@@ -1,6 +1,6 @@
 # Differentiable Extended Karplus-Strong (DiffKS)
 
-This repository contains a differentiable implementation of the **Extended Karplus-Strong algorithm** using **DDSP principles**. The model is fully **time-domain** and leverages [`torchlpc`](https://github.com/csteinmetz1/torchlpc) to enable efficient gradient propagation through **time-varying all-pole IIR filters**.
+This repository contains a differentiable implementation of the **Extended Karplus-Strong algorithm** using **DDSP principles**. The model is fully **time-domain** and leverages [`torchlpc`]([https://github.com/csteinmetz1/torchlpc](https://github.com/DiffAPF/torchlpc)) to enable efficient gradient propagation through **time-varying all-pole IIR filters**.
 
 ## Overview
 
@@ -14,7 +14,7 @@ The DiffKS model extends the classical Karplus-Strong plucked string algorithm b
 
 We use a **multi-resolution STFT loss** combined with a **minimum action penalty**, which encourages smooth evolution by minimizing the differences between consecutive frames.
 
-This provides a good tradeoff between temporal detail and spectral structure, while also penalizing erratic changes in control parameters.
+This provides a good tradeoff between temporal detail and spectral structure, while also penalizing erratic changes in control parameters. *However*, although this results in more similar filter coefficient trajectories for in-domain target samples, the stft loss isn't smaller for out-domain targets. We should look into simply applying a low-pass filter to the coefficient trajectories to flat-out sharp edges.
 
 ## Known Issue
 
@@ -27,7 +27,7 @@ A[0, torch.arange(n_samples), z_Lminus1]  = -(b1 * alfa + b2 * (1 - alfa))
 A[0, torch.arange(n_samples), z_Lminus2]  = -(b2 * alfa)
 ```
 
-This issue remains **open** and is a priority for further investigation.
+This might be provoqued by something up the pipeline leading to this excerpt of code - further tests should be done to gain an understanding on what might be provoquing it.
 
 ## TODO
 
