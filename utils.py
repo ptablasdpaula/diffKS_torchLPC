@@ -23,13 +23,13 @@ def load_config(config_path="config.json"):
         config["global_settings"],
     )
 
-def compute_minimum_action(raw_coeff_frames: torch.Tensor, distance: str = "l2") -> torch.Tensor:
+def compute_minimum_action(coeff_frames: torch.Tensor, distance: str = "l2") -> torch.Tensor:
     """
     Penalize large changes in reflection coefficients across adjacent frames.
-    raw_coeff_frames is shape [n_frames, 2].
+    coeff_frames is shape [n_frames, 2].
     """
     # shape = [n_frames - 1, 2]
-    diffs = raw_coeff_frames[1:] - raw_coeff_frames[:-1]
+    diffs = (coeff_frames[1:-1] - coeff_frames[:-2]) - (coeff_frames[2:] - coeff_frames[1:-1])
 
     if distance.lower() == "l1":
         return torch.abs(diffs).mean()
