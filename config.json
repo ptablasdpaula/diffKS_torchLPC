@@ -1,0 +1,26 @@
+{
+  "hyperparameters": {
+    "learning_rate": 0.5,
+    "max_epochs": 500,
+    "stft_weight": 100,
+    "min_action_weight": 10,
+    "min_action_distance": "l2"
+  },
+  "model_params": {
+    "f0_1_Hz": 155.56,
+    "f0_2_Hz": 155.56,
+    "n_frames": 30,
+    "burst_width_in_s": 0.02,
+    "lowest_note_in_hz": 27.5
+  },
+  "in_domain_params": {
+    "use_in_domain": false,
+    "b_start": 0.99,
+    "b_mid": 0.5,
+    "b_end": 0.6
+  },
+  "global_settings": {
+    "sample_rate": 16000,
+    "length_audio_s": 4
+  }
+}
