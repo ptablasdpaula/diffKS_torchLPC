@@ -157,7 +157,7 @@ def main():
 
         if use_in_domain and t_coeff_frames is not None:
             # Plot predicted vs. target
-            t_frames = t_coeff_frames.cpu()
+            t_frames = t_model.get_constrained_coefficients(for_plotting=True)
 
             plt.figure()
             plt.plot(t_frames[:, 0], label="Target b1")

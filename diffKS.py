@@ -90,10 +90,7 @@ class DiffKS(nn.Module):
         def compute_coeffs():
             sigmoid_b = torch.sigmoid(self.raw_coeff_frames)
             sum_b = sigmoid_b.sum(dim=-1, keepdim=True)
-            scaling_factor = torch.ones_like(sum_b)
-            mask = (sum_b > 1.0).squeeze(-1)
-            scaling_factor[mask] = sum_b[mask]
-            return sigmoid_b / scaling_factor
+            return sigmoid_b / sum_b
 
         if for_plotting:
             with torch.no_grad():
@@ -158,7 +155,7 @@ def noise_burst(
             f"Requested total length {length_s:.3f}s < noise burst width {burst_width_s:.3f}s."
         )
 
-    burst = torch.randn((1, burst_width_n, 1), device=get_device())
+    burst = torch.rand((1, burst_width_n, 1), device=get_device()) - 0.5
 
     # Zero-pad up to total_length_n
     pad_amount = total_length_n - burst_width_n
