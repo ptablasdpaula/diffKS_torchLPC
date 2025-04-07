@@ -25,6 +25,7 @@ During training, the filter coefficients exhibit steep and abrupt changes, often
 A[0, torch.arange(n_samples), z_L]        = -(b1 * (1 - alfa))
 A[0, torch.arange(n_samples), z_Lminus1]  = -(b1 * alfa + b2 * (1 - alfa))
 A[0, torch.arange(n_samples), z_Lminus2]  = -(b2 * alfa)
+```
 
 This issue remains **open** and is a priority for further investigation.
 
