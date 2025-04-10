@@ -30,7 +30,8 @@ def main():
     n_frames           = mp["n_frames"]
     burst_width_s      = mp["burst_width_in_s"]
     lowest_note_in_hz  = mp["lowest_note_in_hz"]
-    filter_order = mp["l_filter_order"]
+    loop_filter_order = mp["l_filter_order"]
+    exc_filter_order = mp["exc_filter_order"]
 
     use_in_domain      = idp["use_in_domain"]
     b_start, b_mid, b_end = idp["b_start"], idp["b_mid"], idp["b_end"]
@@ -54,7 +55,9 @@ def main():
         n_frames=n_frames,
         sample_rate=sample_rate,
         lowest_note_in_hz=lowest_note_in_hz,
-        l_filter_order=filter_order,
+        l_filter_order=loop_filter_order,
+        excitation_filter_order=exc_filter_order,
+        requires_grad=True,
     )
 
     # ==== Create Baseline audio (to be optimized) =========
@@ -70,7 +73,7 @@ def main():
     if use_in_domain:
         t_coeff_frames = make_symmetric_mirrored_coefficient_frame_linspace(
             n_frames=n_frames,
-            l_filter_order=filter_order,
+            l_filter_order=loop_filter_order,
             b_start=b_start,
             b_mid=b_mid,
             b_end=b_end
@@ -83,7 +86,8 @@ def main():
             lowest_note_in_hz=lowest_note_in_hz,
             init_coeffs_frames=t_coeff_frames,
             gain=t_gain,
-            l_filter_order=filter_order
+            l_filter_order=loop_filter_order,
+            requires_grad=False
         )
 
         t_audio = ks_to_audio(

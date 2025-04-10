@@ -22,6 +22,8 @@ class DiffKS(nn.Module):
         init_coeffs_frames: Optional[torch.Tensor] = None,
         coeff_range: Tuple[float, float] = (-2, 0),
         gain: Optional[float] = None,  # <--- None => learnable; non-None => fixed
+        excitation_filter_order: int = 1,
+        requires_grad : bool = True,
     ):
         super().__init__()
         assert l_filter_order >= 1, "Filter order must be at least 1"
@@ -33,6 +35,8 @@ class DiffKS(nn.Module):
         self.num_coefficients = l_filter_order + 1 # To account for DC coefficient
         self.num_active_indexes = l_filter_order + 2 # To account for DC + linear interpolation
         self.coeff_vector_size = int(self.sample_rate // self.lowest_note_in_hz) + self.num_active_indexes
+        self.excitation_filter_order = excitation_filter_order
+        self.requires_grad = requires_grad
 
         if gain is None:
             self.raw_gain = nn.Parameter(torch.tensor(0.0))
@@ -49,6 +53,7 @@ class DiffKS(nn.Module):
 
         # The excitation burst is stored as a non-trainable buffer
         self.register_buffer("excitation", burst.float())
+        self.exc_coefficients = nn.Parameter(torch.zeros(1, self.excitation.size(0), self.excitation_filter_order, requires_grad=requires_grad))
 
     def forward(self, delay_len_frames: torch.Tensor, n_samples: int) -> torch.Tensor:
         delay_interp, coeff_interp = self.get_upsampled_parameters(delay_len_frames, n_samples)
@@ -74,7 +79,11 @@ class DiffKS(nn.Module):
 
         x = torch.zeros(n_samples, device=self.excitation.device)
         x[: self.excitation.shape[0]] = self.excitation
-        x = x.unsqueeze(0)
+
+        if self.requires_grad:
+            x = sample_wise_lpc(x.unsqueeze(0), self.exc_coefficients)
+        else:
+            x = x.unsqueeze(0)
 
         y_out = sample_wise_lpc(x, A)
         return y_out.squeeze(0)
