@@ -29,10 +29,12 @@ class DiffKS(nn.Module):
         self.sample_rate = sample_rate
         self.lowest_note_in_hz = lowest_note_in_hz
         self.l_filter_order = l_filter_order
-        self.coeff_vector_size = int(self.sample_rate // self.lowest_note_in_hz) + self.l_filter_order + 1
+        self.num_coefficients = l_filter_order + 1 # To account for DC coefficient
+        self.num_active_indexes = l_filter_order + 2 # To account for DC + linear interpolation
+        self.coeff_vector_size = int(self.sample_rate // self.lowest_note_in_hz) + self.num_active_indexes
 
         if init_coeffs_frames is None:
-            raw_init = torch.empty(self.n_frames, self.l_filter_order).uniform_(*coeff_range)
+            raw_init = torch.empty(self.n_frames, self.num_coefficients).uniform_(*coeff_range)
         else:
             raw_init = torch.special.logit(init_coeffs_frames)
 
@@ -47,17 +49,17 @@ class DiffKS(nn.Module):
         z_l = torch.floor(delay_interp).long()
         alfa = delay_interp - z_l
 
-        idxs = [z_l + i for i in range(self.l_filter_order + 1)]
+        idxs = [z_l + i for i in range(self.num_active_indexes)]
         assert torch.all(idxs[-1] < self.coeff_vector_size), "Delay index exceeds the buffer size"
 
         A = torch.zeros((1, n_samples, self.coeff_vector_size), device=self.excitation.device)
-        b = coeff_interp  # shape: (n_samples, l_filter_order)
+        b = coeff_interp  # shape: (n_samples, num_coefficients)
 
         # First term: z^L
         A[0, torch.arange(n_samples), idxs[0]] = -(1 - alfa) * b[:, 0]
 
         # Middle terms with crossfade
-        for i in range(1, self.l_filter_order):
+        for i in range(1, self.num_coefficients):
             A[0, torch.arange(n_samples), idxs[i]] = -(alfa * b[:, i - 1] + (1 - alfa) * b[:, i])
 
         # Last term: z^(L + l_filter_order)
@@ -106,7 +108,7 @@ class DiffKS(nn.Module):
                                    device=delay_len_frames.device)
 
             delay_input = delay_len_frames.view(1, self.n_frames, 1)
-            coeff_input = coeff_frames.view(1, self.n_frames, self.l_filter_order)
+            coeff_input = coeff_frames.view(1, self.n_frames, self.num_coefficients)
 
             delay_coeffs = natural_cubic_spline_coeffs(t_in, delay_input)
             coeffs_coeffs = natural_cubic_spline_coeffs(t_in, coeff_input)
