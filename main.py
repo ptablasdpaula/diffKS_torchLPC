@@ -26,6 +26,9 @@ def main():
     min_action_weight  = hp["min_action_weight"]
     min_action_dist    = hp.get("min_action_distance", "l2")
 
+    patience_epochs = hp["patience_epochs"]
+    patience_delta = hp["patience_delta"]
+
     f0_1_Hz, f0_2_Hz   = mp["f0_1_Hz"], mp["f0_2_Hz"]
     n_frames           = mp["n_frames"]
     burst_width_s      = mp["burst_width_in_s"]
@@ -112,6 +115,8 @@ def main():
     # For plotting the loss curve
     loss_curve = []
 
+    bad_epochs = 0 # For Early Stopping
+
     progress_bar = tqdm(range(max_epochs), desc="Training")
     for epoch in progress_bar:
         # Forward
@@ -151,6 +156,15 @@ def main():
             })
         else:
             progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        if loss.item() < patience_delta:
+            bad_epochs += 1
+        else:
+            bad_epochs = 0
+
+        if bad_epochs >= patience_epochs:
+            print(f"No improvement after {patience_epochs} epochs. Early stopping at epoch {epoch}.")
+            break
 
     print("Training finished")
 
