@@ -63,7 +63,7 @@ def plot_coefficient_comparison(
         for i, coeff in enumerate(predicted_coeffs.squeeze().numpy(), 1):
             print(f"Coefficient b{i}: {coeff}")
 
-        if target_coeffs.shape[0] == 1:
+        if target_coeffs is not None and target_coeffs.shape[0] == 1:
             print("\nTarget Coefficients:")
             for i, coeff in enumerate(target_coeffs.squeeze().numpy(), 1):
                 print(f"Target b{i}: {coeff}")
@@ -184,16 +184,16 @@ def make_symmetric_mirrored_coefficient_frame_linspace(
         l_filter_order: Number of filter coefficients (default: 2)
 
     Returns:
-        Tensor of shape [n_frames, l_filter_order] with coefficient values
+        Tensor of shape [n_frames, l_filter_order + 1] with coefficient values
     """
     one_third_frames = n_frames // 3
     two_third_frames = one_third_frames * 2
 
-    # Initialize output tensor
-    coeff_frames = torch.zeros(n_frames, l_filter_order)
+    # Initialize output tensor - this should be l_filter_order + 1
+    coeff_frames = torch.zeros(n_frames, l_filter_order + 1)
 
     # For each coefficient, create a pattern
-    for i in range(l_filter_order):
+    for i in range(l_filter_order + 1):
         if i % 2 == 0:
             # Even indices follow b_start -> b_mid -> b_end pattern
             first_segment = torch.linspace(b_start, b_mid, two_third_frames)
