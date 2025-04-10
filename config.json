@@ -1,13 +1,13 @@
 {
   "hyperparameters": {
-    "learning_rate": 0.0035,
-    "max_epochs": 50,
+    "learning_rate": 0.05,
+    "max_epochs": 500,
     "stft_weight": 100,
     "min_action_weight": 10,
     "min_action_distance": "l2"
   },
   "model_params": {
-    "l_filter_order": 2,
+    "l_filter_order": 1,
     "f0_1_Hz": 155.56,
     "f0_2_Hz": 155.56,
     "n_frames": 1,
@@ -16,9 +16,10 @@
   },
   "in_domain_params": {
     "use_in_domain": false,
+    "gain": 1,
     "b_start": 0.99,
-    "b_mid": 0.5,
-    "b_end": 0.6
+    "b_mid": 0.99,
+    "b_end": 0.99
   },
   "global_settings": {
     "sample_rate": 8000,

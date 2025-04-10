@@ -21,6 +21,7 @@ class DiffKS(nn.Module):
         l_filter_order: int = 5,
         init_coeffs_frames: Optional[torch.Tensor] = None,
         coeff_range: Tuple[float, float] = (-2, 0),
+        gain: Optional[float] = None,  # <--- None => learnable; non-None => fixed
     ):
         super().__init__()
         assert l_filter_order >= 1, "Filter order must be at least 1"
@@ -32,6 +33,12 @@ class DiffKS(nn.Module):
         self.num_coefficients = l_filter_order + 1 # To account for DC coefficient
         self.num_active_indexes = l_filter_order + 2 # To account for DC + linear interpolation
         self.coeff_vector_size = int(self.sample_rate // self.lowest_note_in_hz) + self.num_active_indexes
+
+        if gain is None:
+            self.raw_gain = nn.Parameter(torch.tensor(0.0))
+        else:
+            clamped = float(torch.clamp(torch.tensor(gain), 1e-6, 1 - 1e-6))
+            self.register_buffer("raw_gain", torch.logit(torch.tensor(clamped)))
 
         if init_coeffs_frames is None:
             raw_init = torch.empty(self.n_frames, self.num_coefficients).uniform_(*coeff_range)
@@ -72,6 +79,9 @@ class DiffKS(nn.Module):
         y_out = sample_wise_lpc(x, A)
         return y_out.squeeze(0)
 
+    def get_gain(self):
+        return torch.sigmoid(self.raw_gain)
+
     def get_constrained_coefficients(self, for_plotting: bool = False) -> torch.Tensor:
         """
         Generate coefficient trajectories over time using a 1-layer linear network.
@@ -82,7 +92,7 @@ class DiffKS(nn.Module):
         def compute_coeffs():
             sigmoid_b = torch.sigmoid(self.raw_coeff_frames)
             sum_b = sigmoid_b.sum(dim=-1, keepdim=True)
-            return sigmoid_b / sum_b
+            return (sigmoid_b / sum_b) * self.get_gain()
 
         if for_plotting:
             with torch.no_grad():
