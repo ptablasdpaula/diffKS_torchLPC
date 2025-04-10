@@ -8,8 +8,8 @@ from utils import get_device
 
 class DiffKS(nn.Module):
     """
-    A differentiable Karplus–Strong model that supports time-varying
-    fractional delay and time-varying reflection coefficients.
+    A differentiable Karplus–Strong model with time-varying fractional delay
+    and configurable-order filter with normalized coefficients.
     """
 
     def __init__(
@@ -18,22 +18,22 @@ class DiffKS(nn.Module):
         n_frames: int,
         sample_rate: int,
         lowest_note_in_hz: float,
+        l_filter_order: int = 5,
         init_coeffs_frames: Optional[torch.Tensor] = None,
         coeff_range: Tuple[float, float] = (-2, 0),
     ):
         super().__init__()
+        assert l_filter_order >= 1, "Filter order must be at least 1"
 
-        # Store or compute needed values
         self.n_frames = n_frames
         self.sample_rate = sample_rate
         self.lowest_note_in_hz = lowest_note_in_hz
-        self.coeff_vector_size = int(self.sample_rate // self.lowest_note_in_hz) + 2
+        self.l_filter_order = l_filter_order
+        self.coeff_vector_size = int(self.sample_rate // self.lowest_note_in_hz) + self.l_filter_order + 1
 
-        # Initialize reflection coefficients
         if init_coeffs_frames is None:
-            raw_init = torch.empty(self.n_frames, 2).uniform_(*coeff_range)
+            raw_init = torch.empty(self.n_frames, self.l_filter_order).uniform_(*coeff_range)
         else:
-            # Convert to logit space
             raw_init = torch.special.logit(init_coeffs_frames)
 
         self.raw_coeff_frames = nn.Parameter(raw_init)
@@ -42,50 +42,40 @@ class DiffKS(nn.Module):
         self.register_buffer("excitation", burst.float())
 
     def forward(self, delay_len_frames: torch.Tensor, n_samples: int) -> torch.Tensor:
-        """
-        Compute the time-domain output of the Karplus–Strong waveguide.
-        """
-        time_varying_delay, time_varying_coeffs = self.get_upsampled_parameters(
-            delay_len_frames, n_samples
-        )
+        delay_interp, coeff_interp = self.get_upsampled_parameters(delay_len_frames, n_samples)
 
-        # Integer / fractional part
-        z_L = torch.floor(time_varying_delay).long()
-        z_Lminus1 = z_L + 1
-        z_Lminus2 = z_L + 2
-        alfa = time_varying_delay - z_L
+        z_l = torch.floor(delay_interp).long()
+        alfa = delay_interp - z_l
 
-        # Make sure we don't exceed size
-        assert torch.all(z_Lminus2 < self.coeff_vector_size), (
-            f"Delay index exceeds the buffer size ({self.coeff_vector_size})."
-        )
+        idxs = [z_l + i for i in range(self.l_filter_order + 1)]
+        assert torch.all(idxs[-1] < self.coeff_vector_size), "Delay index exceeds the buffer size"
 
-        # Construct matrix A for sample_wise_lpc
-        A = torch.zeros(
-            (1, n_samples, self.coeff_vector_size),
-            device=self.excitation.device
-        )
+        A = torch.zeros((1, n_samples, self.coeff_vector_size), device=self.excitation.device)
+        b = coeff_interp  # shape: (n_samples, l_filter_order)
 
-        b1 = time_varying_coeffs[:, 0]
-        b2 = time_varying_coeffs[:, 1]
+        # First term: z^L
+        A[0, torch.arange(n_samples), idxs[0]] = -(1 - alfa) * b[:, 0]
 
-        # Place reflection coefficients
-        A[0, torch.arange(n_samples), z_L] = -(b1 * (1 - alfa))
-        A[0, torch.arange(n_samples), z_Lminus1] = -(b1 * alfa + b2 * (1 - alfa))
-        A[0, torch.arange(n_samples), z_Lminus2] = -(b2 * alfa)
+        # Middle terms with crossfade
+        for i in range(1, self.l_filter_order):
+            A[0, torch.arange(n_samples), idxs[i]] = -(alfa * b[:, i - 1] + (1 - alfa) * b[:, i])
 
-        # Prepare the excitation burst
+        # Last term: z^(L + l_filter_order)
+        A[0, torch.arange(n_samples), idxs[-1]] = -alfa * b[:, -1]
+
         x = torch.zeros(n_samples, device=self.excitation.device)
         x[: self.excitation.shape[0]] = self.excitation
         x = x.unsqueeze(0)
 
-        # Run the waveguide update
         y_out = sample_wise_lpc(x, A)
         return y_out.squeeze(0)
 
     def get_constrained_coefficients(self, for_plotting: bool = False) -> torch.Tensor:
         """
-        Compute b1, b2 in [0, 1], ensuring b1 + b2 <= 1 at each frame.
+        Generate coefficient trajectories over time using a 1-layer linear network.
+
+        Each coefficient is modeled as: coeff(t) = weight * t + bias
+        with optional normalization so the filter remains stable.
         """
         def compute_coeffs():
             sigmoid_b = torch.sigmoid(self.raw_coeff_frames)
@@ -104,10 +94,6 @@ class DiffKS(nn.Module):
         num_samples: int,
         for_plotting: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Upsample the delay lengths and reflection coefficients
-        from frame rate to sample rate using cubic splines.
-        """
         coeff_frames = self.get_constrained_coefficients(for_plotting=for_plotting)
 
         def interpolate_fn():
@@ -117,25 +103,20 @@ class DiffKS(nn.Module):
                                    device=delay_len_frames.device)
 
             delay_input = delay_len_frames.view(1, self.n_frames, 1)
-            coeff_input = coeff_frames.view(1, self.n_frames, 2)
+            coeff_input = coeff_frames.view(1, self.n_frames, self.l_filter_order)
 
             delay_coeffs = natural_cubic_spline_coeffs(t_in, delay_input)
             coeffs_coeffs = natural_cubic_spline_coeffs(t_in, coeff_input)
 
-            delay_interp = NaturalCubicSpline(delay_coeffs).evaluate(t_out)
-            coeff_interp = NaturalCubicSpline(coeffs_coeffs).evaluate(t_out)
-
-            # Remove extra dims
-            delay_interp = delay_interp.squeeze(0).squeeze(-1)
-            coeff_interp = coeff_interp.squeeze(0)
+            delay_interp = NaturalCubicSpline(delay_coeffs).evaluate(t_out).squeeze(0).squeeze(-1)
+            coeff_interp = NaturalCubicSpline(coeffs_coeffs).evaluate(t_out).squeeze(0)
             return delay_interp, coeff_interp
 
         if for_plotting:
             with torch.no_grad():
                 delay, coeffs = interpolate_fn()
                 return delay.detach().cpu(), coeffs.detach().cpu()
-        else:
-            return interpolate_fn()
+        return interpolate_fn()
 
 
 def noise_burst(

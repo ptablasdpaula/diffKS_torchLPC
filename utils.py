@@ -23,12 +23,21 @@ def load_config(config_path="config.json"):
         config["global_settings"],
     )
 
+def get_raw_coefficients(self) -> torch.Tensor:
+    """
+    Returns the unnormalized (pre-activation) output of the coefficient generator.
+    Shape: [n_frames, l_filter_order]
+    """
+    t = torch.linspace(0, 1, steps=self.n_frames, device=self.coeff_generator.weight.device).unsqueeze(1)
+    return self.coeff_generator(t)
+
+
 def compute_minimum_action(coeff_frames: torch.Tensor, distance: str = "l2") -> torch.Tensor:
     """
     Penalize large changes in reflection coefficients across adjacent frames.
-    coeff_frames is shape [n_frames, 2].
+    coeff_frames is shape [n_frames, l_filter_order].
+    Applies a discrete Laplacian (second difference) smoothing penalty across time.
     """
-    # shape = [n_frames - 1, 2]
     diffs = (coeff_frames[1:-1] - coeff_frames[:-2]) - (coeff_frames[2:] - coeff_frames[1:-1])
 
     if distance.lower() == "l1":
@@ -36,6 +45,55 @@ def compute_minimum_action(coeff_frames: torch.Tensor, distance: str = "l2") -> 
     else:
         # default to L2
         return (diffs ** 2).mean()
+
+
+def plot_coefficient_comparison(
+        predicted_coeffs: torch.Tensor,
+        target_coeffs: torch.Tensor = None,
+        title: str = "Reflection Coefficients",
+        save_path: str = "coefficient_trajectories.png",
+        show_plot: bool = False
+):
+    """
+    Plot predicted reflection coefficients against target coefficients (if provided).
+
+    Args:
+        predicted_coeffs: Tensor of shape [n_frames, l_filter_order] containing predicted coefficients
+        target_coeffs: Optional tensor of shape [n_frames, l_filter_order] containing target coefficients
+        title: Plot title
+        save_path: Path to save the plot (set to None to skip saving)
+        show_plot: Whether to display the plot
+    """
+    plt.figure(figsize=(10, 6))
+
+    # Get number of coefficients
+    n_coeffs = predicted_coeffs.shape[1]
+
+    if target_coeffs is not None:
+        # Plot both predicted and target
+        for i in range(n_coeffs):
+            plt.plot(target_coeffs[:, i], linestyle='-', label=f"Target b{i + 1}")
+            plt.plot(predicted_coeffs[:, i], linestyle='--', label=f"Predicted b{i + 1}")
+        plot_title = f"{title} (Target vs. Predicted)"
+    else:
+        # Plot only predicted coefficients
+        for i in range(n_coeffs):
+            plt.plot(predicted_coeffs[:, i], label=f"Coefficient b{i + 1}")
+        plot_title = title
+
+    plt.title(plot_title)
+    plt.xlabel("Frame index")
+    plt.ylabel("Coefficient value")
+    plt.legend()
+    plt.grid(True)
+
+    if save_path:
+        plt.savefig(save_path)
+
+    if show_plot:
+        plt.show()
+    else:
+        plt.close()
 
 def plot_waveform(waveform: torch.Tensor, sample_rate: int, title: str = "Waveform"):
     """
@@ -104,29 +162,45 @@ def save_audio_torchaudio(
 
 
 def make_symmetric_mirrored_coefficient_frame_linspace(
-    n_frames: int,
-    b_start: float,
-    b_mid: float,
-    b_end: float
+        n_frames: int,
+        b_start: float,
+        b_mid: float,
+        b_end: float,
+        l_filter_order: int = 2
 ) -> torch.Tensor:
     """
     Construct mirrored reflection coefficients in a three segment linspace.
+
+    Args:
+        n_frames: Number of frames to generate
+        b_start: Starting coefficient value
+        b_mid: Middle coefficient value
+        b_end: Ending coefficient value
+        l_filter_order: Number of filter coefficients (default: 2)
+
+    Returns:
+        Tensor of shape [n_frames, l_filter_order] with coefficient values
     """
     one_third_frames = n_frames // 3
     two_third_frames = one_third_frames * 2
 
-    # b1 ramps from b_start -> b_mid -> b_end
-    b1_first_segment = torch.linspace(b_start, b_mid, two_third_frames)
-    b1_second_segment = torch.linspace(b_mid, b_end, n_frames - two_third_frames)
-    b1_coeff_frames = torch.cat([b1_first_segment, b1_second_segment])
+    # Initialize output tensor
+    coeff_frames = torch.zeros(n_frames, l_filter_order)
 
-    # b2 ramps from b_end -> b_mid -> b_start
-    b2_first_segment = torch.linspace(b_end, b_mid, one_third_frames)
-    b2_second_segment = torch.linspace(b_mid, b_start, n_frames - one_third_frames)
-    b2_coeff_frames = torch.cat([b2_first_segment, b2_second_segment])
+    # For each coefficient, create a pattern
+    for i in range(l_filter_order):
+        if i % 2 == 0:
+            # Even indices follow b_start -> b_mid -> b_end pattern
+            first_segment = torch.linspace(b_start, b_mid, two_third_frames)
+            second_segment = torch.linspace(b_mid, b_end, n_frames - two_third_frames)
+            coeff_frames[:, i] = torch.cat([first_segment, second_segment])
+        else:
+            # Odd indices follow b_end -> b_mid -> b_start pattern (mirrored)
+            first_segment = torch.linspace(b_end, b_mid, one_third_frames)
+            second_segment = torch.linspace(b_mid, b_start, n_frames - one_third_frames)
+            coeff_frames[:, i] = torch.cat([first_segment, second_segment])
 
-    return torch.stack([b1_coeff_frames, b2_coeff_frames], dim=1)
-
+    return coeff_frames
 
 def ks_to_audio(
     model: torch.nn.Module,
