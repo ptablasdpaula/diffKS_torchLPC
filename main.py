@@ -9,7 +9,7 @@ from utils import (
     make_symmetric_mirrored_coefficient_frame_linspace,
     ks_to_audio,
     process_target,
-    compute_minimum_action  # <--- import from utils
+    compute_minimum_action, plot_coefficient_comparison  # <--- import from utils
 )
 
 def main():
@@ -30,6 +30,7 @@ def main():
     n_frames           = mp["n_frames"]
     burst_width_s      = mp["burst_width_in_s"]
     lowest_note_in_hz  = mp["lowest_note_in_hz"]
+    filter_order = mp["l_filter_order"]
 
     use_in_domain      = idp["use_in_domain"]
     b_start, b_mid, b_end = idp["b_start"], idp["b_mid"], idp["b_end"]
@@ -51,11 +52,12 @@ def main():
         burst=burst,
         n_frames=n_frames,
         sample_rate=sample_rate,
-        lowest_note_in_hz=lowest_note_in_hz
+        lowest_note_in_hz=lowest_note_in_hz,
+        l_filter_order=filter_order,
     )
 
     # ==== Create Baseline audio (to be optimized) =========
-    p_audio = ks_to_audio(
+    _ = ks_to_audio(
         model=p_model,
         out_path="audio/initial.wav",
         f0_frames=f0_frames,
@@ -64,12 +66,10 @@ def main():
     )
 
     # ==== Generate target audio ===========================
-    t_audio = None
-    t_coeff_frames = None  # We'll store target frames if in-domain
-
     if use_in_domain:
         t_coeff_frames = make_symmetric_mirrored_coefficient_frame_linspace(
             n_frames=n_frames,
+            l_filter_order=filter_order,
             b_start=b_start,
             b_mid=b_mid,
             b_end=b_end
@@ -80,7 +80,8 @@ def main():
             n_frames=n_frames,
             sample_rate=sample_rate,
             lowest_note_in_hz=lowest_note_in_hz,
-            init_coeffs_frames=t_coeff_frames
+            init_coeffs_frames=t_coeff_frames,
+            l_filter_order=filter_order
         )
 
         t_audio = ks_to_audio(
@@ -153,36 +154,14 @@ def main():
 
     # ==== Plot predicted vs target reflection coeffs ======
     with torch.no_grad():
-        pred_coeffs = p_model.get_constrained_coefficients(for_plotting=True)  # shape [n_frames, 2]
+        pred_coeffs = p_model.get_constrained_coefficients(for_plotting=True)
+        target_coeffs = t_model.get_constrained_coefficients(for_plotting=True) if use_in_domain else None
 
-        if use_in_domain and t_coeff_frames is not None:
-            # Plot predicted vs. target
-            t_frames = t_model.get_constrained_coefficients(for_plotting=True)
-
-            plt.figure()
-            plt.plot(t_frames[:, 0], label="Target b1")
-            plt.plot(pred_coeffs[:, 0], label="Predicted b1")
-            plt.plot(t_frames[:, 1], label="Target b2")
-            plt.plot(pred_coeffs[:, 1], label="Predicted b2")
-            plt.title("Reflection Coefficients (Target vs. Predicted)")
-            plt.xlabel("Frame index")
-            plt.ylabel("Coefficient value")
-            plt.legend()
-            plt.grid(True)
-            plt.savefig("coeff_compare.png")  # or plt.show()
-            plt.close()
-        else:
-            # Just plot the predicted coefficients
-            plt.figure()
-            plt.plot(pred_coeffs[:, 0], label="Predicted b1")
-            plt.plot(pred_coeffs[:, 1], label="Predicted b2")
-            plt.title("Predicted Reflection Coefficients")
-            plt.xlabel("Frame index")
-            plt.ylabel("Coefficient value")
-            plt.legend()
-            plt.grid(True)
-            plt.savefig("coeff_predicted.png")  # or plt.show()
-            plt.close()
+        plot_coefficient_comparison(
+            predicted_coeffs=pred_coeffs,
+            target_coeffs=target_coeffs,
+            save_path="coefficient_trajectories.png"
+        )
 
     # ==== Save final model output =========================
     with torch.no_grad():
