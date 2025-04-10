@@ -117,14 +117,17 @@ def main():
             t_audio.unsqueeze(0).unsqueeze(0)
         ) * stft_weight
 
-        # Minimum-action loss on raw coeff frames
-        min_action_loss = compute_minimum_action(
-            p_model.raw_coeff_frames,
-            distance=min_action_dist
-        ) * min_action_weight
+        loss = stft_loss
 
-        # Combine them with separate weights
-        loss =  stft_loss +  min_action_loss
+        if n_frames > 1:
+            # Minimum-action loss on raw coeff frames
+            min_action_loss = compute_minimum_action(
+                p_model.raw_coeff_frames,
+                distance=min_action_dist
+            ) * min_action_weight
+
+            # Combine them with separate weights
+            loss += min_action_loss
 
         # Backprop
         optimizer.zero_grad()
@@ -133,11 +136,15 @@ def main():
 
         # Track and display
         loss_curve.append(loss.item())
-        progress_bar.set_postfix({
-            "stft_loss": f"{stft_loss.item():.4f}",
-            "ma_loss": f"{min_action_loss.item():.4f}",
-            "total": f"{loss.item():.4f}"
-        })
+
+        if n_frames > 1:
+            progress_bar.set_postfix({
+                "stft_loss": f"{stft_loss.item():.4f}",
+                "ma_loss": f"{min_action_loss.item():.4f}",
+                "total": f"{loss.item():.4f}"
+            })
+        else:
+            progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
     print("Training finished")
 

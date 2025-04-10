@@ -56,17 +56,20 @@ def plot_coefficient_comparison(
 ):
     """
     Plot predicted reflection coefficients against target coefficients (if provided).
-
-    Args:
-        predicted_coeffs: Tensor of shape [n_frames, l_filter_order] containing predicted coefficients
-        target_coeffs: Optional tensor of shape [n_frames, l_filter_order] containing target coefficients
-        title: Plot title
-        save_path: Path to save the plot (set to None to skip saving)
-        show_plot: Whether to display the plot
+    For single frame, prints coefficients to console.
     """
-    plt.figure(figsize=(10, 6))
+    if predicted_coeffs.shape[0] == 1:
+        print(f"\n{title} (Single Frame Coefficients):")
+        for i, coeff in enumerate(predicted_coeffs.squeeze().numpy(), 1):
+            print(f"Coefficient b{i}: {coeff}")
 
-    # Get number of coefficients
+        if target_coeffs.shape[0] == 1:
+            print("\nTarget Coefficients:")
+            for i, coeff in enumerate(target_coeffs.squeeze().numpy(), 1):
+                print(f"Target b{i}: {coeff}")
+        return
+
+    plt.figure(figsize=(10, 6))
     n_coeffs = predicted_coeffs.shape[1]
 
     if target_coeffs is not None:
@@ -86,6 +89,8 @@ def plot_coefficient_comparison(
     plt.ylabel("Coefficient value")
     plt.legend()
     plt.grid(True)
+
+    plt.tight_layout()
 
     if save_path:
         plt.savefig(save_path)

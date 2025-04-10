@@ -97,6 +97,9 @@ class DiffKS(nn.Module):
         coeff_frames = self.get_constrained_coefficients(for_plotting=for_plotting)
 
         def interpolate_fn():
+            if self.n_frames == 1:
+                return delay_len_frames.repeat(num_samples), coeff_frames.repeat(num_samples, 1)
+
             t_in = torch.linspace(0, 1, steps=self.n_frames,
                                   device=delay_len_frames.device)
             t_out = torch.linspace(0, 1, steps=num_samples,

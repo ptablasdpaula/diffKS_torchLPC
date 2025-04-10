@@ -1,16 +1,16 @@
 {
   "hyperparameters": {
-    "learning_rate": 0.035,
-    "max_epochs": 2000,
+    "learning_rate": 0.0035,
+    "max_epochs": 50,
     "stft_weight": 100,
     "min_action_weight": 10,
     "min_action_distance": "l2"
   },
   "model_params": {
-    "l_filter_order": 10,
+    "l_filter_order": 2,
     "f0_1_Hz": 155.56,
     "f0_2_Hz": 155.56,
-    "n_frames": 30,
+    "n_frames": 1,
     "burst_width_in_s": 0.02,
     "lowest_note_in_hz": 27.5
   },
