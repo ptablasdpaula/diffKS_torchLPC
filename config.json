@@ -4,7 +4,9 @@
     "max_epochs": 500,
     "stft_weight": 100,
     "min_action_weight": 10,
-    "min_action_distance": "l2"
+    "min_action_distance": "l2",
+    "patience_epochs": 10,
+    "patience_delta": 1
   },
   "model_params": {
     "exc_filter_order": 10,
