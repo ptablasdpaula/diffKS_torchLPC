@@ -34,6 +34,7 @@ def main():
 
     use_in_domain      = idp["use_in_domain"]
     b_start, b_mid, b_end = idp["b_start"], idp["b_mid"], idp["b_end"]
+    t_gain = idp["gain"]
 
     # ==== Generate Burst ==================================
     burst = noise_burst(
@@ -81,6 +82,7 @@ def main():
             sample_rate=sample_rate,
             lowest_note_in_hz=lowest_note_in_hz,
             init_coeffs_frames=t_coeff_frames,
+            gain=t_gain,
             l_filter_order=filter_order
         )
 
@@ -169,6 +171,9 @@ def main():
             target_coeffs=target_coeffs,
             save_path="coefficient_trajectories.png"
         )
+
+        print (f"The Predicted Gain is {p_model.get_gain()}")
+        if use_in_domain: print(f"The Target Gain is {t_model.get_gain()}")
 
     # ==== Save final model output =========================
     with torch.no_grad():
