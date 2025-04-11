@@ -17,7 +17,7 @@
     "burst_width_in_s": 0.02,
     "normalize_burst": true,
     "lowest_note_in_hz": 27.5,
-    "interp_type": "linear"
+    "interp_type": "lagrange"
   },
   "in_domain_params": {
     "use_in_domain": true,

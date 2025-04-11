@@ -6,6 +6,8 @@ from torchlpc import sample_wise_lpc
 from torchcubicspline import natural_cubic_spline_coeffs, NaturalCubicSpline
 from utils import get_device
 
+LAGRANGE_ORDER = 5
+
 class DiffKS(nn.Module):
     """
     A differentiable Karplus–Strong model with time-varying fractional delay
@@ -34,7 +36,13 @@ class DiffKS(nn.Module):
         self.lowest_note_in_hz = lowest_note_in_hz
         self.l_filter_order = l_filter_order
         self.num_coefficients = l_filter_order + 1 # To account for DC coefficient
-        self.num_active_indexes = l_filter_order + 2 # To account for DC + linear interpolation
+        self.num_active_indexes = self.num_coefficients
+        if interp_type == "linear":
+            self.num_active_indexes += 1
+        elif interp_type == "allpass":
+            self.num_active_indexes += 1
+        elif interp_type == "lagrange":
+            self.num_active_indexes += LAGRANGE_ORDER
         self.coeff_vector_size = int(self.sample_rate // self.lowest_note_in_hz) + self.num_active_indexes
         self.excitation_filter_order = excitation_filter_order
         self.requires_grad = requires_grad
@@ -86,7 +94,7 @@ class DiffKS(nn.Module):
             eps = 1e-6
             real_period = delay_interp
             omega = 2 * torch.pi / (real_period * self.sample_rate)
-            zs = torch.exp(1j * omega.view(-1, 1)) ** -torch.arange(self.num_coefficients).view(1, -1)
+            zs = torch.exp(1j * omega.view(-1, 1)) ** -torch.arange(self.num_coefficients, device=self.excitation.device).view(1, -1)
             p_a = -torch.angle(torch.sum(b * zs, dim=-1, keepdim=False)) / omega
             quantized_period = torch.floor(real_period - p_a - eps)
             p_c = real_period - quantized_period - p_a
@@ -103,7 +111,21 @@ class DiffKS(nn.Module):
 
             A[0, torch.arange(n_samples), idxs[-1]] = -b[:, -1]
         elif self.interp_type == "lagrange":
-            raise NotImplementedError # todo
+            z_l = torch.floor(delay_interp).long() - LAGRANGE_ORDER // 2
+            alfa = delay_interp - z_l
+
+            lagrange_coeffs = alfa.view(-1, 1) - torch.arange(LAGRANGE_ORDER + 1, device=delay_interp.device).view(1, -1)
+            lagrange_denom = torch.arange(LAGRANGE_ORDER + 1, device=delay_interp.device).view(1, -1) - torch.arange(LAGRANGE_ORDER + 1, device=delay_interp.device).view(-1, 1)
+
+            lagrange_coeffs = lagrange_coeffs.unsqueeze(-1) / lagrange_denom.T.unsqueeze(0)
+            lagrange_coeffs = torch.where(lagrange_coeffs.isfinite(), lagrange_coeffs, torch.ones_like(lagrange_coeffs))
+            lagrange_coeffs = lagrange_coeffs.prod(dim=-1)
+
+            b = torch.nn.functional.conv1d(b.unsqueeze(0), lagrange_coeffs.unsqueeze(1), padding=LAGRANGE_ORDER, groups=len(b)).squeeze(0)
+
+            for i, idx in enumerate(idxs):
+                A[0, torch.arange(n_samples), idx] = b[:, i]
+
         else:
             raise NotImplementedError
 
