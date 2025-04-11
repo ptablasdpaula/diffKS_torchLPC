@@ -286,3 +286,53 @@ def process_target(
     torchaudio.save(out_path, processed_target[0], target_sample_rate)
 
     return processed_target
+
+def plot_upsampled_filter_coeffs(
+    model,
+    f0_frames: torch.Tensor,
+    sample_rate: int,
+    length_audio_s: float,
+    title: str = "Upsampled Reflection Coefficients",
+    save_path: str = "upsampled_filter_coeffs.png",
+    show_plot: bool = False
+):
+    """
+    Uses the model's cubic-spline upsampling to generate reflection coefficients
+    at the audio sample rate and plots them.
+
+    Args:
+        model: The trained DiffKS model (or similar).
+        f0_frames: Tensor of fundamental-frequency frames (sample_rate/f0_Hz).
+        sample_rate: Sample rate in Hz.
+        length_audio_s: Total audio length in seconds.
+        title: Title for the plot.
+        save_path: Where to save the plotted figure.
+        show_plot: Whether to show the figure window instead of saving it.
+    """
+    n_samples = int(sample_rate * length_audio_s)
+
+    # Evaluate the upsampled delay and filter coefficients
+    # for_plotting=True => returns a detached CPU tensor.
+    with torch.no_grad():
+        up_delay, up_coeffs = model.get_upsampled_parameters(
+            delay_len_frames=f0_frames,
+            num_samples=n_samples,
+            for_plotting=True
+        )
+
+    # up_coeffs is shape [n_samples, l_filter_order + 1].
+    plt.figure(figsize=(12, 6))
+    for i in range(up_coeffs.shape[1]):
+        plt.plot(up_coeffs[:, i], label=f"Coeff {i}")
+
+    plt.title(title)
+    plt.xlabel("Sample Index")
+    plt.ylabel("Coefficient Value")
+    plt.legend()
+    plt.grid(True)
+
+    if show_plot:
+        plt.show()
+    else:
+        plt.savefig(save_path)
+    plt.close()

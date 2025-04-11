@@ -9,11 +9,11 @@
     "patience_delta": 1
   },
   "model_params": {
-    "exc_filter_order": 10,
-    "l_filter_order": 2,
-    "f0_1_Hz": 155.56,
-    "f0_2_Hz": 155.56,
-    "n_frames": 10,
+    "exc_filter_order": 3,
+    "l_filter_order": 1,
+    "f0_1_Hz": 159.56,
+    "f0_2_Hz": 159.56,
+    "n_frames": 1,
     "burst_width_in_s": 0.02,
     "lowest_note_in_hz": 27.5
   },

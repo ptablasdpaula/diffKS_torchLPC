@@ -9,7 +9,7 @@ from utils import (
     make_symmetric_mirrored_coefficient_frame_linspace,
     ks_to_audio,
     process_target,
-    compute_minimum_action, plot_coefficient_comparison  # <--- import from utils
+    compute_minimum_action, plot_coefficient_comparison, plot_upsampled_filter_coeffs  # <--- import from utils
 )
 
 def main():
@@ -192,6 +192,16 @@ def main():
 
         print (f"The Predicted Gain is {p_model.get_gain()}")
         if use_in_domain: print(f"The Target Gain is {t_model.get_gain()}")
+
+    # ==== Plot predicted FINAL coefficients (after upsampling)
+    plot_upsampled_filter_coeffs(
+        model=p_model,
+        f0_frames=f0_frames,
+        sample_rate=sample_rate,
+        length_audio_s=length_audio_s,
+        title="Cubic predicted",
+        save_path="coefficient_upsampled.png"
+    )
 
     # ==== Save final model output =========================
     with torch.no_grad():
