@@ -36,6 +36,7 @@ def main():
     loop_filter_order = mp["l_filter_order"]
     exc_filter_order = mp["exc_filter_order"]
     interp_type = mp["interp_type"]
+    normalize_burst = mp["normalize_burst"]
 
     use_in_domain      = idp["use_in_domain"]
     b_start, b_mid, b_end = idp["b_start"], idp["b_mid"], idp["b_end"]
@@ -45,7 +46,8 @@ def main():
     burst = noise_burst(
         sample_rate=sample_rate,
         length_s=length_audio_s,
-        burst_width_s=burst_width_s
+        burst_width_s=burst_width_s,
+        normalize=normalize_burst,
     )
 
     # ==== Create f0 frames (delay lengths) ================
