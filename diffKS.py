@@ -24,6 +24,7 @@ class DiffKS(nn.Module):
         gain: Optional[float] = None,  # <--- None => learnable; non-None => fixed
         excitation_filter_order: int = 1,
         requires_grad : bool = True,
+        interp_type: str = "linear",
     ):
         super().__init__()
         assert l_filter_order >= 1, "Filter order must be at least 1"
@@ -37,6 +38,7 @@ class DiffKS(nn.Module):
         self.coeff_vector_size = int(self.sample_rate // self.lowest_note_in_hz) + self.num_active_indexes
         self.excitation_filter_order = excitation_filter_order
         self.requires_grad = requires_grad
+        self.interp_type = interp_type
 
         if gain is None:
             self.raw_gain = nn.Parameter(torch.tensor(0.0))
@@ -67,18 +69,43 @@ class DiffKS(nn.Module):
         A = torch.zeros((1, n_samples, self.coeff_vector_size), device=self.excitation.device)
         b = coeff_interp  # shape: (n_samples, num_coefficients)
 
-        # First term: z^L
-        A[0, torch.arange(n_samples), idxs[0]] = -(1 - alfa) * b[:, 0]
-
-        # Middle terms with crossfade
-        for i in range(1, self.num_coefficients):
-            A[0, torch.arange(n_samples), idxs[i]] = -(alfa * b[:, i - 1] + (1 - alfa) * b[:, i])
-
-        # Last term: z^(L + l_filter_order)
-        A[0, torch.arange(n_samples), idxs[-1]] = -alfa * b[:, -1]
-
         x = torch.zeros(n_samples, device=self.excitation.device)
         x[: self.excitation.shape[0]] = self.excitation
+
+        if self.interp_type == "linear":
+            # First term: z^L
+            A[0, torch.arange(n_samples), idxs[0]] = -(1 - alfa) * b[:, 0]
+
+            # Middle terms with crossfade
+            for i in range(1, self.num_coefficients):
+                A[0, torch.arange(n_samples), idxs[i]] = -(alfa * b[:, i - 1] + (1 - alfa) * b[:, i])
+
+            # Last term: z^(L + l_filter_order)
+            A[0, torch.arange(n_samples), idxs[-1]] = -alfa * b[:, -1]
+        elif self.interp_type == "allpass":
+            eps = 1e-6
+            real_period = delay_interp
+            omega = 2 * torch.pi / (real_period * self.sample_rate)
+            zs = torch.exp(1j * omega.view(-1, 1)) ** -torch.arange(self.num_coefficients).view(1, -1)
+            p_a = -torch.angle(torch.sum(b * zs, dim=-1, keepdim=False)) / omega
+            quantized_period = torch.floor(real_period - p_a - eps)
+            p_c = real_period - quantized_period - p_a
+
+            C = (1 - p_c) / (1 + p_c)
+            x = torch.cat([x[0:1], x[1:] + x[:-1] * C[1:]])
+
+            A[0, torch.arange(n_samples), 0] = C
+
+            A[0, torch.arange(n_samples), idxs[0]] = -C * b[:, 0]
+
+            for i in range(1, self.num_coefficients):
+                A[0, torch.arange(n_samples), idxs[i]] = -(b[:, i - 1] + C * b[:, i])
+
+            A[0, torch.arange(n_samples), idxs[-1]] = -b[:, -1]
+        elif self.interp_type == "lagrange":
+            raise NotImplementedError # todo
+        else:
+            raise NotImplementedError
 
         if self.requires_grad:
             x = sample_wise_lpc(x.unsqueeze(0), self.exc_coefficients)

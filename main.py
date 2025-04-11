@@ -35,6 +35,7 @@ def main():
     lowest_note_in_hz  = mp["lowest_note_in_hz"]
     loop_filter_order = mp["l_filter_order"]
     exc_filter_order = mp["exc_filter_order"]
+    interp_type = mp["interp_type"]
 
     use_in_domain      = idp["use_in_domain"]
     b_start, b_mid, b_end = idp["b_start"], idp["b_mid"], idp["b_end"]
@@ -61,6 +62,7 @@ def main():
         l_filter_order=loop_filter_order,
         excitation_filter_order=exc_filter_order,
         requires_grad=True,
+        interp_type=interp_type,
     )
 
     # ==== Create Baseline audio (to be optimized) =========
