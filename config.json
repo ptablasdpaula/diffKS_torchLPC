@@ -15,6 +15,7 @@
     "f0_2_Hz": 159.56,
     "n_frames": 1,
     "burst_width_in_s": 0.02,
+    "normalize_burst": true,
     "lowest_note_in_hz": 27.5,
     "interp_type": "linear"
   },

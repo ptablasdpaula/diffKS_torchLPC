@@ -174,7 +174,8 @@ def noise_burst(
     sample_rate: int,
     length_s: float,
     burst_width_s: float,
-    return_1D: bool = True
+    return_1D: bool = True,
+    normalize: bool = False,
 ) -> torch.Tensor:
     """
     Generate a single-channel noise burst and zero-pad it.
@@ -188,6 +189,10 @@ def noise_burst(
         )
 
     burst = torch.rand((1, burst_width_n, 1), device=get_device()) - 0.5
+
+    if normalize:
+        burst = burst - burst.mean()
+        burst = burst / burst.abs().max()
 
     # Zero-pad up to total_length_n
     pad_amount = total_length_n - burst_width_n
