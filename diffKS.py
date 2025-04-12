@@ -127,9 +127,14 @@ class DiffKS(nn.Module):
 
             lagrange_coeffs = alfa.view(-1, 1) - torch.arange(LAGRANGE_ORDER + 1, device=delay_interp.device).view(1, -1)
             lagrange_denom = torch.arange(LAGRANGE_ORDER, -1, -1, device=delay_interp.device).view(-1, 1) - torch.arange(LAGRANGE_ORDER + 1, device=delay_interp.device).view(1, -1)
-            lagrange_denom = lagrange_denom.unsqueeze(0)
 
-            lagrange_coeffs = torch.where(lagrange_denom != 0, lagrange_coeffs.unsqueeze(1) / lagrange_denom, torch.ones_like(lagrange_coeffs).unsqueeze(1))
+            lagrange_denom = lagrange_denom.unsqueeze(0)
+            lagrange_coeffs = lagrange_coeffs.unsqueeze(1)
+
+            lagrange_coeffs = torch.where(lagrange_denom != 0, lagrange_coeffs, 1)
+            lagrange_denom = torch.where(lagrange_denom != 0, lagrange_denom, 1)
+
+            lagrange_coeffs = lagrange_coeffs / lagrange_denom
             lagrange_coeffs = lagrange_coeffs.prod(dim=-1)
 
             b = torch.nn.functional.conv1d(b.unsqueeze(0), lagrange_coeffs.unsqueeze(1), padding=LAGRANGE_ORDER, groups=len(b)).squeeze(0)
