@@ -27,9 +27,12 @@ class DiffKS(nn.Module):
         excitation_filter_order: int = 1,
         requires_grad : bool = True,
         interp_type: str = "linear",
+        use_double_precision: bool = False,
     ):
         super().__init__()
         assert l_filter_order >= 1, "Filter order must be at least 1"
+
+        self._dtype = torch.float64 if use_double_precision else torch.float32
 
         self.n_frames = n_frames
         self.sample_rate = sample_rate
@@ -41,21 +44,21 @@ class DiffKS(nn.Module):
         self.requires_grad = requires_grad
 
         if gain is None:
-            self.raw_gain = nn.Parameter(torch.tensor(0.0))
+            self.raw_gain = nn.Parameter(torch.tensor(0.0, dtype=self._dtype))
         else:
-            clamped = float(torch.clamp(torch.tensor(gain), 1e-6, 1 - 1e-6))
-            self.register_buffer("raw_gain", torch.logit(torch.tensor(clamped)))
+            clamped = float(torch.clamp(torch.tensor(gain, dtype=self._dtype), 1e-6, 1 - 1e-6))
+            self.register_buffer("raw_gain", torch.logit(torch.tensor(clamped, dtype=self._dtype)))
 
         if init_coeffs_frames is None:
-            raw_init = torch.empty(self.n_frames, self.num_coefficients).uniform_(*coeff_range)
+            raw_init = torch.empty(self.n_frames, self.num_coefficients, dtype=self._dtype).uniform_(*coeff_range)
         else:
-            raw_init = torch.special.logit(init_coeffs_frames)
+            raw_init = torch.special.logit(init_coeffs_frames).to(self._dtype)
 
         self.raw_coeff_frames = nn.Parameter(raw_init)
 
-        # The excitation burst is stored as a non-trainable buffer
-        self.register_buffer("excitation", burst.float())
-        self.exc_coefficients = nn.Parameter(torch.zeros(1, self.excitation.size(0), self.excitation_filter_order, requires_grad=requires_grad))
+        self.register_buffer("excitation", burst.to(self._dtype))
+        self.exc_coefficients = nn.Parameter(torch.zeros(1, self.excitation.size(0), self.excitation_filter_order,
+                                                         requires_grad=requires_grad, dtype=self._dtype))
 
     @property
     def interp_type(self):
@@ -83,7 +86,7 @@ class DiffKS(nn.Module):
         idxs = [z_l + i for i in range(self.num_active_indexes)]
         assert torch.all(idxs[-1] < self.coeff_vector_size), "Delay index exceeds the buffer size"
 
-        A = torch.zeros((1, n_samples, self.coeff_vector_size), device=self.excitation.device)
+        A = torch.zeros((1, n_samples, self.coeff_vector_size), device=self.excitation.device, dtype=self._dtype)
         b = coeff_interp  # shape: (n_samples, num_coefficients)
 
         x = torch.zeros(n_samples, device=self.excitation.device)
@@ -125,7 +128,7 @@ class DiffKS(nn.Module):
             idxs = [z_l + i for i in range(self.num_active_indexes)]
             assert torch.all(idxs[-1] < self.coeff_vector_size), "Delay index exceeds the buffer size"
 
-            lagrange_coeffs = alfa.view(-1, 1) - torch.arange(LAGRANGE_ORDER + 1, device=delay_interp.device).view(1, -1)
+            lagrange_coeffs = alfa.view(-1, 1) - torch.arange(LAGRANGE_ORDER + 1, device=delay_interp.device, dtype=self._dtype).view(1, -1)
             lagrange_denom = torch.arange(LAGRANGE_ORDER, -1, -1, device=delay_interp.device).view(-1, 1) - torch.arange(LAGRANGE_ORDER + 1, device=delay_interp.device).view(1, -1)
 
             lagrange_denom = lagrange_denom.unsqueeze(0)
@@ -186,13 +189,15 @@ class DiffKS(nn.Module):
             if self.n_frames == 1:
                 return delay_len_frames.repeat(num_samples), coeff_frames.repeat(num_samples, 1)
 
-            t_in = torch.linspace(0, 1, steps=self.n_frames,
-                                  device=delay_len_frames.device)
-            t_out = torch.linspace(0, 1, steps=num_samples,
-                                   device=delay_len_frames.device)
+            delay_len_frames_ = delay_len_frames.to(self._dtype)
 
-            delay_input = delay_len_frames.view(1, self.n_frames, 1)
-            coeff_input = coeff_frames.view(1, self.n_frames, self.num_coefficients)
+            t_in = torch.linspace(0, 1, steps=self.n_frames,
+                                  device=delay_len_frames_.device, dtype=self._dtype)
+            t_out = torch.linspace(0, 1, steps=num_samples,
+                                   device=delay_len_frames_.device, dtype=self._dtype)
+
+            delay_input = delay_len_frames_.view(1, self.n_frames, 1)
+            coeff_input = coeff_frames.view(1, self.n_frames, self.num_coefficients).to(dtype=self._dtype)
 
             delay_coeffs = natural_cubic_spline_coeffs(t_in, delay_input)
             coeffs_coeffs = natural_cubic_spline_coeffs(t_in, coeff_input)

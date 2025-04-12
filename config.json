@@ -15,6 +15,7 @@
     "f0_1_Hz": 159.56,
     "f0_2_Hz": 159.56,
     "n_frames": 1,
+    "use_double_precision": true,
     "burst_width_in_s": 0.02,
     "normalize_burst": true,
     "lowest_note_in_hz": 27.5,
