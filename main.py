@@ -23,6 +23,7 @@ def main():
     learning_rate      = hp["learning_rate"]
     max_epochs         = hp["max_epochs"]
     stft_weight        = hp["stft_weight"]
+    use_A_weighing     = hp["use_A_weighing"]
     min_action_weight  = hp["min_action_weight"]
     min_action_dist    = hp.get("min_action_distance", "l2")
 
@@ -114,7 +115,9 @@ def main():
 
     # ==== Setup optimizer and loss ========================
     optimizer = torch.optim.Adam(p_model.parameters(), lr=learning_rate)
-    loss_fn = multi_stft_loss(scale_invariance=True)
+    loss_fn = multi_stft_loss(scale_invariance=True,
+                              perceptual_weighting=use_A_weighing,
+                              sample_rate=sample_rate,)
 
     # For plotting the loss curve
     loss_curve = []
