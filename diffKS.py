@@ -36,17 +36,9 @@ class DiffKS(nn.Module):
         self.lowest_note_in_hz = lowest_note_in_hz
         self.l_filter_order = l_filter_order
         self.num_coefficients = l_filter_order + 1 # To account for DC coefficient
-        self.num_active_indexes = self.num_coefficients
-        if interp_type == "linear":
-            self.num_active_indexes += 1
-        elif interp_type == "allpass":
-            self.num_active_indexes += 1
-        elif interp_type == "lagrange":
-            self.num_active_indexes += LAGRANGE_ORDER
-        self.coeff_vector_size = int(self.sample_rate // self.lowest_note_in_hz) + self.num_active_indexes
+        self.interp_type = interp_type
         self.excitation_filter_order = excitation_filter_order
         self.requires_grad = requires_grad
-        self.interp_type = interp_type
 
         if gain is None:
             self.raw_gain = nn.Parameter(torch.tensor(0.0))
@@ -64,6 +56,23 @@ class DiffKS(nn.Module):
         # The excitation burst is stored as a non-trainable buffer
         self.register_buffer("excitation", burst.float())
         self.exc_coefficients = nn.Parameter(torch.zeros(1, self.excitation.size(0), self.excitation_filter_order, requires_grad=requires_grad))
+
+    @property
+    def interp_type(self):
+        return self._interp_type
+
+    @interp_type.setter
+    def interp_type(self, value: str):
+        assert value in ["linear", "allpass", "lagrange"], "Invalid interpolation type"
+        self._interp_type = value
+        if value == "linear":
+            self.num_active_indexes = self.num_coefficients + 1
+        elif value == "allpass":
+            self.num_active_indexes = self.num_coefficients + 1
+        elif value == "lagrange":
+            self.num_active_indexes = self.num_coefficients + LAGRANGE_ORDER
+
+        self.coeff_vector_size = int(self.sample_rate // self.lowest_note_in_hz) + self.num_active_indexes
 
     def forward(self, delay_len_frames: torch.Tensor, n_samples: int) -> torch.Tensor:
         delay_interp, coeff_interp = self.get_upsampled_parameters(delay_len_frames, n_samples)
@@ -113,18 +122,20 @@ class DiffKS(nn.Module):
         elif self.interp_type == "lagrange":
             z_l = torch.floor(delay_interp).long() - LAGRANGE_ORDER // 2
             alfa = delay_interp - z_l
+            idxs = [z_l + i for i in range(self.num_active_indexes)]
+            assert torch.all(idxs[-1] < self.coeff_vector_size), "Delay index exceeds the buffer size"
 
             lagrange_coeffs = alfa.view(-1, 1) - torch.arange(LAGRANGE_ORDER + 1, device=delay_interp.device).view(1, -1)
-            lagrange_denom = torch.arange(LAGRANGE_ORDER + 1, device=delay_interp.device).view(1, -1) - torch.arange(LAGRANGE_ORDER + 1, device=delay_interp.device).view(-1, 1)
+            lagrange_denom = torch.arange(LAGRANGE_ORDER, -1, -1, device=delay_interp.device).view(-1, 1) - torch.arange(LAGRANGE_ORDER + 1, device=delay_interp.device).view(1, -1)
+            lagrange_denom = lagrange_denom.unsqueeze(0)
 
-            lagrange_coeffs = lagrange_coeffs.unsqueeze(-1) / lagrange_denom.T.unsqueeze(0)
-            lagrange_coeffs = torch.where(lagrange_coeffs.isfinite(), lagrange_coeffs, torch.ones_like(lagrange_coeffs))
+            lagrange_coeffs = torch.where(lagrange_denom != 0, lagrange_coeffs.unsqueeze(1) / lagrange_denom, torch.ones_like(lagrange_coeffs).unsqueeze(1))
             lagrange_coeffs = lagrange_coeffs.prod(dim=-1)
 
             b = torch.nn.functional.conv1d(b.unsqueeze(0), lagrange_coeffs.unsqueeze(1), padding=LAGRANGE_ORDER, groups=len(b)).squeeze(0)
 
             for i, idx in enumerate(idxs):
-                A[0, torch.arange(n_samples), idx] = b[:, i]
+                A[0, torch.arange(n_samples), idx] = -b[:, i]
 
         else:
             raise NotImplementedError
