@@ -3,6 +3,7 @@
     "learning_rate": 0.035,
     "max_epochs": 500,
     "stft_weight": 100,
+    "use_A_weighing": true,
     "min_action_weight": 10,
     "min_action_distance": "l2",
     "patience_epochs": 10,
