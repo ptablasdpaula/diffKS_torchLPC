@@ -37,6 +37,7 @@ def main():
     loop_filter_order = mp["l_filter_order"]
     exc_filter_order = mp["exc_filter_order"]
     interp_type = mp["interp_type"]
+    use_double_precision = mp["use_double_precision"]
     normalize_burst = mp["normalize_burst"]
 
     use_in_domain      = idp["use_in_domain"]
@@ -66,6 +67,7 @@ def main():
         excitation_filter_order=exc_filter_order,
         requires_grad=True,
         interp_type=interp_type,
+        use_double_precision=use_double_precision,
     )
 
     # ==== Create Baseline audio (to be optimized) =========
@@ -95,7 +97,9 @@ def main():
             init_coeffs_frames=t_coeff_frames,
             gain=t_gain,
             l_filter_order=loop_filter_order,
-            requires_grad=False
+            requires_grad=False,
+            interp_type=interp_type,
+            use_double_precision=use_double_precision,
         )
 
         t_audio = ks_to_audio(
