@@ -59,6 +59,7 @@ class DiffKS(nn.Module):
         self.register_buffer("excitation", burst.to(self._dtype))
         self.exc_coefficients = nn.Parameter(torch.zeros(1, self.excitation.size(0), self.excitation_filter_order,
                                                          requires_grad=requires_grad, dtype=self._dtype))
+        self.register_buffer("excitation_filter_out", burst.to(self._dtype)) # Buffer to store the excitation filter out in the last training run
 
     @property
     def interp_type(self):
@@ -77,7 +78,10 @@ class DiffKS(nn.Module):
 
         self.coeff_vector_size = int(self.sample_rate // self.lowest_note_in_hz) + self.num_active_indexes
 
-    def forward(self, delay_len_frames: torch.Tensor, n_samples: int) -> torch.Tensor:
+    def forward(self,
+                delay_len_frames: torch.Tensor,
+                n_samples: int,
+                save_exc_filter_out: bool = False) -> torch.Tensor:
         delay_interp, coeff_interp = self.get_upsampled_parameters(delay_len_frames, n_samples)
 
         z_l = torch.floor(delay_interp).long()
@@ -153,8 +157,14 @@ class DiffKS(nn.Module):
         else:
             x = x.unsqueeze(0)
 
+        if save_exc_filter_out:
+           self.excitation_filter_out = x
+
         y_out = sample_wise_lpc(x, A)
         return y_out.squeeze(0)
+
+    def get_excitation_filter_out(self):
+        return self.excitation_filter_out
 
     def get_gain(self):
         return torch.sigmoid(self.raw_gain)

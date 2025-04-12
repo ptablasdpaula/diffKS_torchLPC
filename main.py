@@ -9,7 +9,7 @@ from utils import (
     make_symmetric_mirrored_coefficient_frame_linspace,
     ks_to_audio,
     process_target,
-    compute_minimum_action, plot_coefficient_comparison, plot_upsampled_filter_coeffs  # <--- import from utils
+    compute_minimum_action, plot_coefficient_comparison, plot_upsampled_filter_coeffs, plot_excitation_filter_analysis  # <--- import from utils
 )
 
 def main():
@@ -212,6 +212,24 @@ def main():
         length_audio_s=length_audio_s,
         title="Cubic predicted",
         save_path="coefficient_upsampled.png"
+    )
+
+    # ==== Plot Excitation Filter coefficients and Output ==
+    with torch.no_grad():
+        _ = p_model(delay_len_frames=f0_frames, n_samples=length_audio_n, save_exc_filter_out=True)
+
+        exc_filt_out = p_model.get_excitation_filter_out()
+        exc_coeffs = p_model.exc_coefficients
+        burst_in = p_model.excitation
+
+    plot_excitation_filter_analysis(
+        burst=burst_in,
+        exc_filt_out=exc_filt_out,
+        exc_coeffs=exc_coeffs,
+        sample_rate=sample_rate,
+        max_time_s=0.05,
+        save_path="excitation_filter_analysis.png",
+        show_plot=False
     )
 
     # ==== Save final model output =========================
