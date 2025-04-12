@@ -336,3 +336,83 @@ def plot_upsampled_filter_coeffs(
     else:
         plt.savefig(save_path)
     plt.close()
+
+def plot_excitation_filter_analysis(
+    burst: torch.Tensor,
+    exc_filt_out: torch.Tensor,
+    exc_coeffs: torch.Tensor,
+    sample_rate: int,
+    max_time_s: float = 0.25,
+    save_path: str = "excitation_filter_analysis.png",
+    show_plot: bool = False
+):
+    """
+    Plots:
+      - Top subplot: The first `max_time_s` seconds of:
+          (1) The initial noise burst
+          (2) The audio after the excitation filter
+      - Bottom subplot: The corresponding excitation filter coefficients
+
+    Args:
+        burst:          The initial noise burst, shape [burst_size].
+        exc_filt_out:   Excitation-filtered audio, shape [n_samples].
+        exc_coeffs:     The learned filter coefficients, typically shape [1, burst_size, filter_order]
+                        or [burst_size, filter_order].
+        sample_rate:    Sample rate of the audio.
+        max_time_s:     How many seconds from the start to display for both waveforms.
+        save_path:      Where to save the generated figure.
+        show_plot:      If True, will display the figure window; otherwise just saves.
+    """
+    # Convert everything to 1D arrays if necessary
+    burst = burst.squeeze()
+    exc_filt_out = exc_filt_out.squeeze()
+
+    burst_np = burst.detach().cpu().numpy()
+    exc_filt_out_np = exc_filt_out.detach().cpu().numpy()
+
+    # Convert coefficients
+    coeffs_np = exc_coeffs.detach().cpu().numpy()
+    if coeffs_np.ndim == 3:
+        coeffs_np = coeffs_np.squeeze(0)  # shape => [burst_size, filter_order]
+
+    # Slice waveforms to first max_time_s
+    burst_len = burst_np.shape[0]
+    exc_len = exc_filt_out_np.shape[0]
+
+    max_burst_samps = min(int(sample_rate * max_time_s), burst_len)
+    max_exc_samps   = min(int(sample_rate * max_time_s), exc_len)
+
+    burst_np = burst_np[:max_burst_samps]
+    burst_time = np.linspace(0, max_time_s, max_burst_samps)
+
+    exc_filt_out_np = exc_filt_out_np[:max_exc_samps]
+    exc_time        = np.linspace(0, max_time_s, max_exc_samps)
+
+    if coeffs_np.shape[0] == burst_len:
+        coeffs_np = coeffs_np[:max_burst_samps]
+
+    fig, axs = plt.subplots(2, 1, figsize=(10, 6), sharex=False)
+    fig.suptitle("Excitation Filter Analysis")
+
+    # --- Top subplot: Original burst & excitation-filtered audio
+    axs[0].plot(burst_time, burst_np, label="Initial Noise Burst", alpha=0.75)
+    axs[0].plot(exc_time, exc_filt_out_np, label="After Excitation Filter", alpha=0.75)
+    axs[0].set_xlabel("Time (s)")
+    axs[0].set_ylabel("Amplitude")
+    axs[0].legend()
+    axs[0].grid(True)
+
+    # --- Bottom subplot: Filter coefficients
+    for c in range(coeffs_np.shape[1]):
+        axs[1].plot(coeffs_np[:, c], label=f"Coeff {c+1}")
+    axs[1].set_xlabel("Sample index (of first portion)")
+    axs[1].set_ylabel("Filter Coeff Value")
+    axs[1].legend()
+    axs[1].grid(True)
+
+    plt.tight_layout()
+    plt.savefig(save_path)
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
