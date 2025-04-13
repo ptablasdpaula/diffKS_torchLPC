@@ -81,13 +81,14 @@ def main():
     )
 
     # ==== Create Baseline audio (to be optimized) =========
-    _ = ks_to_audio(
+    '''_ = ks_to_audio(
         model=p_model,
         out_path="audio/initial.wav",
         f0_frames=f0_frames,
         sample_rate=sample_rate,
         length_audio_s=length_audio_s
     )
+'''
 
     # ==== Generate target audio ===========================
     if use_in_domain:
@@ -141,7 +142,9 @@ def main():
     progress_bar = tqdm(range(max_epochs), desc="Training")
     for epoch in progress_bar:
         # Forward
-        output = p_model(delay_len_frames=f0_frames, n_samples=length_audio_n)
+        output = p_model(delay_len_frames=f0_frames,
+                         n_samples=length_audio_n,
+                         target=t_audio,)
 
         # Multi-resolution STFT loss
         stft_loss = loss_fn(
@@ -226,7 +229,7 @@ def main():
 
     # ==== Excitation Filter Analysis =============================
     with torch.no_grad():
-        _ = p_model(delay_len_frames=f0_frames, n_samples=length_audio_n, save_exc_filter_out=True)
+        _ = p_model(delay_len_frames=f0_frames, n_samples=length_audio_n, save_exc_filter_out=True, target = t_audio)
 
         exc_filt_out = p_model.get_excitation_filter_out()
         exc_coeffs = p_model.exc_coefficients
@@ -259,7 +262,8 @@ def main():
             out_path="audio/optimized_model.wav",
             f0_frames=f0_frames,
             sample_rate=sample_rate,
-            length_audio_s=length_audio_s
+            length_audio_s=length_audio_s,
+            target_audio=t_audio,
         )
 
 if __name__ == "__main__":
