@@ -9,7 +9,7 @@ from utils import (
     make_symmetric_mirrored_coefficient_frame_linspace,
     ks_to_audio,
     process_target,
-    compute_minimum_action, plot_coefficient_comparison, plot_upsampled_filter_coeffs, plot_excitation_filter_analysis  # <--- import from utils
+    compute_minimum_action, plot_coefficient_comparison, plot_upsampled_filter_coeffs, plot_excitation_filter_analysis, plot_excitation_filter_coefficients  # <--- import from utils
 )
 
 def main():
@@ -35,9 +35,14 @@ def main():
     burst_width_s      = mp["burst_width_in_s"]
     lowest_note_in_hz  = mp["lowest_note_in_hz"]
     loop_filter_order = mp["l_filter_order"]
-    exc_filter_order = mp["exc_filter_order"]
+
     interp_type = mp["interp_type"]
     use_double_precision = mp["use_double_precision"]
+
+    exc_filter_order = mp["exc_filter_order"]
+    burst_length_in_s = mp["burst_length_in_s"]
+    exc_filter_n_frames = mp["exc_filter_n_frames"]
+
     normalize_burst = mp["normalize_burst"]
 
     use_in_domain      = idp["use_in_domain"]
@@ -47,7 +52,7 @@ def main():
     # ==== Generate Burst ==================================
     burst = noise_burst(
         sample_rate=sample_rate,
-        length_s=length_audio_s,
+        length_s=burst_length_in_s,
         burst_width_s=burst_width_s,
         normalize=normalize_burst,
     )
@@ -55,6 +60,10 @@ def main():
     # ==== Create f0 frames (delay lengths) ================
     f0_1_n = sample_rate / f0_1_Hz
     f0_2_n = sample_rate / f0_2_Hz
+
+    # TODO, delay_len should have its own frames:
+    # loop coefficients benefit from 1, but if vibrato
+    # pitch bend, etc... It can't be captured
     f0_frames = torch.linspace(f0_1_n, f0_2_n, n_frames)
 
     # ==== Initialize Model ================================
@@ -68,6 +77,7 @@ def main():
         requires_grad=True,
         interp_type=interp_type,
         use_double_precision=use_double_precision,
+        excitation_filter_n_frames=exc_filter_n_frames,
     )
 
     # ==== Create Baseline audio (to be optimized) =========
@@ -214,7 +224,7 @@ def main():
         save_path="coefficient_upsampled.png"
     )
 
-    # ==== Plot Excitation Filter coefficients and Output ==
+    # ==== Excitation Filter Analysis =============================
     with torch.no_grad():
         _ = p_model(delay_len_frames=f0_frames, n_samples=length_audio_n, save_exc_filter_out=True)
 
@@ -227,9 +237,19 @@ def main():
         exc_filt_out=exc_filt_out,
         exc_coeffs=exc_coeffs,
         sample_rate=sample_rate,
-        max_time_s=0.05,
+        max_time_s=burst_length_in_s,
         save_path="excitation_filter_analysis.png",
         show_plot=False
+    )
+
+    # ==== Plot Excitation Filter coefficients after upsampling ==
+    plot_excitation_filter_coefficients(
+        model=p_model,
+        f0_frames=f0_frames,
+        sample_rate=sample_rate,
+        length_audio_s=length_audio_s,
+        title="Excitation Filter Coefficients",
+        save_path="excitation_coefficients.png"
     )
 
     # ==== Save final model output =========================

@@ -24,7 +24,8 @@ class DiffKS(nn.Module):
         init_coeffs_frames: Optional[torch.Tensor] = None,
         coeff_range: Tuple[float, float] = (-2, 0),
         gain: Optional[float] = None,  # <--- None => learnable; non-None => fixed
-        excitation_filter_order: int = 1,
+        excitation_filter_order: int = 5,
+        excitation_filter_n_frames: int = 100,
         requires_grad : bool = True,
         interp_type: str = "linear",
         use_double_precision: bool = False,
@@ -36,11 +37,14 @@ class DiffKS(nn.Module):
 
         self.n_frames = n_frames
         self.sample_rate = sample_rate
+
         self.lowest_note_in_hz = lowest_note_in_hz
         self.l_filter_order = l_filter_order
         self.num_coefficients = l_filter_order + 1 # To account for DC coefficient
         self.interp_type = interp_type
+
         self.excitation_filter_order = excitation_filter_order
+        self.excitation_filter_n_frames = excitation_filter_n_frames
         self.requires_grad = requires_grad
 
         if gain is None:
@@ -57,8 +61,7 @@ class DiffKS(nn.Module):
         self.raw_coeff_frames = nn.Parameter(raw_init)
 
         self.register_buffer("excitation", burst.to(self._dtype))
-        self.exc_coefficients = nn.Parameter(torch.zeros(1, self.excitation.size(0), self.excitation_filter_order,
-                                                         requires_grad=requires_grad, dtype=self._dtype))
+        self.exc_coefficients = nn.Parameter(torch.zeros(self.excitation_filter_n_frames, self.excitation_filter_order, dtype=self._dtype))
         self.register_buffer("excitation_filter_out", burst.to(self._dtype)) # Buffer to store the excitation filter out in the last training run
 
     @property
@@ -82,7 +85,7 @@ class DiffKS(nn.Module):
                 delay_len_frames: torch.Tensor,
                 n_samples: int,
                 save_exc_filter_out: bool = False) -> torch.Tensor:
-        delay_interp, coeff_interp = self.get_upsampled_parameters(delay_len_frames, n_samples)
+        delay_interp, coeff_interp, exc_filt_interp = self.get_upsampled_parameters(delay_len_frames, n_samples)
 
         z_l = torch.floor(delay_interp).long()
         alfa = delay_interp - z_l
@@ -152,16 +155,25 @@ class DiffKS(nn.Module):
         else:
             raise NotImplementedError
 
+        burst_length = self.excitation.shape[0]
+        burst_only = x[:burst_length]
+
         if self.requires_grad:
-            x = sample_wise_lpc(x.unsqueeze(0), self.exc_coefficients)
+            a_in = exc_filt_interp.unsqueeze(0)
+            filtered_burst = sample_wise_lpc(burst_only.unsqueeze(0), a_in)
         else:
-            x = x.unsqueeze(0)
+            filtered_burst = burst_only
+
+        # Now zero-pad the filtered result to full length
+        x = torch.zeros(n_samples, device=self.excitation.device)
+        x[:burst_length] = filtered_burst
+        x = x.unsqueeze(0)
 
         if save_exc_filter_out:
            self.excitation_filter_out = x
 
         y_out = sample_wise_lpc(x, A)
-        return y_out.squeeze(0)
+        return y_out.squeeze(0).to(torch.float32)
 
     def get_excitation_filter_out(self):
         return self.excitation_filter_out
@@ -188,39 +200,89 @@ class DiffKS(nn.Module):
             return compute_coeffs()
 
     def get_upsampled_parameters(
-        self,
-        delay_len_frames: torch.Tensor,
-        num_samples: int,
-        for_plotting: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+            self,
+            delay_len_frames: torch.Tensor,
+            num_samples: int,
+            for_plotting: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Upsample:
+          1) delay_len_frames -> delay_interp ( shape: [num_samples] )
+          2) self.raw_coeff_frames -> coeff_interp ( shape: [num_samples, self.num_coefficients] )
+          3) self.raw_excitation_filter_frames -> exc_filt_interp ( shape: [num_samples, excitation_filter_order] )
+
+        Returns (delay_interp, coeff_interp, exc_filt_interp).
+        """
         coeff_frames = self.get_constrained_coefficients(for_plotting=for_plotting)
+        exc_filter_frames_ = self.exc_coefficients
 
         def interpolate_fn():
+            # Interpolation for delay (f0) and coefficients
             if self.n_frames == 1:
-                return delay_len_frames.repeat(num_samples), coeff_frames.repeat(num_samples, 1)
+                coeff_i = coeff_frames.repeat(num_samples, 1)
 
-            delay_len_frames_ = delay_len_frames.to(self._dtype)
+                # TODO, delay_len should have its own frames:
+                # loop coefficients benefit from 1, but if vibrato
+                # pitch bend, etc... It can't be captured
+                delay_i = delay_len_frames.repeat(num_samples)
 
-            t_in = torch.linspace(0, 1, steps=self.n_frames,
-                                  device=delay_len_frames_.device, dtype=self._dtype)
-            t_out = torch.linspace(0, 1, steps=num_samples,
-                                   device=delay_len_frames_.device, dtype=self._dtype)
+            else:
+                delay_len_frames_ = delay_len_frames.to(self._dtype)
 
-            delay_input = delay_len_frames_.view(1, self.n_frames, 1)
-            coeff_input = coeff_frames.view(1, self.n_frames, self.num_coefficients).to(dtype=self._dtype)
+                t_in_main = torch.linspace(
+                    0, 1, steps=self.n_frames,
+                    device=delay_len_frames_.device,
+                    dtype=self._dtype
+                )
+                t_out_main = torch.linspace(
+                    0, 1, steps=num_samples,
+                    device=delay_len_frames_.device,
+                    dtype=self._dtype
+                )
 
-            delay_coeffs = natural_cubic_spline_coeffs(t_in, delay_input)
-            coeffs_coeffs = natural_cubic_spline_coeffs(t_in, coeff_input)
+                # reshape => [1, F, D]
+                delay_input = delay_len_frames_.view(1, self.n_frames, 1)
+                coeff_input = coeff_frames.view(1, self.n_frames, self.num_coefficients).to(dtype=self._dtype)
 
-            delay_interp = NaturalCubicSpline(delay_coeffs).evaluate(t_out).squeeze(0).squeeze(-1)
-            coeff_interp = NaturalCubicSpline(coeffs_coeffs).evaluate(t_out).squeeze(0)
-            return delay_interp, coeff_interp
+                # Fit splines
+                delay_coeffs = natural_cubic_spline_coeffs(t_in_main, delay_input)
+                coeffs_coeffs = natural_cubic_spline_coeffs(t_in_main, coeff_input)
+
+                delay_i = NaturalCubicSpline(delay_coeffs).evaluate(t_out_main).squeeze(0).squeeze(-1)
+                coeff_i = NaturalCubicSpline(coeffs_coeffs).evaluate(t_out_main).squeeze(0)
+
+            # Interpolation for excitation filter
+            burst_num_samples = self.excitation.shape[0]
+
+            if self.excitation_filter_n_frames == 1:
+                exc_filt_i = exc_filter_frames_.repeat(burst_num_samples, 1)
+            else:
+                t_in_exc = torch.linspace(
+                    0, 1, steps=self.excitation_filter_n_frames,
+                    device=exc_filter_frames_.device,
+                    dtype=self._dtype
+                )
+                t_out_exc = torch.linspace(
+                    0, 1, steps=burst_num_samples,
+                    device=exc_filter_frames_.device,
+                    dtype=self._dtype
+                )
+                # shape => [1, exc_frames, exc_filter_order]
+                exc_input = exc_filter_frames_.unsqueeze(0)
+
+                exc_coeffs = natural_cubic_spline_coeffs(t_in_exc, exc_input)
+                exc_filt_i = NaturalCubicSpline(exc_coeffs).evaluate(t_out_exc)
+                # => shape [1, burst_num_samples, exc_filter_order]
+                exc_filt_i = exc_filt_i.squeeze(0)  # => [burst_num_samples, exc_filter_order]
+
+            return delay_i, coeff_i, exc_filt_i
 
         if for_plotting:
             with torch.no_grad():
-                delay, coeffs = interpolate_fn()
-                return delay.detach().cpu(), coeffs.detach().cpu()
-        return interpolate_fn()
+                d, c, e = interpolate_fn()
+                return d.detach().cpu(), c.detach().cpu(), e.detach().cpu()
+        else:
+            return interpolate_fn()
 
 
 def noise_burst(
