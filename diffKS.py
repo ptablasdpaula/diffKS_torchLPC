@@ -8,6 +8,57 @@ from utils import get_device
 
 LAGRANGE_ORDER = 5
 
+class InvertLPC(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, y, A, zi):
+        B, T = y.shape
+        N = A.shape[2]
+
+        if zi is not None:
+            initial = zi.flip(dims=[1])
+        else:
+            initial = y.new_zeros(B, N)
+
+        y_padded = torch.cat([initial, y], dim=1)
+        x = y.clone()
+
+        # Precompute all shifted versions in one go
+        shifts = torch.stack([y_padded[:, N - k:N - k + T] for k in range(1, N + 1)], dim=2)
+        x += (A * shifts).sum(dim=2)
+
+        ctx.save_for_backward(A, shifts, y_padded)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        A, shifts, y_padded = ctx.saved_tensors
+        B, T, N = A.shape
+        grad_y = grad_A = grad_zi = None
+
+        # Gradient for y (input signal)
+        if ctx.needs_input_grad[0]:
+            grad_y = grad_output.clone()
+            for k in range(1, N + 1):
+                grad_shifted = F.pad(grad_output, (k, 0))[:, :-k] * A[:, :, k - 1]
+                grad_y += grad_shifted
+
+        # Gradient for A (coefficients)
+        if ctx.needs_input_grad[1]:
+            grad_A = grad_output.unsqueeze(2) * shifts
+
+        # Gradient for zi (initial conditions)
+        if ctx.needs_input_grad[2]:
+            grad_zi = torch.zeros_like(y_padded[:, :N])
+            for k in range(1, N + 1):
+                grad_zi[:, N - k] = (grad_output[:, :k] * A[:, :k, k - 1]).sum(dim=1)
+            grad_zi = grad_zi.flip(dims=[1])
+
+        return grad_y, grad_A, grad_zi
+
+
+def invert_lpc(y: torch.Tensor, A: torch.Tensor, zi: torch.Tensor = None) -> torch.Tensor:
+    return InvertLPC.apply(y, A, zi)
+
 class DiffKS(nn.Module):
     """
     A differentiable Karplus–Strong model with time-varying fractional delay
@@ -84,6 +135,7 @@ class DiffKS(nn.Module):
     def forward(self,
                 delay_len_frames: torch.Tensor,
                 n_samples: int,
+                target: torch.Tensor = None,
                 save_exc_filter_out: bool = False) -> torch.Tensor:
         delay_interp, coeff_interp, exc_filt_interp = self.get_upsampled_parameters(delay_len_frames, n_samples)
 
@@ -172,14 +224,32 @@ class DiffKS(nn.Module):
         if save_exc_filter_out:
            self.excitation_filter_out = x
 
-        y_out = sample_wise_lpc(x, A)
+        # Now we obtain plucking signal through inverse filtering of the
+        # predicted filters:
+
+        y_target = target.squeeze(0)
+        x_est = invert_lpc(y_target, A)
+
+        pad_length = n_samples - burst_length
+
+        pad_shape = (1, pad_length, self.excitation_filter_order)
+        pad_coeffs = torch.zeros(pad_shape, device=a_in.device, dtype=self._dtype)
+        pad_coeffs[:, :, 0] = 1.0  # Set DC term to 1 for identity beyond burst
+
+        a_in_padded = torch.cat([a_in, pad_coeffs], dim=1)
+
+        pluck_est = invert_lpc(x_est, a_in_padded)
+
+        # Once the plucking signal is obtained, we filter it again through the pred. filts.
+        y_out = sample_wise_lpc(pluck_est, A)
+
         return y_out.squeeze(0).to(torch.float32)
 
     def get_excitation_filter_out(self):
         return self.excitation_filter_out
 
     def get_gain(self):
-        return torch.sigmoid(self.raw_gain)
+        return torch.sigmoid(self.raw_gain) * 0.1 + 0.9
 
     def get_constrained_coefficients(self, for_plotting: bool = False) -> torch.Tensor:
         """
