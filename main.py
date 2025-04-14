@@ -9,7 +9,7 @@ from utils import (
     make_symmetric_mirrored_coefficient_frame_linspace,
     ks_to_audio,
     process_target,
-    compute_minimum_action  # <--- import from utils
+    compute_minimum_action, plot_coefficient_comparison, plot_upsampled_filter_coeffs, plot_excitation_filter_analysis, plot_excitation_filter_coefficients  # <--- import from utils
 )
 
 def main():
@@ -23,27 +23,47 @@ def main():
     learning_rate      = hp["learning_rate"]
     max_epochs         = hp["max_epochs"]
     stft_weight        = hp["stft_weight"]
+    use_A_weighing     = hp["use_A_weighing"]
     min_action_weight  = hp["min_action_weight"]
     min_action_dist    = hp.get("min_action_distance", "l2")
+
+    patience_epochs = hp["patience_epochs"]
+    patience_delta = hp["patience_delta"]
 
     f0_1_Hz, f0_2_Hz   = mp["f0_1_Hz"], mp["f0_2_Hz"]
     n_frames           = mp["n_frames"]
     burst_width_s      = mp["burst_width_in_s"]
     lowest_note_in_hz  = mp["lowest_note_in_hz"]
+    loop_filter_order = mp["l_filter_order"]
+
+    interp_type = mp["interp_type"]
+    use_double_precision = mp["use_double_precision"]
+
+    exc_filter_order = mp["exc_filter_order"]
+    burst_length_in_s = mp["burst_length_in_s"]
+    exc_filter_n_frames = mp["exc_filter_n_frames"]
+
+    normalize_burst = mp["normalize_burst"]
 
     use_in_domain      = idp["use_in_domain"]
     b_start, b_mid, b_end = idp["b_start"], idp["b_mid"], idp["b_end"]
+    t_gain = idp["gain"]
 
     # ==== Generate Burst ==================================
     burst = noise_burst(
         sample_rate=sample_rate,
-        length_s=length_audio_s,
-        burst_width_s=burst_width_s
+        length_s=burst_length_in_s,
+        burst_width_s=burst_width_s,
+        normalize=normalize_burst,
     )
 
     # ==== Create f0 frames (delay lengths) ================
     f0_1_n = sample_rate / f0_1_Hz
     f0_2_n = sample_rate / f0_2_Hz
+
+    # TODO, delay_len should have its own frames:
+    # loop coefficients benefit from 1, but if vibrato
+    # pitch bend, etc... It can't be captured
     f0_frames = torch.linspace(f0_1_n, f0_2_n, n_frames)
 
     # ==== Initialize Model ================================
@@ -51,11 +71,17 @@ def main():
         burst=burst,
         n_frames=n_frames,
         sample_rate=sample_rate,
-        lowest_note_in_hz=lowest_note_in_hz
+        lowest_note_in_hz=lowest_note_in_hz,
+        l_filter_order=loop_filter_order,
+        excitation_filter_order=exc_filter_order,
+        requires_grad=True,
+        interp_type=interp_type,
+        use_double_precision=use_double_precision,
+        excitation_filter_n_frames=exc_filter_n_frames,
     )
 
     # ==== Create Baseline audio (to be optimized) =========
-    p_audio = ks_to_audio(
+    _ = ks_to_audio(
         model=p_model,
         out_path="audio/initial.wav",
         f0_frames=f0_frames,
@@ -64,12 +90,10 @@ def main():
     )
 
     # ==== Generate target audio ===========================
-    t_audio = None
-    t_coeff_frames = None  # We'll store target frames if in-domain
-
     if use_in_domain:
         t_coeff_frames = make_symmetric_mirrored_coefficient_frame_linspace(
             n_frames=n_frames,
+            l_filter_order=loop_filter_order,
             b_start=b_start,
             b_mid=b_mid,
             b_end=b_end
@@ -80,7 +104,12 @@ def main():
             n_frames=n_frames,
             sample_rate=sample_rate,
             lowest_note_in_hz=lowest_note_in_hz,
-            init_coeffs_frames=t_coeff_frames
+            init_coeffs_frames=t_coeff_frames,
+            gain=t_gain,
+            l_filter_order=loop_filter_order,
+            requires_grad=False,
+            interp_type=interp_type,
+            use_double_precision=use_double_precision,
         )
 
         t_audio = ks_to_audio(
@@ -100,10 +129,14 @@ def main():
 
     # ==== Setup optimizer and loss ========================
     optimizer = torch.optim.Adam(p_model.parameters(), lr=learning_rate)
-    loss_fn = multi_stft_loss(scale_invariance=True)
+    loss_fn = multi_stft_loss(scale_invariance=True,
+                              perceptual_weighting=use_A_weighing,
+                              sample_rate=sample_rate,)
 
     # For plotting the loss curve
     loss_curve = []
+
+    bad_epochs = 0 # For Early Stopping
 
     progress_bar = tqdm(range(max_epochs), desc="Training")
     for epoch in progress_bar:
@@ -116,14 +149,17 @@ def main():
             t_audio.unsqueeze(0).unsqueeze(0)
         ) * stft_weight
 
-        # Minimum-action loss on raw coeff frames
-        min_action_loss = compute_minimum_action(
-            p_model.raw_coeff_frames,
-            distance=min_action_dist
-        ) * min_action_weight
+        loss = stft_loss
 
-        # Combine them with separate weights
-        loss =  stft_loss +  min_action_loss
+        if n_frames > 1:
+            # Minimum-action loss on raw coeff frames
+            min_action_loss = compute_minimum_action(
+                p_model.raw_coeff_frames,
+                distance=min_action_dist
+            ) * min_action_weight
+
+            # Combine them with separate weights
+            loss += min_action_loss
 
         # Backprop
         optimizer.zero_grad()
@@ -132,11 +168,24 @@ def main():
 
         # Track and display
         loss_curve.append(loss.item())
-        progress_bar.set_postfix({
-            "stft_loss": f"{stft_loss.item():.4f}",
-            "ma_loss": f"{min_action_loss.item():.4f}",
-            "total": f"{loss.item():.4f}"
-        })
+
+        if n_frames > 1:
+            progress_bar.set_postfix({
+                "stft_loss": f"{stft_loss.item():.4f}",
+                "ma_loss": f"{min_action_loss.item():.4f}",
+                "total": f"{loss.item():.4f}"
+            })
+        else:
+            progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        if loss.item() < patience_delta:
+            bad_epochs += 1
+        else:
+            bad_epochs = 0
+
+        if bad_epochs >= patience_epochs:
+            print(f"No improvement after {patience_epochs} epochs. Early stopping at epoch {epoch}.")
+            break
 
     print("Training finished")
 
@@ -153,36 +202,55 @@ def main():
 
     # ==== Plot predicted vs target reflection coeffs ======
     with torch.no_grad():
-        pred_coeffs = p_model.get_constrained_coefficients(for_plotting=True)  # shape [n_frames, 2]
+        pred_coeffs = p_model.get_constrained_coefficients(for_plotting=True)
+        target_coeffs = t_model.get_constrained_coefficients(for_plotting=True) if use_in_domain else None
 
-        if use_in_domain and t_coeff_frames is not None:
-            # Plot predicted vs. target
-            t_frames = t_model.get_constrained_coefficients(for_plotting=True)
+        plot_coefficient_comparison(
+            predicted_coeffs=pred_coeffs,
+            target_coeffs=target_coeffs,
+            save_path="coefficient_trajectories.png"
+        )
 
-            plt.figure()
-            plt.plot(t_frames[:, 0], label="Target b1")
-            plt.plot(pred_coeffs[:, 0], label="Predicted b1")
-            plt.plot(t_frames[:, 1], label="Target b2")
-            plt.plot(pred_coeffs[:, 1], label="Predicted b2")
-            plt.title("Reflection Coefficients (Target vs. Predicted)")
-            plt.xlabel("Frame index")
-            plt.ylabel("Coefficient value")
-            plt.legend()
-            plt.grid(True)
-            plt.savefig("coeff_compare.png")  # or plt.show()
-            plt.close()
-        else:
-            # Just plot the predicted coefficients
-            plt.figure()
-            plt.plot(pred_coeffs[:, 0], label="Predicted b1")
-            plt.plot(pred_coeffs[:, 1], label="Predicted b2")
-            plt.title("Predicted Reflection Coefficients")
-            plt.xlabel("Frame index")
-            plt.ylabel("Coefficient value")
-            plt.legend()
-            plt.grid(True)
-            plt.savefig("coeff_predicted.png")  # or plt.show()
-            plt.close()
+        print (f"The Predicted Gain is {p_model.get_gain()}")
+        if use_in_domain: print(f"The Target Gain is {t_model.get_gain()}")
+
+    # ==== Plot predicted FINAL coefficients (after upsampling)
+    plot_upsampled_filter_coeffs(
+        model=p_model,
+        f0_frames=f0_frames,
+        sample_rate=sample_rate,
+        length_audio_s=length_audio_s,
+        title="Cubic predicted",
+        save_path="coefficient_upsampled.png"
+    )
+
+    # ==== Excitation Filter Analysis =============================
+    with torch.no_grad():
+        _ = p_model(delay_len_frames=f0_frames, n_samples=length_audio_n, save_exc_filter_out=True)
+
+        exc_filt_out = p_model.get_excitation_filter_out()
+        exc_coeffs = p_model.exc_coefficients
+        burst_in = p_model.excitation
+
+    plot_excitation_filter_analysis(
+        burst=burst_in,
+        exc_filt_out=exc_filt_out,
+        exc_coeffs=exc_coeffs,
+        sample_rate=sample_rate,
+        max_time_s=burst_length_in_s,
+        save_path="excitation_filter_analysis.png",
+        show_plot=False
+    )
+
+    # ==== Plot Excitation Filter coefficients after upsampling ==
+    plot_excitation_filter_coefficients(
+        model=p_model,
+        f0_frames=f0_frames,
+        sample_rate=sample_rate,
+        length_audio_s=length_audio_s,
+        title="Excitation Filter Coefficients",
+        save_path="excitation_coefficients.png"
+    )
 
     # ==== Save final model output =========================
     with torch.no_grad():
