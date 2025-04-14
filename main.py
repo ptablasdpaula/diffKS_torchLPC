@@ -9,7 +9,8 @@ from utils import (
     make_symmetric_mirrored_coefficient_frame_linspace,
     ks_to_audio,
     process_target,
-    compute_minimum_action, plot_coefficient_comparison, plot_upsampled_filter_coeffs, plot_excitation_filter_analysis, plot_excitation_filter_coefficients  # <--- import from utils
+    compute_minimum_action, plot_coefficient_comparison, plot_upsampled_filter_coeffs, plot_excitation_filter_analysis,
+    plot_excitation_filter_coefficients, save_audio_torchaudio  # <--- import from utils
 )
 
 def main():
@@ -253,6 +254,22 @@ def main():
         title="Excitation Filter Coefficients",
         save_path="excitation_coefficients.png"
     )
+
+    # ==== Plot inverse filtered signal (plucking) =========
+    inv_filt_signal = p_model.get_inverse_filtered_signal()
+    time_axis = torch.arange(len(inv_filt_signal)) / sample_rate
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(time_axis, inv_filt_signal.cpu().numpy())
+    plt.title("Inverse Filtered Signal (Plucking Excitation)")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Amplitude")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("inverse_filtered_signal.png")  # or use plt.show() to display it
+    plt.close()
+
+    save_audio_torchaudio(inv_filt_signal, sample_rate=sample_rate, out_path="audio/inversed.wav")
 
     # ==== Save final model output =========================
     with torch.no_grad():

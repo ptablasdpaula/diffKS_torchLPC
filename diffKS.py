@@ -113,7 +113,9 @@ class DiffKS(nn.Module):
 
         self.register_buffer("excitation", burst.to(self._dtype))
         self.exc_coefficients = nn.Parameter(torch.zeros(self.excitation_filter_n_frames, self.excitation_filter_order, dtype=self._dtype))
+
         self.register_buffer("excitation_filter_out", burst.to(self._dtype)) # Buffer to store the excitation filter out in the last training run
+        self.register_buffer("inverse_filtered_signal", torch.zeros(self.sample_rate))
 
     @property
     def interp_type(self):
@@ -228,24 +230,28 @@ class DiffKS(nn.Module):
         # predicted filters:
         if target is not None:
             y_target = target.squeeze(0)
+
+            # inversed loop filter
             x_est = invert_lpc(y_target, A)
+            x_est = x_est[:, :burst_length] # cut to make sure we conserve only plucking
 
-            pad_length = n_samples - burst_length
+            pluck_est = invert_lpc(x_est, a_in)
+            self.inverse_filtered_signal = pluck_est.squeeze() # Store for plotting
 
-            pad_shape = (1, pad_length, self.excitation_filter_order)
-            pad_coeffs = torch.zeros(pad_shape, device=a_in.device, dtype=self._dtype)
-            pad_coeffs[:, :, 0] = 1.0  # Set DC term to 1 for identity beyond burst
+            # Refiltering
+            x_refiltered = sample_wise_lpc(pluck_est, a_in)
 
-            a_in_padded = torch.cat([a_in, pad_coeffs], dim=1)
+            x = torch.zeros(n_samples, device=self.excitation.device) # Pad to total length
+            x[:burst_length] = x_refiltered
 
-            pluck_est = invert_lpc(x_est, a_in_padded)
-
-            # Once the plucking signal is obtained, we filter it again through the pred. filts.
-            y_out = sample_wise_lpc(pluck_est, A)
+            y_out = sample_wise_lpc(x.unsqueeze(0), A)
         else:
             y_out = sample_wise_lpc(x, A)
 
         return y_out.squeeze(0).to(torch.float32)
+
+    def get_inverse_filtered_signal(self):
+        return self.inverse_filtered_signal
 
     def get_excitation_filter_out(self):
         return self.excitation_filter_out
