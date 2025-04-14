@@ -10,18 +10,19 @@
     "patience_delta": 1
   },
   "model_params": {
-    "exc_filter_order": 5,
-    "exc_filter_n_frames": 100,
-    "l_filter_order": 1,
-    "f0_1_Hz": 159.56,
-    "f0_2_Hz": 40.56,
-    "n_frames": 1,
+    "exc_order": 5,
+    "exc_n_frames": 10,
+    "loop_order": 3,
+    "loop_n_frames": 1,
+    "f0_1_Hz": 159.6,
+    "f0_2_Hz": 159.6,
+    "f0_n_frames": 1,
+    "min_f0_hz": 27.5,
+    "burst_width_s": 0.02,
+    "burst_length_s": 0.025,
     "use_double_precision": true,
-    "burst_width_in_s": 0.02,
-    "burst_length_in_s": 0.025,
     "normalize_burst": true,
-    "lowest_note_in_hz": 27.5,
-    "interp_type": "allpass"
+    "interp_type": "lagrange"
   },
   "in_domain_params": {
     "use_in_domain": false,
