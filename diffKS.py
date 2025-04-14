@@ -226,22 +226,24 @@ class DiffKS(nn.Module):
 
         # Now we obtain plucking signal through inverse filtering of the
         # predicted filters:
+        if target is not None:
+            y_target = target.squeeze(0)
+            x_est = invert_lpc(y_target, A)
 
-        y_target = target.squeeze(0)
-        x_est = invert_lpc(y_target, A)
+            pad_length = n_samples - burst_length
 
-        pad_length = n_samples - burst_length
+            pad_shape = (1, pad_length, self.excitation_filter_order)
+            pad_coeffs = torch.zeros(pad_shape, device=a_in.device, dtype=self._dtype)
+            pad_coeffs[:, :, 0] = 1.0  # Set DC term to 1 for identity beyond burst
 
-        pad_shape = (1, pad_length, self.excitation_filter_order)
-        pad_coeffs = torch.zeros(pad_shape, device=a_in.device, dtype=self._dtype)
-        pad_coeffs[:, :, 0] = 1.0  # Set DC term to 1 for identity beyond burst
+            a_in_padded = torch.cat([a_in, pad_coeffs], dim=1)
 
-        a_in_padded = torch.cat([a_in, pad_coeffs], dim=1)
+            pluck_est = invert_lpc(x_est, a_in_padded)
 
-        pluck_est = invert_lpc(x_est, a_in_padded)
-
-        # Once the plucking signal is obtained, we filter it again through the pred. filts.
-        y_out = sample_wise_lpc(pluck_est, A)
+            # Once the plucking signal is obtained, we filter it again through the pred. filts.
+            y_out = sample_wise_lpc(pluck_est, A)
+        else:
+            y_out = sample_wise_lpc(x, A)
 
         return y_out.squeeze(0).to(torch.float32)
 
