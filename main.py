@@ -79,7 +79,7 @@ def main():
     # ==== Create Baseline audio (to be optimized) =========
     _ = ks_to_audio(
         model=p_model,
-        out_path="audio/initial.wav",
+        out_path="initial.wav",
         f0_frames=f0_frames,
         sample_rate=sample_rate,
         length_audio_s=length_audio_s
@@ -110,7 +110,7 @@ def main():
 
         t_audio = ks_to_audio(
             model=t_model,
-            out_path="audio/target.wav",
+            out_path="target.wav",
             f0_frames=f0_frames,
             sample_rate=sample_rate,
             length_audio_s=length_audio_s
@@ -118,7 +118,7 @@ def main():
     else:
         t_audio = process_target(
             target_path="audio/guitar.wav",
-            out_path="audio/target.wav",
+            out_path="audio/out/target.wav",
             target_sample_rate=sample_rate,
             target_length_samples=length_audio_n
         )
@@ -195,7 +195,7 @@ def main():
     plt.ylabel("Loss")
     plt.legend()
     plt.grid(True)
-    plt.savefig("loss_curve.png")  # or plt.show()
+    plt.savefig("plots/loss_curve.png")  # or plt.show()
     plt.close()
 
     # ==== Plot predicted vs target reflection coeffs ======
@@ -206,7 +206,7 @@ def main():
         plot_coefficient_comparison(
             predicted_coeffs=pred_coeffs,
             target_coeffs=target_coeffs,
-            save_path="coefficient_trajectories.png"
+            save_path="plots/coefficient_trajectories.png"
         )
 
         print (f"The Predicted Gain is {p_model.get_gain()}")
@@ -219,7 +219,7 @@ def main():
         sample_rate=sample_rate,
         length_audio_s=length_audio_s,
         title="Cubic predicted",
-        save_path="coefficient_upsampled.png"
+        save_path="plots/coefficient_upsampled.png"
     )
 
     # ==== Excitation Filter Analysis =============================
@@ -234,7 +234,7 @@ def main():
         exc_coeffs=exc_coeffs,
         sample_rate=sample_rate,
         max_time_s=burst_length_s,
-        save_path="excitation_filter_analysis.png",
+        save_path="plots/excitation_filter_analysis.png",
         show_plot=False
     )
 
@@ -245,7 +245,7 @@ def main():
         sample_rate=sample_rate,
         length_audio_s=length_audio_s,
         title="Excitation Filter Coefficients",
-        save_path="excitation_coefficients.png"
+        save_path="plots/excitation_coefficients.png"
     )
 
     # ==== Plot inverse filtered signal (plucking) =========
@@ -259,16 +259,16 @@ def main():
     plt.ylabel("Amplitude")
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("inverse_filtered_signal.png")  # or use plt.show() to display it
+    plt.savefig("plots/inverse_filtered_signal.png")  # or use plt.show() to display it
     plt.close()
 
-    save_audio_torchaudio(inv_filt_signal, sample_rate=sample_rate, out_path="audio/inversed.wav")
+    save_audio_torchaudio(inv_filt_signal, sample_rate=sample_rate, out_path="audio/out/inversed.wav")
 
     # ==== Save final model output =========================
     with torch.no_grad():
         ks_to_audio(
             model=p_model,
-            out_path="audio/optimized_model.wav",
+            out_path="optimized_model.wav",
             f0_frames=f0_frames,
             sample_rate=sample_rate,
             length_audio_s=length_audio_s,

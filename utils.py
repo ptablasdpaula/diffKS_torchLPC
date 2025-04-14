@@ -236,6 +236,8 @@ def ks_to_audio(
         # Normalize audio to [-1, 1]
         normalized_signal = normalize_audio(time_signal)
 
+        out_path = "audio/out/" + out_path
+
         # Plot the normalized waveform
         plot_waveform(normalized_signal, sample_rate, title=out_path)
 
@@ -296,8 +298,8 @@ def plot_upsampled_filter_coeffs(
     f0_frames: torch.Tensor,
     sample_rate: int,
     length_audio_s: float,
-    title: str = "Upsampled Reflection Coefficients",
-    save_path: str = "upsampled_filter_coeffs.png",
+    title: str = "Upsampled Loop Coefficients",
+    save_path: str = "plots/upsampled_loop_coeffs.png",
     show_plot: bool = False
 ):
     """
