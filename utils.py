@@ -23,12 +23,21 @@ def load_config(config_path="config.json"):
         config["global_settings"],
     )
 
+def get_raw_coefficients(self) -> torch.Tensor:
+    """
+    Returns the unnormalized (pre-activation) output of the coefficient generator.
+    Shape: [n_frames, l_filter_order]
+    """
+    t = torch.linspace(0, 1, steps=self.n_frames, device=self.coeff_generator.weight.device).unsqueeze(1)
+    return self.coeff_generator(t)
+
+
 def compute_minimum_action(coeff_frames: torch.Tensor, distance: str = "l2") -> torch.Tensor:
     """
     Penalize large changes in reflection coefficients across adjacent frames.
-    coeff_frames is shape [n_frames, 2].
+    coeff_frames is shape [n_frames, l_filter_order].
+    Applies a discrete Laplacian (second difference) smoothing penalty across time.
     """
-    # shape = [n_frames - 1, 2]
     diffs = (coeff_frames[1:-1] - coeff_frames[:-2]) - (coeff_frames[2:] - coeff_frames[1:-1])
 
     if distance.lower() == "l1":
@@ -36,6 +45,60 @@ def compute_minimum_action(coeff_frames: torch.Tensor, distance: str = "l2") -> 
     else:
         # default to L2
         return (diffs ** 2).mean()
+
+
+def plot_coefficient_comparison(
+        predicted_coeffs: torch.Tensor,
+        target_coeffs: torch.Tensor = None,
+        title: str = "Reflection Coefficients",
+        save_path: str = "coefficient_trajectories.png",
+        show_plot: bool = False
+):
+    """
+    Plot predicted reflection coefficients against target coefficients (if provided).
+    For single frame, prints coefficients to console.
+    """
+    if predicted_coeffs.shape[0] == 1:
+        print(f"\n{title} (Single Frame Coefficients):")
+        for i, coeff in enumerate(predicted_coeffs.squeeze().numpy(), 1):
+            print(f"Coefficient b{i}: {coeff}")
+
+        if target_coeffs is not None and target_coeffs.shape[0] == 1:
+            print("\nTarget Coefficients:")
+            for i, coeff in enumerate(target_coeffs.squeeze().numpy(), 1):
+                print(f"Target b{i}: {coeff}")
+        return
+
+    plt.figure(figsize=(10, 6))
+    n_coeffs = predicted_coeffs.shape[1]
+
+    if target_coeffs is not None:
+        # Plot both predicted and target
+        for i in range(n_coeffs):
+            plt.plot(target_coeffs[:, i], linestyle='-', label=f"Target b{i + 1}")
+            plt.plot(predicted_coeffs[:, i], linestyle='--', label=f"Predicted b{i + 1}")
+        plot_title = f"{title} (Target vs. Predicted)"
+    else:
+        # Plot only predicted coefficients
+        for i in range(n_coeffs):
+            plt.plot(predicted_coeffs[:, i], label=f"Coefficient b{i + 1}")
+        plot_title = title
+
+    plt.title(plot_title)
+    plt.xlabel("Frame index")
+    plt.ylabel("Coefficient value")
+    plt.legend()
+    plt.grid(True)
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path)
+
+    if show_plot:
+        plt.show()
+    else:
+        plt.close()
 
 def plot_waveform(waveform: torch.Tensor, sample_rate: int, title: str = "Waveform"):
     """
@@ -104,29 +167,45 @@ def save_audio_torchaudio(
 
 
 def make_symmetric_mirrored_coefficient_frame_linspace(
-    n_frames: int,
-    b_start: float,
-    b_mid: float,
-    b_end: float
+        n_frames: int,
+        b_start: float,
+        b_mid: float,
+        b_end: float,
+        l_filter_order: int = 2
 ) -> torch.Tensor:
     """
     Construct mirrored reflection coefficients in a three segment linspace.
+
+    Args:
+        n_frames: Number of frames to generate
+        b_start: Starting coefficient value
+        b_mid: Middle coefficient value
+        b_end: Ending coefficient value
+        l_filter_order: Number of filter coefficients (default: 2)
+
+    Returns:
+        Tensor of shape [n_frames, l_filter_order + 1] with coefficient values
     """
     one_third_frames = n_frames // 3
     two_third_frames = one_third_frames * 2
 
-    # b1 ramps from b_start -> b_mid -> b_end
-    b1_first_segment = torch.linspace(b_start, b_mid, two_third_frames)
-    b1_second_segment = torch.linspace(b_mid, b_end, n_frames - two_third_frames)
-    b1_coeff_frames = torch.cat([b1_first_segment, b1_second_segment])
+    # Initialize output tensor - this should be l_filter_order + 1
+    coeff_frames = torch.zeros(n_frames, l_filter_order + 1)
 
-    # b2 ramps from b_end -> b_mid -> b_start
-    b2_first_segment = torch.linspace(b_end, b_mid, one_third_frames)
-    b2_second_segment = torch.linspace(b_mid, b_start, n_frames - one_third_frames)
-    b2_coeff_frames = torch.cat([b2_first_segment, b2_second_segment])
+    # For each coefficient, create a pattern
+    for i in range(l_filter_order + 1):
+        if i % 2 == 0:
+            # Even indices follow b_start -> b_mid -> b_end pattern
+            first_segment = torch.linspace(b_start, b_mid, two_third_frames)
+            second_segment = torch.linspace(b_mid, b_end, n_frames - two_third_frames)
+            coeff_frames[:, i] = torch.cat([first_segment, second_segment])
+        else:
+            # Odd indices follow b_end -> b_mid -> b_start pattern (mirrored)
+            first_segment = torch.linspace(b_end, b_mid, one_third_frames)
+            second_segment = torch.linspace(b_mid, b_start, n_frames - one_third_frames)
+            coeff_frames[:, i] = torch.cat([first_segment, second_segment])
 
-    return torch.stack([b1_coeff_frames, b2_coeff_frames], dim=1)
-
+    return coeff_frames
 
 def ks_to_audio(
     model: torch.nn.Module,
@@ -207,3 +286,267 @@ def process_target(
     torchaudio.save(out_path, processed_target[0], target_sample_rate)
 
     return processed_target
+
+def plot_upsampled_filter_coeffs(
+    model,
+    f0_frames: torch.Tensor,
+    sample_rate: int,
+    length_audio_s: float,
+    title: str = "Upsampled Reflection Coefficients",
+    save_path: str = "upsampled_filter_coeffs.png",
+    show_plot: bool = False
+):
+    """
+    Uses the model's cubic-spline upsampling to generate reflection coefficients
+    at the audio sample rate and plots them.
+
+    Args:
+        model: The trained DiffKS model (or similar).
+        f0_frames: Tensor of fundamental-frequency frames (sample_rate/f0_Hz).
+        sample_rate: Sample rate in Hz.
+        length_audio_s: Total audio length in seconds.
+        title: Title for the plot.
+        save_path: Where to save the plotted figure.
+        show_plot: Whether to show the figure window instead of saving it.
+    """
+    n_samples = int(sample_rate * length_audio_s)
+
+    # Evaluate the upsampled delay and filter coefficients
+    # for_plotting=True => returns a detached CPU tensor.
+    with torch.no_grad():
+        up_delay, up_coeffs, _ = model.get_upsampled_parameters(
+            delay_len_frames=f0_frames,
+            num_samples=n_samples,
+            for_plotting=True
+        )
+
+    # up_coeffs is shape [n_samples, l_filter_order + 1].
+    plt.figure(figsize=(12, 6))
+    for i in range(up_coeffs.shape[1]):
+        plt.plot(up_coeffs[:, i], label=f"Coeff {i}")
+
+    plt.title(title)
+    plt.xlabel("Sample Index")
+    plt.ylabel("Coefficient Value")
+    plt.legend()
+    plt.grid(True)
+
+    if show_plot:
+        plt.show()
+    else:
+        plt.savefig(save_path)
+    plt.close()
+
+def plot_excitation_filter_analysis(
+    burst: torch.Tensor,
+    exc_filt_out: torch.Tensor,
+    exc_coeffs: torch.Tensor,
+    sample_rate: int,
+    max_time_s: float = 0.25,
+    save_path: str = "excitation_filter_analysis.png",
+    show_plot: bool = False
+):
+    """
+    Plots:
+      - Top subplot: The first `max_time_s` seconds of:
+          (1) The initial noise burst
+          (2) The audio after the excitation filter
+      - Bottom subplot: The corresponding excitation filter coefficients
+
+    Args:
+        burst:          The initial noise burst, shape [burst_size].
+        exc_filt_out:   Excitation-filtered audio, shape [n_samples].
+        exc_coeffs:     The learned filter coefficients, typically shape [1, burst_size, filter_order]
+                        or [burst_size, filter_order].
+        sample_rate:    Sample rate of the audio.
+        max_time_s:     How many seconds from the start to display for both waveforms.
+        save_path:      Where to save the generated figure.
+        show_plot:      If True, will display the figure window; otherwise just saves.
+    """
+    # Convert everything to 1D arrays if necessary
+    burst = burst.squeeze()
+    exc_filt_out = exc_filt_out.squeeze()
+
+    burst_np = burst.detach().cpu().numpy()
+    exc_filt_out_np = exc_filt_out.detach().cpu().numpy()
+
+    # Convert coefficients
+    coeffs_np = exc_coeffs.detach().cpu().numpy()
+    if coeffs_np.ndim == 3:
+        coeffs_np = coeffs_np.squeeze(0)  # shape => [burst_size, filter_order]
+
+    # Slice waveforms to first max_time_s
+    burst_len = burst_np.shape[0]
+    exc_len = exc_filt_out_np.shape[0]
+
+    max_burst_samps = min(int(sample_rate * max_time_s), burst_len)
+    max_exc_samps   = min(int(sample_rate * max_time_s), exc_len)
+
+    burst_np = burst_np[:max_burst_samps]
+    burst_time = np.linspace(0, max_time_s, max_burst_samps)
+
+    exc_filt_out_np = exc_filt_out_np[:max_exc_samps]
+    exc_time        = np.linspace(0, max_time_s, max_exc_samps)
+
+    if coeffs_np.shape[0] == burst_len:
+        coeffs_np = coeffs_np[:max_burst_samps]
+
+    fig, axs = plt.subplots(2, 1, figsize=(10, 6), sharex=False)
+    fig.suptitle("Excitation Filter Analysis")
+
+    # --- Top subplot: Original burst & excitation-filtered audio
+    axs[0].plot(burst_time, burst_np, label="Initial Noise Burst", alpha=0.75)
+    axs[0].plot(exc_time, exc_filt_out_np, label="After Excitation Filter", alpha=0.75)
+    axs[0].set_xlabel("Time (s)")
+    axs[0].set_ylabel("Amplitude")
+    axs[0].legend()
+    axs[0].grid(True)
+
+    # --- Bottom subplot: Filter coefficients
+    for c in range(coeffs_np.shape[1]):
+        axs[1].plot(coeffs_np[:, c], label=f"Coeff {c+1}")
+    axs[1].set_xlabel("Sample index (of first portion)")
+    axs[1].set_ylabel("Filter Coeff Value")
+    axs[1].legend()
+    axs[1].grid(True)
+
+    plt.tight_layout()
+    plt.savefig(save_path)
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+
+def plot_excitation_filter_analysis(
+    burst: torch.Tensor,
+    exc_filt_out: torch.Tensor,
+    exc_coeffs: torch.Tensor,
+    sample_rate: int,
+    max_time_s: float = 0.25,
+    save_path: str = "excitation_filter_analysis.png",
+    show_plot: bool = False
+):
+    """
+    Plots:
+      - Top subplot: The first `max_time_s` seconds of:
+          (1) The initial noise burst
+          (2) The audio after the excitation filter
+      - Bottom subplot: The corresponding excitation filter coefficients
+
+    Args:
+        burst:          The initial noise burst, shape [burst_size].
+        exc_filt_out:   Excitation-filtered audio, shape [n_samples].
+        exc_coeffs:     The learned filter coefficients, typically shape [1, burst_size, filter_order]
+                        or [burst_size, filter_order].
+        sample_rate:    Sample rate of the audio.
+        max_time_s:     How many seconds from the start to display for both waveforms.
+        save_path:      Where to save the generated figure.
+        show_plot:      If True, will display the figure window; otherwise just saves.
+    """
+    # Convert everything to 1D arrays if necessary
+    burst = burst.squeeze()
+    exc_filt_out = exc_filt_out.squeeze()
+
+    burst_np = burst.detach().cpu().numpy()
+    exc_filt_out_np = exc_filt_out.detach().cpu().numpy()
+
+    # Convert coefficients
+    coeffs_np = exc_coeffs.detach().cpu().numpy()
+    if coeffs_np.ndim == 3:
+        coeffs_np = coeffs_np.squeeze(0)  # shape => [burst_size, filter_order]
+
+    # Slice waveforms to first max_time_s
+    burst_len = burst_np.shape[0]
+    exc_len = exc_filt_out_np.shape[0]
+
+    max_burst_samps = min(int(sample_rate * max_time_s), burst_len)
+    max_exc_samps   = min(int(sample_rate * max_time_s), exc_len)
+
+    burst_np = burst_np[:max_burst_samps]
+    burst_time = np.linspace(0, max_time_s, max_burst_samps)
+
+    exc_filt_out_np = exc_filt_out_np[:max_exc_samps]
+    exc_time        = np.linspace(0, max_time_s, max_exc_samps)
+
+    if coeffs_np.shape[0] == burst_len:
+        coeffs_np = coeffs_np[:max_burst_samps]
+
+    fig, axs = plt.subplots(2, 1, figsize=(10, 6), sharex=False)
+    fig.suptitle("Excitation Filter Analysis")
+
+    # --- Top subplot: Original burst & excitation-filtered audio
+    axs[0].plot(burst_time, burst_np, label="Initial Noise Burst", alpha=0.75)
+    axs[0].plot(exc_time, exc_filt_out_np, label="After Excitation Filter", alpha=0.75)
+    axs[0].set_xlabel("Time (s)")
+    axs[0].set_ylabel("Amplitude")
+    axs[0].legend()
+    axs[0].grid(True)
+
+    # --- Bottom subplot: Filter coefficients
+    for c in range(coeffs_np.shape[1]):
+        axs[1].plot(coeffs_np[:, c], label=f"Coeff {c+1}")
+    axs[1].set_xlabel("Sample index (of first portion)")
+    axs[1].set_ylabel("Filter Coeff Value")
+    axs[1].legend()
+    axs[1].grid(True)
+
+    plt.tight_layout()
+    plt.savefig(save_path)
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+
+def plot_excitation_filter_coefficients(
+        model,
+        f0_frames: torch.Tensor,
+        sample_rate: int,
+        length_audio_s: float,
+        title: str = "Excitation Filter Coefficients",
+        save_path: str = "excitation_coefficients.png",
+        show_plot: bool = False
+):
+    """
+    Plots the upsampled excitation filter coefficients over time.
+
+    Args:
+        model: The trained DiffKS model
+        f0_frames: Tensor of fundamental-frequency frames
+        sample_rate: Sample rate in Hz
+        length_audio_s: Total audio length in seconds
+        title: Title for the plot
+        save_path: Where to save the plotted figure
+        show_plot: Whether to show the figure window
+    """
+    n_samples = int(sample_rate * length_audio_s)
+
+    # Get the upsampled parameters
+    with torch.no_grad():
+        _, _, exc_coeffs = model.get_upsampled_parameters(
+            delay_len_frames=f0_frames,
+            num_samples=n_samples,
+            for_plotting=True
+        )
+
+    # Plot the excitation filter coefficients
+    plt.figure(figsize=(12, 6))
+
+    # If there's only one coefficient, plot it directly
+    if exc_coeffs.shape[1] == 1:
+        plt.plot(exc_coeffs.squeeze(), label="Excitation Coefficient")
+    else:
+        # Plot each coefficient in a different color
+        for i in range(exc_coeffs.shape[1]):
+            plt.plot(exc_coeffs[:, i], label=f"Coefficient {i + 1}")
+
+    plt.title(title)
+    plt.xlabel("Sample Index")
+    plt.ylabel("Coefficient Value")
+    plt.legend()
+    plt.grid(True)
+
+    if show_plot:
+        plt.show()
+    else:
+        plt.savefig(save_path)
+    plt.close()
