@@ -1,7 +1,7 @@
 {
   "hyperparameters": {
     "learning_rate": 0.035,
-    "max_epochs": 1,
+    "max_epochs": 10,
     "stft_weight": 100,
     "use_A_weighing": true,
     "min_action_weight": 10,
@@ -14,17 +14,17 @@
     "exc_filter_n_frames": 100,
     "l_filter_order": 1,
     "f0_1_Hz": 159.56,
-    "f0_2_Hz": 159.56,
+    "f0_2_Hz": 40.56,
     "n_frames": 1,
-    "use_double_precision": false,
+    "use_double_precision": true,
     "burst_width_in_s": 0.02,
     "burst_length_in_s": 0.025,
     "normalize_burst": true,
     "lowest_note_in_hz": 27.5,
-    "interp_type": "lagrange"
+    "interp_type": "allpass"
   },
   "in_domain_params": {
-    "use_in_domain": true,
+    "use_in_domain": false,
     "gain": 1,
     "b_start": 0.99,
     "b_mid": 0.99,

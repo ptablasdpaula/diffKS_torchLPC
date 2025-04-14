@@ -213,7 +213,7 @@ def ks_to_audio(
     f0_frames: torch.Tensor,
     sample_rate: int,
     length_audio_s: int,
-    target_audio: torch.Tensor,
+    target_audio: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     Run the model to produce audio, normalize it, plot it, and then

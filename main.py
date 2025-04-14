@@ -81,14 +81,13 @@ def main():
     )
 
     # ==== Create Baseline audio (to be optimized) =========
-    '''_ = ks_to_audio(
+    _ = ks_to_audio(
         model=p_model,
         out_path="audio/initial.wav",
         f0_frames=f0_frames,
         sample_rate=sample_rate,
         length_audio_s=length_audio_s
     )
-'''
 
     # ==== Generate target audio ===========================
     if use_in_domain:
@@ -144,7 +143,7 @@ def main():
         # Forward
         output = p_model(delay_len_frames=f0_frames,
                          n_samples=length_audio_n,
-                         target=t_audio,)
+                         target=t_audio if use_in_domain else None,)
 
         # Multi-resolution STFT loss
         stft_loss = loss_fn(
