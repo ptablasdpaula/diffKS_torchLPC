@@ -78,7 +78,7 @@ class DiffKS(nn.Module):
         burst: torch.Tensor,
         loop_n_frames: int,
         sample_rate: int,
-        min_f0_hz: float,
+        min_f0_hz: float = 27.5,
         loop_order: int = 5,
         init_loop_coefficients: Optional[torch.Tensor] = None,
         gain: Optional[float] = None,  # <--- None => learnable; non-None => fixed
