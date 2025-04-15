@@ -152,7 +152,7 @@ def main():
         if loop_n_frames > 1:
             # Minimum-action loss on raw coeff frames
             min_action_loss = compute_minimum_action(
-                p_model.raw_coeff_frames,
+                p_model.loop_coefficients,
                 distance=min_action_dist
             ) * min_action_weight
 
