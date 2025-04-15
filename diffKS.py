@@ -81,8 +81,7 @@ class DiffKS(nn.Module):
         sample_rate: int,
         min_f0_hz: float,
         loop_order: int = 5,
-        init_loop_b_frames: Optional[torch.Tensor] = None,
-        init_loop_b_range: Tuple[float, float] = (-2, 0),
+        init_loop_coefficients: Optional[torch.Tensor] = None,
         gain: Optional[float] = None,  # <--- None => learnable; non-None => fixed
         exc_order: int = 5,
         exc_n_frames: int = 100,
@@ -93,42 +92,45 @@ class DiffKS(nn.Module):
         super().__init__()
         assert loop_order >= 1, "Filter order must be at least 1"
 
-        self._dtype = torch.float64 if use_double_precision else torch.float32
-
-        self.loop_n_frames = loop_n_frames
-        self.exc_n_frames = exc_n_frames
-
+        # ====== General ================================
         self.sample_rate = sample_rate
-
+        self._dtype = torch.float64 if use_double_precision else torch.float32
         self.min_f0_hz = min_f0_hz
+
+        # ====== Loop Filter ============================
+        self.loop_n_frames = loop_n_frames
+
         self.loop_order = loop_order
         self.loop_n_coefficients = loop_order + 1 # To account for DC coefficient
+
+        if init_loop_coefficients is None:
+            init_loop_coefficients = torch.empty(self.loop_n_frames, self.loop_n_coefficients, dtype=self._dtype).uniform_(-2, 0)
+        else:
+            init_loop_coefficients = torch.special.logit(init_loop_coefficients).to(self._dtype)
+
+        self.loop_coefficients = nn.Parameter(init_loop_coefficients)
+
+        if gain is None:
+            self.loop_gain = nn.Parameter(torch.tensor(0.0, dtype=self._dtype))
+        else:
+            clamped = float(torch.clamp(torch.tensor(gain, dtype=self._dtype), 1e-6, 1 - 1e-6))
+            self.register_buffer("raw_gain", torch.logit(torch.tensor(clamped, dtype=self._dtype)))
+
+        # ====== Interpolation Settings ==================
+        self.interp_type = interp_type
 
         self.lagrange_denom = torch.arange(LAGRANGE_ORDER, -1, -1).view(-1, 1) - torch.arange(LAGRANGE_ORDER + 1).view(1, -1)
         self.lagrange_mask = self.lagrange_denom != 0
         self.lagrange_denom = torch.where(self.lagrange_mask, self.lagrange_denom, 1)
 
-        self.interp_type = interp_type
-
-        self.excitation_filter_order = exc_order
+        # ====== Excitation Filter ======================
+        self.exc_n_frames = exc_n_frames
+        self.exc_order = exc_order
         self.exc_requires_grad = exc_requires_grad
-
-        if gain is None:
-            self.raw_gain = nn.Parameter(torch.tensor(0.0, dtype=self._dtype))
-        else:
-            clamped = float(torch.clamp(torch.tensor(gain, dtype=self._dtype), 1e-6, 1 - 1e-6))
-            self.register_buffer("raw_gain", torch.logit(torch.tensor(clamped, dtype=self._dtype)))
-
-        if init_loop_b_frames is None:
-            raw_init = torch.empty(self.loop_n_frames, self.loop_n_coefficients, dtype=self._dtype).uniform_(*init_loop_b_range)
-        else:
-            raw_init = torch.special.logit(init_loop_b_frames).to(self._dtype)
-
-        self.raw_coeff_frames = nn.Parameter(raw_init)
-
         self.register_buffer("excitation", burst.to(self._dtype))
-        self.exc_coefficients = nn.Parameter(torch.zeros(self.exc_n_frames, self.excitation_filter_order, dtype=self._dtype))
+        self.exc_coefficients = nn.Parameter(torch.zeros(self.exc_n_frames, self.exc_order, dtype=self._dtype))
 
+        # ====== Analysis Buffers =======================
         self.register_buffer("excitation_filter_out", burst.to(self._dtype)) # Buffer to store the excitation filter out in the last training run
         self.register_buffer("inverse_filtered_signal", torch.zeros(self.sample_rate))
 
@@ -262,7 +264,7 @@ class DiffKS(nn.Module):
         return self.excitation_filter_out
 
     def get_gain(self):
-        return torch.sigmoid(self.raw_gain)
+        return torch.sigmoid(self.loop_gain)
 
     def get_constrained_coefficients(self, for_plotting: bool = False) -> torch.Tensor:
         """
@@ -272,7 +274,7 @@ class DiffKS(nn.Module):
         with optional normalization so the filter remains stable.
         """
         def compute_coeffs():
-            sigmoid_b = torch.sigmoid(self.raw_coeff_frames)
+            sigmoid_b = torch.sigmoid(self.loop_coefficients)
             sum_b = sigmoid_b.sum(dim=-1, keepdim=True)
             return (sigmoid_b / sum_b) * self.get_gain()
 
