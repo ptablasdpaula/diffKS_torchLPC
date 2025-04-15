@@ -9,7 +9,8 @@ from utils import (
     make_symmetric_mirrored_coefficient_frame_linspace,
     ks_to_audio,
     process_target,
-    compute_minimum_action, plot_coefficient_comparison, plot_upsampled_filter_coeffs, plot_excitation_filter_analysis, plot_excitation_filter_coefficients  # <--- import from utils
+    compute_minimum_action, plot_coefficient_comparison, plot_upsampled_filter_coeffs, plot_excitation_filter_analysis,
+    plot_excitation_filter_coefficients, save_audio_torchaudio  # <--- import from utils
 )
 
 def main():
@@ -28,31 +29,30 @@ def main():
     min_action_dist    = hp.get("min_action_distance", "l2")
 
     patience_epochs = hp["patience_epochs"]
-    patience_delta = hp["patience_delta"]
+    patience_delta  = hp["patience_delta"]
 
-    f0_1_Hz, f0_2_Hz   = mp["f0_1_Hz"], mp["f0_2_Hz"]
-    n_frames           = mp["n_frames"]
-    burst_width_s      = mp["burst_width_in_s"]
-    lowest_note_in_hz  = mp["lowest_note_in_hz"]
-    loop_filter_order = mp["l_filter_order"]
+    exc_order       = mp["exc_order"]
+    exc_n_frames    = mp["exc_n_frames"]
+    loop_order      = mp["loop_order"]
+    loop_n_frames   = mp["loop_n_frames"]
+    f0_1_Hz, f0_2_Hz= mp["f0_1_Hz"], mp["f0_2_Hz"]
+    f0_n_frames     = mp["f0_n_frames"]
+    min_f0_hz       = mp["min_f0_hz"]
+    burst_width_s   = mp["burst_width_s"]
+    burst_length_s  = mp["burst_length_s"]
 
-    interp_type = mp["interp_type"]
     use_double_precision = mp["use_double_precision"]
-
-    exc_filter_order = mp["exc_filter_order"]
-    burst_length_in_s = mp["burst_length_in_s"]
-    exc_filter_n_frames = mp["exc_filter_n_frames"]
-
     normalize_burst = mp["normalize_burst"]
+    interp_type = mp["interp_type"]
 
-    use_in_domain      = idp["use_in_domain"]
+    use_in_domain = idp["use_in_domain"]
     b_start, b_mid, b_end = idp["b_start"], idp["b_mid"], idp["b_end"]
     t_gain = idp["gain"]
 
     # ==== Generate Burst ==================================
     burst = noise_burst(
         sample_rate=sample_rate,
-        length_s=burst_length_in_s,
+        length_s=burst_length_s,
         burst_width_s=burst_width_s,
         normalize=normalize_burst,
     )
@@ -60,30 +60,26 @@ def main():
     # ==== Create f0 frames (delay lengths) ================
     f0_1_n = sample_rate / f0_1_Hz
     f0_2_n = sample_rate / f0_2_Hz
-
-    # TODO, delay_len should have its own frames:
-    # loop coefficients benefit from 1, but if vibrato
-    # pitch bend, etc... It can't be captured
-    f0_frames = torch.linspace(f0_1_n, f0_2_n, n_frames)
+    f0_frames = torch.linspace(f0_1_n, f0_2_n, f0_n_frames)
 
     # ==== Initialize Model ================================
     p_model = DiffKS(
         burst=burst,
-        n_frames=n_frames,
+        loop_n_frames=loop_n_frames,
         sample_rate=sample_rate,
-        lowest_note_in_hz=lowest_note_in_hz,
-        l_filter_order=loop_filter_order,
-        excitation_filter_order=exc_filter_order,
-        requires_grad=True,
+        min_f0_hz=min_f0_hz,
+        loop_order=loop_order,
+        exc_order=exc_order,
+        exc_requires_grad=True,
         interp_type=interp_type,
         use_double_precision=use_double_precision,
-        excitation_filter_n_frames=exc_filter_n_frames,
+        exc_n_frames=exc_n_frames,
     )
 
     # ==== Create Baseline audio (to be optimized) =========
     _ = ks_to_audio(
         model=p_model,
-        out_path="audio/initial.wav",
+        out_path="initial.wav",
         f0_frames=f0_frames,
         sample_rate=sample_rate,
         length_audio_s=length_audio_s
@@ -92,8 +88,8 @@ def main():
     # ==== Generate target audio ===========================
     if use_in_domain:
         t_coeff_frames = make_symmetric_mirrored_coefficient_frame_linspace(
-            n_frames=n_frames,
-            l_filter_order=loop_filter_order,
+            n_frames=loop_n_frames,
+            order=loop_order,
             b_start=b_start,
             b_mid=b_mid,
             b_end=b_end
@@ -101,20 +97,20 @@ def main():
 
         t_model = DiffKS(
             burst=burst,
-            n_frames=n_frames,
+            loop_n_frames=loop_n_frames,
             sample_rate=sample_rate,
-            lowest_note_in_hz=lowest_note_in_hz,
-            init_coeffs_frames=t_coeff_frames,
+            min_f0_hz=min_f0_hz,
+            init_loop_b_frames=t_coeff_frames,
             gain=t_gain,
-            l_filter_order=loop_filter_order,
-            requires_grad=False,
+            loop_order=loop_order,
+            exc_requires_grad=False,
             interp_type=interp_type,
             use_double_precision=use_double_precision,
         )
 
         t_audio = ks_to_audio(
             model=t_model,
-            out_path="audio/target.wav",
+            out_path="target.wav",
             f0_frames=f0_frames,
             sample_rate=sample_rate,
             length_audio_s=length_audio_s
@@ -122,7 +118,7 @@ def main():
     else:
         t_audio = process_target(
             target_path="audio/guitar.wav",
-            out_path="audio/target.wav",
+            out_path="audio/out/target.wav",
             target_sample_rate=sample_rate,
             target_length_samples=length_audio_n
         )
@@ -141,7 +137,9 @@ def main():
     progress_bar = tqdm(range(max_epochs), desc="Training")
     for epoch in progress_bar:
         # Forward
-        output = p_model(delay_len_frames=f0_frames, n_samples=length_audio_n)
+        output = p_model(delay_len_frames=f0_frames,
+                         n_samples=length_audio_n,
+                         target=t_audio if use_in_domain is False else None,)
 
         # Multi-resolution STFT loss
         stft_loss = loss_fn(
@@ -151,7 +149,7 @@ def main():
 
         loss = stft_loss
 
-        if n_frames > 1:
+        if loop_n_frames > 1:
             # Minimum-action loss on raw coeff frames
             min_action_loss = compute_minimum_action(
                 p_model.raw_coeff_frames,
@@ -169,7 +167,7 @@ def main():
         # Track and display
         loss_curve.append(loss.item())
 
-        if n_frames > 1:
+        if loop_n_frames > 1:
             progress_bar.set_postfix({
                 "stft_loss": f"{stft_loss.item():.4f}",
                 "ma_loss": f"{min_action_loss.item():.4f}",
@@ -197,7 +195,7 @@ def main():
     plt.ylabel("Loss")
     plt.legend()
     plt.grid(True)
-    plt.savefig("loss_curve.png")  # or plt.show()
+    plt.savefig("plots/loss_curve.png")  # or plt.show()
     plt.close()
 
     # ==== Plot predicted vs target reflection coeffs ======
@@ -208,7 +206,7 @@ def main():
         plot_coefficient_comparison(
             predicted_coeffs=pred_coeffs,
             target_coeffs=target_coeffs,
-            save_path="coefficient_trajectories.png"
+            save_path="plots/coefficient_trajectories.png"
         )
 
         print (f"The Predicted Gain is {p_model.get_gain()}")
@@ -221,13 +219,11 @@ def main():
         sample_rate=sample_rate,
         length_audio_s=length_audio_s,
         title="Cubic predicted",
-        save_path="coefficient_upsampled.png"
+        save_path="plots/coefficient_upsampled.png"
     )
 
     # ==== Excitation Filter Analysis =============================
     with torch.no_grad():
-        _ = p_model(delay_len_frames=f0_frames, n_samples=length_audio_n, save_exc_filter_out=True)
-
         exc_filt_out = p_model.get_excitation_filter_out()
         exc_coeffs = p_model.exc_coefficients
         burst_in = p_model.excitation
@@ -237,8 +233,8 @@ def main():
         exc_filt_out=exc_filt_out,
         exc_coeffs=exc_coeffs,
         sample_rate=sample_rate,
-        max_time_s=burst_length_in_s,
-        save_path="excitation_filter_analysis.png",
+        max_time_s=burst_length_s,
+        save_path="plots/excitation_filter_analysis.png",
         show_plot=False
     )
 
@@ -249,17 +245,34 @@ def main():
         sample_rate=sample_rate,
         length_audio_s=length_audio_s,
         title="Excitation Filter Coefficients",
-        save_path="excitation_coefficients.png"
+        save_path="plots/excitation_coefficients.png"
     )
+
+    # ==== Plot inverse filtered signal (plucking) =========
+    inv_filt_signal = p_model.get_inverse_filtered_signal()
+    time_axis = torch.arange(len(inv_filt_signal)) / sample_rate
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(time_axis, inv_filt_signal.detach().numpy())
+    plt.title("Inverse Filtered Signal (Plucking Excitation)")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Amplitude")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("plots/inverse_filtered_signal.png")  # or use plt.show() to display it
+    plt.close()
+
+    save_audio_torchaudio(inv_filt_signal, sample_rate=sample_rate, out_path="audio/out/inversed.wav")
 
     # ==== Save final model output =========================
     with torch.no_grad():
         ks_to_audio(
             model=p_model,
-            out_path="audio/optimized_model.wav",
+            out_path="optimized_model.wav",
             f0_frames=f0_frames,
             sample_rate=sample_rate,
-            length_audio_s=length_audio_s
+            length_audio_s=length_audio_s,
+            target_audio=t_audio,
         )
 
 if __name__ == "__main__":
