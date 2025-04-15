@@ -1,3 +1,4 @@
+from os import remove
 from typing import Optional, Tuple
 import torch
 import torch.nn as nn
@@ -102,6 +103,11 @@ class DiffKS(nn.Module):
         self.min_f0_hz = min_f0_hz
         self.loop_order = loop_order
         self.loop_n_coefficients = loop_order + 1 # To account for DC coefficient
+
+        self.lagrange_denom = torch.arange(LAGRANGE_ORDER, -1, -1).view(-1, 1) - torch.arange(LAGRANGE_ORDER + 1).view(1, -1)
+        self.lagrange_mask = self.lagrange_denom != 0
+        self.lagrange_denom = torch.where(self.lagrange_mask, self.lagrange_denom, 1)
+
         self.interp_type = interp_type
 
         self.excitation_filter_order = exc_order
@@ -149,14 +155,21 @@ class DiffKS(nn.Module):
                 target: torch.Tensor = None,) -> torch.Tensor:
         delay_interp, coeff_interp, exc_filt_interp = self.get_upsampled_parameters(delay_len_frames, n_samples)
 
+        A = torch.zeros((1, n_samples, self.coeff_vector_size), device=self.excitation.device, dtype=self._dtype)
+        b = coeff_interp  # shape: (n_samples, loop_n_coefficients)
+
+        omega = 2 * torch.pi / delay_interp
+        zs = torch.exp(1j * omega.view(-1, 1)) ** -torch.arange(self.loop_n_coefficients, device=self.excitation.device).view(1, -1)
+        p_a = -torch.angle(torch.sum(b * zs, dim=-1, keepdim=False)) / omega
+
+        delay_interp = delay_interp - (1 + p_a)
+
         z_l = torch.floor(delay_interp).long()
         alfa = delay_interp - z_l
 
         idxs = [z_l + i for i in range(self.num_active_indexes)]
         assert torch.all(idxs[-1] < self.coeff_vector_size), "Delay index exceeds the buffer size"
 
-        A = torch.zeros((1, n_samples, self.coeff_vector_size), device=self.excitation.device, dtype=self._dtype)
-        b = coeff_interp  # shape: (n_samples, loop_n_coefficients)
 
         x = torch.zeros(n_samples, device=self.excitation.device)
         x[: self.excitation.shape[0]] = self.excitation
@@ -172,15 +185,7 @@ class DiffKS(nn.Module):
             # Last term: z^(L + loop_order)
             A[0, torch.arange(n_samples), idxs[-1]] = -alfa * b[:, -1]
         elif self.interp_type == "allpass":
-            eps = 1e-6
-            real_period = delay_interp
-            omega = 2 * torch.pi / (real_period * self.sample_rate)
-            zs = torch.exp(1j * omega.view(-1, 1)) ** -torch.arange(self.loop_n_coefficients, device=self.excitation.device).view(1, -1)
-            p_a = -torch.angle(torch.sum(b * zs, dim=-1, keepdim=False)) / omega
-            quantized_period = torch.floor(real_period - p_a - eps)
-            p_c = real_period - quantized_period - p_a
-
-            C = (1 - p_c) / (1 + p_c)
+            C = (1 - alfa) / (1 + alfa)
             x = torch.cat([x[0:1], x[1:] + x[:-1] * C[1:]])
 
             A[0, torch.arange(n_samples), 0] = C
@@ -192,19 +197,12 @@ class DiffKS(nn.Module):
 
             A[0, torch.arange(n_samples), idxs[-1]] = -b[:, -1]
         elif self.interp_type == "lagrange":
-            z_l = torch.floor(delay_interp).long() - LAGRANGE_ORDER // 2
-            alfa = delay_interp - z_l
-            idxs = [z_l + i for i in range(self.num_active_indexes)]
-            assert torch.all(idxs[-1] < self.coeff_vector_size), "Delay index exceeds the buffer size"
-
             lagrange_coeffs = alfa.view(-1, 1) - torch.arange(LAGRANGE_ORDER + 1, device=delay_interp.device, dtype=self._dtype).view(1, -1)
-            lagrange_denom = torch.arange(LAGRANGE_ORDER, -1, -1, device=delay_interp.device).view(-1, 1) - torch.arange(LAGRANGE_ORDER + 1, device=delay_interp.device).view(1, -1)
 
-            lagrange_denom = lagrange_denom.unsqueeze(0)
+            lagrange_denom = self.lagrange_denom.to(delay_interp.device).unsqueeze(0)
             lagrange_coeffs = lagrange_coeffs.unsqueeze(1)
 
-            lagrange_coeffs = torch.where(lagrange_denom != 0, lagrange_coeffs, 1)
-            lagrange_denom = torch.where(lagrange_denom != 0, lagrange_denom, 1)
+            lagrange_coeffs = torch.where(self.lagrange_mask, lagrange_coeffs, 1)
 
             lagrange_coeffs = lagrange_coeffs / lagrange_denom
             lagrange_coeffs = lagrange_coeffs.prod(dim=-1)
