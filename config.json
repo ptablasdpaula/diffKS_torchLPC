@@ -1,7 +1,7 @@
 {
   "hyperparameters": {
-    "learning_rate": 0.1,
-    "max_epochs": 100,
+    "learning_rate": 0.03,
+    "max_epochs": 3,
     "stft_weight": 100,
     "use_A_weighing": true,
     "min_action_weight": 10,
