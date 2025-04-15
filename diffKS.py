@@ -1,4 +1,3 @@
-from os import remove
 from typing import Optional, Tuple
 import torch
 import torch.nn as nn
@@ -152,26 +151,37 @@ class DiffKS(nn.Module):
         self.coeff_vector_size = int(self.sample_rate // self.min_f0_hz) + self.num_active_indexes
 
     def forward(self,
-                delay_len_frames: torch.Tensor,
+                f0_frames: torch.Tensor,
                 n_samples: int,
-                target: torch.Tensor = None,) -> torch.Tensor:
-        delay_interp, coeff_interp, exc_filt_interp = self.get_upsampled_parameters(delay_len_frames, n_samples)
+                target: Optional[torch.Tensor] = None,  # [batch_size, n_samples]
+                loop_coefficients: Optional[torch.Tensor] = None,  # [n_frames, loop_n_coefficients]
+                loop_gain: Optional[torch.Tensor] = None,  # [1]
+                exc_coefficients: Optional[torch.Tensor] = None,  # [exc_n_frames, exc_order]
+                ) -> torch.Tensor:  # [n_samples]
+
+        f0, l_b, exc_b = self.get_upsampled_parameters(f0_frames,
+                                                       n_samples,
+                                                       l_b=loop_coefficients,
+                                                       l_g=loop_gain,
+                                                       exc_b=exc_coefficients)
 
         A = torch.zeros((1, n_samples, self.coeff_vector_size), device=self.excitation.device, dtype=self._dtype)
-        b = coeff_interp  # shape: (n_samples, loop_n_coefficients)
+        b = l_b  # shape: (n_samples, loop_n_coefficients)
 
-        omega = 2 * torch.pi / delay_interp
+        omega = 2 * torch.pi / f0
         zs = torch.exp(1j * omega.view(-1, 1)) ** -torch.arange(self.loop_n_coefficients, device=self.excitation.device).view(1, -1)
         p_a = -torch.angle(torch.sum(b * zs, dim=-1, keepdim=False)) / omega
 
-        delay_interp = delay_interp - (1 + p_a)
+        f0 = f0 - (1 + p_a)
 
-        z_l = torch.floor(delay_interp).long()
-        alfa = delay_interp - z_l
+        z_l = torch.floor(f0).long()
+        alfa = f0 - z_l
 
         idxs = [z_l + i for i in range(self.num_active_indexes)]
         assert torch.all(idxs[-1] < self.coeff_vector_size), "Delay index exceeds the buffer size"
 
+        A = torch.zeros((1, n_samples, self.coeff_vector_size), device=self.excitation.device, dtype=self._dtype)
+        b = l_b  # shape: (n_samples, loop_n_coefficients)
 
         x = torch.zeros(n_samples, device=self.excitation.device)
         x[: self.excitation.shape[0]] = self.excitation
@@ -199,9 +209,9 @@ class DiffKS(nn.Module):
 
             A[0, torch.arange(n_samples), idxs[-1]] = -b[:, -1]
         elif self.interp_type == "lagrange":
-            lagrange_coeffs = alfa.view(-1, 1) - torch.arange(LAGRANGE_ORDER + 1, device=delay_interp.device, dtype=self._dtype).view(1, -1)
+            lagrange_coeffs = alfa.view(-1, 1) - torch.arange(LAGRANGE_ORDER + 1, device=f0.device, dtype=self._dtype).view(1, -1)
 
-            lagrange_denom = self.lagrange_denom.to(delay_interp.device).unsqueeze(0)
+            lagrange_denom = self.lagrange_denom.to(f0.device).unsqueeze(0)
             lagrange_coeffs = lagrange_coeffs.unsqueeze(1)
 
             lagrange_coeffs = torch.where(self.lagrange_mask, lagrange_coeffs, 1)
@@ -221,7 +231,7 @@ class DiffKS(nn.Module):
         burst_only = x[:burst_length]
 
         if self.exc_requires_grad:
-            a_in = exc_filt_interp.unsqueeze(0)
+            a_in = exc_b.unsqueeze(0)
             filtered_burst = sample_wise_lpc(burst_only.unsqueeze(0), a_in)
         else:
             filtered_burst = burst_only
@@ -263,10 +273,14 @@ class DiffKS(nn.Module):
     def get_excitation_filter_out(self):
         return self.excitation_filter_out
 
-    def get_gain(self):
-        return torch.sigmoid(self.loop_gain)
+    def get_gain(self,
+                 l_g : torch.Tensor = None,):
+        return torch.sigmoid(l_g if l_g is not None else self.loop_gain)
 
-    def get_constrained_coefficients(self, for_plotting: bool = False) -> torch.Tensor:
+    def get_constrained_coefficients(self,
+                                     l_b : torch.Tensor = None,
+                                     l_g : torch.Tensor = None,
+                                     for_plotting: bool = False) -> torch.Tensor:
         """
         Generate coefficient trajectories over time using a 1-layer linear network.
 
@@ -274,9 +288,9 @@ class DiffKS(nn.Module):
         with optional normalization so the filter remains stable.
         """
         def compute_coeffs():
-            sigmoid_b = torch.sigmoid(self.loop_coefficients)
+            sigmoid_b = torch.sigmoid(l_b if l_b is not None else self.loop_coefficients)
             sum_b = sigmoid_b.sum(dim=-1, keepdim=True)
-            return (sigmoid_b / sum_b) * self.get_gain()
+            return (sigmoid_b / sum_b) * (self.get_gain(l_g if l_g is not None else None))
 
         if for_plotting:
             with torch.no_grad():
@@ -288,46 +302,41 @@ class DiffKS(nn.Module):
             self,
             delay_len_frames: torch.Tensor,
             num_samples: int,
+            l_b: Optional[torch.Tensor] = None,
+            l_g: Optional[torch.Tensor] = None,
+            exc_b: Optional[torch.Tensor] = None,
             for_plotting: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Upsample:
-          1) delay_len_frames -> delay_interp ( shape: [f0_frames] )
-          2) self.raw_coeff_frames -> coeff_interp ( shape: [loop_frames, self.loop_n_coefficients] )
-          3) self.raw_excitation_filter_frames -> exc_filt_interp ( shape: [exc_frames, excitation_filter_order] )
-
-        Returns (delay_interp, coeff_interp, exc_filt_interp).
-        """
         def interpolate_fn():
-            coeff_frames = self.get_constrained_coefficients(for_plotting=for_plotting)
-
-            if self.loop_n_frames == 1:
-                coeff_i = coeff_frames.repeat(num_samples, 1)
-            else:
-                coeff_input = coeff_frames.view(1, self.loop_n_frames, self.loop_n_coefficients).to(dtype=self._dtype)
-                coeff_i = spline_upsample(coeff_input, num_samples).squeeze()
-
+            loop_b_frames = self.get_constrained_coefficients(l_b=l_b if l_b is not None else None,
+                                                              l_g=l_g if l_g is not None else None,
+                                                              for_plotting=for_plotting)
+            exc_b_frames_ = exc_b if exc_b is not None else self.exc_coefficients
             f0_n_frames = delay_len_frames.size(0)
 
+            burst_num_samples = self.excitation.shape[0]
+
+            if self.loop_n_frames == 1:
+                loop_b_i = loop_b_frames.repeat(num_samples, 1)
+            else:
+                loob_b_reshaped = loop_b_frames.view(1, self.loop_n_frames, self.loop_n_coefficients).to(dtype=self._dtype)
+                loop_b_i = spline_upsample(loob_b_reshaped, num_samples).squeeze()
+
             if f0_n_frames == 1:
-                delay_i = delay_len_frames.repeat(num_samples)
+                f0_i = delay_len_frames.repeat(num_samples)
             else:
                 # reshape => [1, F, D]
                 delay_input = delay_len_frames.view(1, f0_n_frames, 1).to(dtype=self._dtype)
-                delay_i = spline_upsample(delay_input, num_samples).squeeze()
+                f0_i = spline_upsample(delay_input, num_samples).squeeze()
 
             # Interpolation for excitation filter
-            exc_filter_frames_ = self.exc_coefficients
-            burst_num_samples = self.excitation.shape[0]
-
             if self.exc_n_frames == 1:
-                exc_filt_i = exc_filter_frames_.repeat(burst_num_samples, 1)
+                exc_b_i = exc_b_frames_.repeat(burst_num_samples, 1)
             else:
                 # shape => [1, exc_frames, exc_filter_order]
-                exc_input = exc_filter_frames_.unsqueeze(0)
-                exc_filt_i = spline_upsample(exc_input, burst_num_samples).squeeze(0) # => [burst_num_samples, exc_filter_order]
+                exc_b_i = spline_upsample(exc_b_frames_.unsqueeze(0), burst_num_samples).squeeze(0) # => [burst_num_samples, exc_filter_order]
 
-            return delay_i, coeff_i, exc_filt_i
+            return f0_i, loop_b_i, exc_b_i
 
         if for_plotting:
             with torch.no_grad():

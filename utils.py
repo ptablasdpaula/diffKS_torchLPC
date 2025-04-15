@@ -226,7 +226,7 @@ def ks_to_audio(
     with torch.no_grad():
         # Generate audio
         time_signal = model(
-            delay_len_frames=f0_frames,
+            f0_frames=f0_frames,
             n_samples=n_samples,
             target=target_audio,
         ).cpu()
