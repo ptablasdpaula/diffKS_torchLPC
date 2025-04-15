@@ -137,7 +137,7 @@ def main():
     progress_bar = tqdm(range(max_epochs), desc="Training")
     for epoch in progress_bar:
         # Forward
-        output = p_model(delay_len_frames=f0_frames,
+        output = p_model(f0_frames=f0_frames,
                          n_samples=length_audio_n,
                          target=t_audio if use_in_domain is False else None,)
 
