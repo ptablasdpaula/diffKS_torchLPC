@@ -241,7 +241,6 @@ class DiffKS(nn.Module):
         x[:burst_length] = filtered_burst
         x = x.unsqueeze(0)
 
-
         # Now we obtain plucking signal through inverse filtering of the
         # predicted filters:
         if target is not None:
