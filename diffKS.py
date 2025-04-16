@@ -127,7 +127,7 @@ class DiffKS(nn.Module):
         self.exc_order = exc_order
         self.exc_requires_grad = exc_requires_grad
         self.register_buffer("excitation", burst.to(self._dtype))
-        self.exc_coefficients = nn.Parameter(torch.rand(self.exc_n_frames, self.exc_order, dtype=self._dtype))
+        self.exc_coefficients = nn.Parameter(torch.ones(self.exc_n_frames, self.exc_order, dtype=self._dtype) * 1e-4)
 
         # ====== Analysis Buffers =======================
         self.register_buffer("excitation_filter_out", burst.to(self._dtype)) # Buffer to store the excitation filter out in the last training run
@@ -164,13 +164,6 @@ class DiffKS(nn.Module):
                                                        l_b=loop_coefficients,
                                                        l_g=loop_gain,
                                                        exc_b=exc_coefficients)
-        '''
-        # Print mean values of each excitation filter coefficient
-        print("Excitation filter coefficients mean values:")
-        for i in range(self.exc_order):
-            print(f"  Coefficient {i + 1}: {exc_b[:, i].mean().item():.6f}")
-        '''
-
         b = l_b  # shape: (n_samples, loop_n_coefficients)
 
         omega = 2 * torch.pi / f0
@@ -311,9 +304,9 @@ class DiffKS(nn.Module):
             self,
             delay_len_frames: torch.Tensor,
             num_samples: int,
-            l_b: Optional[torch.Tensor] = None,
-            l_g: Optional[torch.Tensor] = None,
-            exc_b: Optional[torch.Tensor] = None,
+            l_b: torch.Tensor = None,
+            l_g: torch.Tensor = None,
+            exc_b: torch.Tensor = None,
             for_plotting: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         def interpolate_fn():
