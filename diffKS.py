@@ -280,8 +280,8 @@ class DiffKS(nn.Module):
         return torch.sigmoid(l_g if l_g is not None else self.loop_gain)
 
     def get_constrained_coefficients(self,
-                                     l_b : torch.Tensor = None,
-                                     l_g : torch.Tensor = None,
+                                     l_b : Optional[torch.Tensor] = None,
+                                     l_g : Optional[torch.Tensor] = None,
                                      for_plotting: bool = False) -> torch.Tensor:
         """
         Generate coefficient trajectories over time using a 1-layer linear network.
@@ -304,9 +304,9 @@ class DiffKS(nn.Module):
             self,
             delay_len_frames: torch.Tensor,
             num_samples: int,
-            l_b: torch.Tensor = None,
-            l_g: torch.Tensor = None,
-            exc_b: torch.Tensor = None,
+            l_b: Optional[torch.Tensor] = None,
+            l_g: Optional[torch.Tensor] = None,
+            exc_b: Optional[torch.Tensor] = None,
             for_plotting: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         def interpolate_fn():
