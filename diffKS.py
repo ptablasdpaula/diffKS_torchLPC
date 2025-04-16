@@ -127,7 +127,7 @@ class DiffKS(nn.Module):
         self.exc_order = exc_order
         self.exc_requires_grad = exc_requires_grad
         self.register_buffer("excitation", burst.to(self._dtype))
-        self.exc_coefficients = nn.Parameter(torch.zeros(self.exc_n_frames, self.exc_order, dtype=self._dtype))
+        self.exc_coefficients = nn.Parameter(torch.rand(self.exc_n_frames, self.exc_order, dtype=self._dtype))
 
         # ====== Analysis Buffers =======================
         self.register_buffer("excitation_filter_out", burst.to(self._dtype)) # Buffer to store the excitation filter out in the last training run
@@ -164,8 +164,13 @@ class DiffKS(nn.Module):
                                                        l_b=loop_coefficients,
                                                        l_g=loop_gain,
                                                        exc_b=exc_coefficients)
+        '''
+        # Print mean values of each excitation filter coefficient
+        print("Excitation filter coefficients mean values:")
+        for i in range(self.exc_order):
+            print(f"  Coefficient {i + 1}: {exc_b[:, i].mean().item():.6f}")
+        '''
 
-        A = torch.zeros((1, n_samples, self.coeff_vector_size), device=self.excitation.device, dtype=self._dtype)
         b = l_b  # shape: (n_samples, loop_n_coefficients)
 
         omega = 2 * torch.pi / f0
@@ -236,12 +241,13 @@ class DiffKS(nn.Module):
         else:
             filtered_burst = burst_only
 
+        self.excitation_filter_out = filtered_burst.squeeze()
+
         # Now zero-pad the filtered result to full length
         x = torch.zeros(n_samples, device=self.excitation.device)
         x[:burst_length] = filtered_burst
         x = x.unsqueeze(0)
 
-        self.excitation_filter_out = x
 
         # Now we obtain plucking signal through inverse filtering of the
         # predicted filters:
@@ -252,11 +258,14 @@ class DiffKS(nn.Module):
             x_est = invert_lpc(y_target, A)
             x_est = x_est[:, :burst_length] # cut to make sure we conserve only plucking
 
-            pluck_est = invert_lpc(x_est, a_in)
-            self.inverse_filtered_signal = pluck_est.squeeze() # Store for plotting
-
-            # Refiltering
-            x_refiltered = sample_wise_lpc(pluck_est, a_in)
+            if self.exc_requires_grad:
+                pluck_est = invert_lpc(x_est, a_in)
+                self.inverse_filtered_signal = pluck_est.squeeze() # Store for plotting
+                # Refiltering
+                x_refiltered = sample_wise_lpc(pluck_est, a_in)
+            else:
+                self.inverse_filtered_signal = x_est.squeeze() # Store for plotting
+                x_refiltered = x_est
 
             x = torch.zeros(n_samples, device=self.excitation.device) # Pad to total length
             x[:burst_length] = x_refiltered
