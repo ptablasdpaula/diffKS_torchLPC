@@ -113,7 +113,7 @@ class DiffKS(nn.Module):
             self.loop_gain = nn.Parameter(torch.tensor(0.0, dtype=self._dtype))
         else:
             clamped = float(torch.clamp(torch.tensor(gain, dtype=self._dtype), 1e-6, 1 - 1e-6))
-            self.register_buffer("raw_gain", torch.logit(torch.tensor(clamped, dtype=self._dtype)))
+            self.register_buffer("loop_gain", torch.logit(torch.tensor(clamped, dtype=self._dtype)))
 
         # ====== Interpolation Settings ==================
         self.interp_type = interp_type
