@@ -3,6 +3,8 @@ from auraloss.freq import MultiResolutionSTFTLoss as multi_stft_loss
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
+import numpy as np
+
 from diffKS import DiffKS, noise_burst
 from utils import (
     load_config,
@@ -21,6 +23,7 @@ def main():
     length_audio_s = gs["length_audio_s"]
     length_audio_n = sample_rate * length_audio_s
 
+    method             = hp["method"]
     learning_rate      = hp["learning_rate"]
     max_epochs         = hp["max_epochs"]
     stft_weight        = hp["stft_weight"]
@@ -100,7 +103,7 @@ def main():
             loop_n_frames=loop_n_frames,
             sample_rate=sample_rate,
             min_f0_hz=min_f0_hz,
-            init_loop_b_frames=t_coeff_frames,
+            init_loop_coefficients=t_coeff_frames,
             gain=t_gain,
             loop_order=loop_order,
             exc_requires_grad=False,
@@ -123,67 +126,151 @@ def main():
             target_length_samples=length_audio_n
         )
 
-    # ==== Setup optimizer and loss ========================
-    optimizer = torch.optim.Adam(p_model.parameters(), lr=learning_rate)
+
+
     loss_fn = multi_stft_loss(scale_invariance=True,
                               perceptual_weighting=use_A_weighing,
-                              sample_rate=sample_rate,)
+                              sample_rate=sample_rate, )
 
     # For plotting the loss curve
     loss_curve = []
 
-    bad_epochs = 0 # For Early Stopping
+    bad_epochs = 0  # For Early Stopping
 
     progress_bar = tqdm(range(max_epochs), desc="Training")
-    for epoch in progress_bar:
-        # Forward
-        output = p_model(f0_frames=f0_frames,
-                         n_samples=length_audio_n,
-                         target=t_audio if use_in_domain is False else None,)
 
-        # Multi-resolution STFT loss
-        stft_loss = loss_fn(
-            output.unsqueeze(0).unsqueeze(0),
-            t_audio.unsqueeze(0).unsqueeze(0)
-        ) * stft_weight
+    # should probably factor this out into classes / methods - can do that once NN implementation is there
+    if method == "gradient":
+        # ==== Setup optimizer and loss ========================
+        optimizer = torch.optim.Adam(p_model.parameters(), lr=learning_rate)
+        for epoch in progress_bar:
+            # Forward
+            output = p_model(f0_frames=f0_frames,
+                             n_samples=length_audio_n,
+                             target=t_audio if use_in_domain is False else None,)
 
-        loss = stft_loss
+            # Multi-resolution STFT loss
+            stft_loss = loss_fn(
+                output.unsqueeze(0).unsqueeze(0),
+                t_audio.unsqueeze(0).unsqueeze(0)
+            ) * stft_weight
 
-        if loop_n_frames > 1:
-            # Minimum-action loss on raw coeff frames
-            min_action_loss = compute_minimum_action(
-                p_model.loop_coefficients,
-                distance=min_action_dist
-            ) * min_action_weight
+            loss = stft_loss
 
-            # Combine them with separate weights
-            loss += min_action_loss
+            if loop_n_frames > 1:
+                # Minimum-action loss on raw coeff frames
+                min_action_loss = compute_minimum_action(
+                    p_model.loop_coefficients,
+                    distance=min_action_dist
+                ) * min_action_weight
 
-        # Backprop
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+                # Combine them with separate weights
+                loss += min_action_loss
 
-        # Track and display
-        loss_curve.append(loss.item())
+            # Backprop
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-        if loop_n_frames > 1:
-            progress_bar.set_postfix({
-                "stft_loss": f"{stft_loss.item():.4f}",
-                "ma_loss": f"{min_action_loss.item():.4f}",
-                "total": f"{loss.item():.4f}"
-            })
-        else:
-            progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+            # Track and display
+            loss_curve.append(loss.item())
 
-        if loss.item() < patience_delta:
-            bad_epochs += 1
-        else:
-            bad_epochs = 0
+            if loop_n_frames > 1:
+                progress_bar.set_postfix({
+                    "stft_loss": f"{stft_loss.item():.4f}",
+                    "ma_loss": f"{min_action_loss.item():.4f}",
+                    "total": f"{loss.item():.4f}"
+                })
+            else:
+                progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-        if bad_epochs >= patience_epochs:
-            print(f"No improvement after {patience_epochs} epochs. Early stopping at epoch {epoch}.")
-            break
+            if loss.item() < patience_delta:
+                bad_epochs += 1
+            else:
+                bad_epochs = 0
+
+            if bad_epochs >= patience_epochs:
+                print(f"No improvement after {patience_epochs} epochs. Early stopping at epoch {epoch}.")
+                break
+
+    elif method == "genetic":
+        import pygad
+        def fitness_func(ga_instance, solution, solution_idx):
+            with torch.no_grad():
+
+                # assert loop_n_frames * (loop_order+1) + 1 + exc_n_frames * (exc_order+1) == len(solution)
+                loop_coeffs = solution[:loop_n_frames * (loop_order+1)].reshape((loop_n_frames, loop_order+1))
+                # loop_gain = solution[loop_n_frames * (loop_order+1):loop_n_frames * (loop_order+1) + 1]
+                # exc_coeffs = solution[loop_n_frames * (loop_order+1) + 1:loop_n_frames * (loop_order+1) + 1 + exc_n_frames * (exc_order+1)].reshape((exc_n_frames, exc_order+1))
+                output = p_model(f0_frames=f0_frames,
+                                 n_samples=length_audio_n,
+                                 target=t_audio if use_in_domain is False else None,
+                                 loop_coefficients=torch.tensor(loop_coeffs),
+                                 loop_gain=t_model.loop_gain,
+                                 # exc_coefficients=torch.tensor(exc_coeffs),
+                                 )
+
+                # Multi-resolution STFT loss
+                stft_loss = loss_fn(
+                    output.unsqueeze(0).unsqueeze(0),
+                    t_audio.unsqueeze(0).unsqueeze(0)
+                ).item()
+                if loop_n_frames > 1:
+                    # Minimum-action loss on raw coeff frames
+                    min_action_loss = compute_minimum_action(
+                        loop_coeffs,
+                        distance=min_action_dist
+                    ).item()
+                    return [-stft_loss, -min_action_loss]
+                return -stft_loss
+
+        num_generations = 400
+        num_parents_mating = 18
+
+        fitness_function = fitness_func
+
+        sol_per_pop = 60
+        num_genes = loop_n_frames * (loop_order+1)# + 1 + exc_n_frames * (exc_order+1)
+
+        init_range_low = -1
+        init_range_high = 1
+
+        parent_selection_type = "sss"
+        keep_parents = -1
+
+        crossover_type = "single_point"
+
+        mutation_type = "random"
+        mutation_percent_genes = 0.1
+
+        def on_gen(ga_instance):
+            print("Generation : ", ga_instance.generations_completed)
+            print("Best solution : ", p_model.get_constrained_coefficients(l_b=torch.tensor(ga_instance.best_solution()[0]).view(loop_n_frames, loop_order+1), l_g=t_model.loop_gain, for_plotting=True), "Truth : ", t_model.get_constrained_coefficients(for_plotting=True))
+            print("Fitness of the best solution :", ga_instance.best_solution()[1])
+
+        ga_instance = pygad.GA(
+            num_generations=num_generations,
+            num_parents_mating=num_parents_mating,
+            fitness_func=fitness_function,
+            sol_per_pop=sol_per_pop,
+            num_genes=num_genes,
+            init_range_low=init_range_low,
+            init_range_high=init_range_high,
+            parent_selection_type=parent_selection_type,
+            keep_parents=keep_parents,
+            keep_elitism=3,
+            crossover_type=crossover_type,
+            mutation_type=mutation_type,
+            # mutation_percent_genes=mutation_percent_genes,
+            random_mutation_min_val=-0.1,
+            random_mutation_max_val=0.1,
+            mutation_probability=0.9,
+            crossover_probability=0.9,
+            on_generation=on_gen,
+            gene_type=np.float64 if use_double_precision else np.float32,
+        )
+
+        ga_instance.run()
 
     print("Training finished")
 
