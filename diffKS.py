@@ -181,8 +181,6 @@ class DiffKS(nn.Module):
                                              loop_coefficients=l_b,
                                              input=input)
 
-        x = resize_tensor_dim(x, n_samples, 1)
-
         loop_inv = invert_lpc(x, A)
 
         ks_inv_signal = invert_lpc(resize_tensor_dim(loop_inv, self.exc_length_n, 1),
@@ -208,116 +206,116 @@ class DiffKS(nn.Module):
         """
         Computes the coefficient matrix for a resonator with fractional delay.
 
-        This function combines delay line modeling, filter coefficients, and interpolation
-        to create a complete resonator matrix for physical modeling synthesis.
-
         Args:
-            f0: Fundamental frequency in Hz [batch_size, n_samples]
+            f0: Fundamental frequency in samples [batch_size, n_samples]
             loop_coefficients: Filter coefficients [batch_size, n_samples, loop_n_coefficients]
+            input: Input excitation signal [batch_size, n_samples]
 
         Returns:
             A: Coefficient matrix [batch_size, n_samples, coeff_vector_size]
             x: Modified excitation signal [batch_size, n_samples]
         """
-
-        # Assert input dimensions
         assert f0.dim() == 2, f"f0 must have 2 dimensions, got shape {f0.shape}"
         assert loop_coefficients.dim() == 3, f"loop_coefficients must have 3 dimensions, got shape {loop_coefficients.shape}"
 
-        # Extract dimensions
-        batch_size = f0.size(0)
-        n_samples = f0.size(1)
-
-        # Check that dimensions are compatible
+        batch_size, n_samples = f0.shape
         assert loop_coefficients.size(
             0) == batch_size, f"Batch size mismatch: f0 has {batch_size}, loop_coefficients has {loop_coefficients.size(0)}"
         assert loop_coefficients.size(
             1) == n_samples, f"Sample count mismatch: f0 has {n_samples}, loop_coefficients has {loop_coefficients.size(1)}"
         assert loop_coefficients.size(
             2) == self.loop_n_coefficients, f"Coefficient count mismatch: expected {self.loop_n_coefficients}, got {loop_coefficients.size(2)}"
+        assert input.size(1) == n_samples, f"Input sample count mismatch: expected {n_samples}, got {input.size(1)}"
 
-        x = resize_tensor_dim(input, self.exc_length_n, 1).to(self.device)
+        x = input
+        b = loop_coefficients  # [batch_size, n_samples, loop_n_coefficients]
 
-        results_A = []
-        results_x = []
+        # Calculate phase adjustment
+        omega = 2 * torch.pi / f0  # [batch_size, n_samples]
+        coeff_range = torch.arange(self.loop_n_coefficients, device=self.device).view(1, 1, -1)
+        zs = torch.exp(1j * omega.view(batch_size, n_samples, 1)) ** -coeff_range
+        p_a = -torch.angle(torch.sum(b * zs, dim=-1)) / omega
+        f0_corrected = f0 - (1 + p_a)
 
-        # Process each item in the batch separately to maintain the original logic
-        for batch in range(batch_size):
-            # Use the existing logic for each item in the batch
-            f0_item = f0[batch]  # [n_samples]
-            l_b_item = loop_coefficients[batch]  # [n_samples, loop_n_coefficients]
-            x_item = x[batch]
+        z_l = torch.floor(f0_corrected).long()  # [batch_size, n_samples]
+        alfa = f0_corrected - z_l  # [batch_size, n_samples]
 
-            # --- Original logic starts here ---
-            b = l_b_item  # shape: (n_samples, loop_n_coefficients)
+        max_delay_idx = z_l + self.num_active_indexes - 1
+        assert torch.all(max_delay_idx < self.coeff_vector_size), "Delay index exceeds the buffer size"
 
-            omega = 2 * torch.pi / f0_item
-            zs = torch.exp(1j * omega.view(-1, 1)) ** -torch.arange(self.loop_n_coefficients,
-                                                                    device=self.device).view(1, -1)
-            p_a = -torch.angle(torch.sum(b * zs, dim=-1, keepdim=False)) / omega
+        A = torch.zeros((batch_size, n_samples, self.coeff_vector_size), device=self.device, dtype=self._dtype)
 
-            f0_corrected = f0_item - (1 + p_a)
+        # Create indexing tensors
+        batch_indices = torch.arange(batch_size, device=self.device).view(-1, 1).expand(-1, n_samples)
+        sample_indices = torch.arange(n_samples, device=self.device).view(1, -1).expand(batch_size, -1)
 
-            z_l = torch.floor(f0_corrected).long()
-            alfa = f0_corrected - z_l
+        if self.interp_type == "linear":
+            indices = z_l
+            A[batch_indices, sample_indices, indices] = -(1 - alfa) * b[..., 0]
 
-            idxs = [z_l + i for i in range(self.num_active_indexes)]
-            assert torch.all(idxs[-1] < self.coeff_vector_size), "Delay index exceeds the buffer size"
+            for i in range(1, self.loop_n_coefficients):
+                indices = z_l + i
+                A[batch_indices, sample_indices, indices] = -(alfa * b[..., i - 1] + (1 - alfa) * b[..., i])
 
-            A = torch.zeros((1, n_samples, self.coeff_vector_size), device=self.device, dtype=self._dtype)
-            b = l_b_item  # shape: (n_samples, loop_n_coefficients)
+            indices = z_l + self.num_active_indexes - 1
+            A[batch_indices, sample_indices, indices] = -alfa * b[..., -1]
 
-            if self.interp_type == "linear":
-                # First term: z^L
-                A[0, torch.arange(n_samples), idxs[0]] = -(1 - alfa) * b[:, 0]
+        elif self.interp_type == "allpass":
+            C = (1 - alfa) / (1 + alfa)
 
-                # Middle terms with crossfade
-                for i in range(1, self.loop_n_coefficients):
-                    A[0, torch.arange(n_samples), idxs[i]] = -(alfa * b[:, i - 1] + (1 - alfa) * b[:, i])
+            x_processed = torch.zeros_like(x)
+            x_processed[:, 0] = x[:, 0]
+            x_processed[:, 1:] = x[:, 1:] + x[:, :-1] * C[:, 1:]
+            x = x_processed
 
-                # Last term: z^(L + loop_order)
-                A[0, torch.arange(n_samples), idxs[-1]] = -alfa * b[:, -1]
-            elif self.interp_type == "allpass":
-                C = (1 - alfa) / (1 + alfa)
-                x = torch.cat([x_item[0:1], x_item[1:] + x_item[:-1] * C[1:]])
+            A[:, :, 0] = C
 
-                A[0, torch.arange(n_samples), 0] = C
+            indices = z_l
+            A[batch_indices, sample_indices, indices] = -C * b[..., 0]
 
-                A[0, torch.arange(n_samples), idxs[0]] = -C * b[:, 0]
+            for i in range(1, self.loop_n_coefficients):
+                indices = z_l + i
+                A[batch_indices, sample_indices, indices] = -(b[..., i - 1] + C * b[..., i])
 
-                for i in range(1, self.loop_n_coefficients):
-                    A[0, torch.arange(n_samples), idxs[i]] = -(b[:, i - 1] + C * b[:, i])
+            indices = z_l + self.num_active_indexes - 1
+            A[batch_indices, sample_indices, indices] = -b[..., -1]
 
-                A[0, torch.arange(n_samples), idxs[-1]] = -b[:, -1]
-            elif self.interp_type == "lagrange":
-                lagrange_coeffs = alfa.view(-1, 1) - torch.arange(LAGRANGE_ORDER + 1, device=f0_item.device,
-                                                                  dtype=self._dtype).view(1, -1)
+        elif self.interp_type == "lagrange":
+            b_processed = torch.zeros(batch_size, n_samples, self.num_active_indexes,
+                                      device=self.device, dtype=self._dtype)
 
-                lagrange_denom = self.lagrange_denom.to(f0_item.device).unsqueeze(0)
+            for batch_idx in range(batch_size):
+                batch_alfa = alfa[batch_idx]  # [n_samples]
+                batch_b = b[batch_idx]  # [n_samples, loop_n_coefficients]
+
+                # Calculate Lagrange coefficients
+                lagrange_coeffs = batch_alfa.view(-1, 1) - torch.arange(
+                    LAGRANGE_ORDER + 1, device=self.device, dtype=self._dtype).view(1, -1)
+
+                # Apply denominator and masks
                 lagrange_coeffs = lagrange_coeffs.unsqueeze(1)
-
                 lagrange_coeffs = torch.where(self.lagrange_mask, lagrange_coeffs, 1)
-
-                lagrange_coeffs = lagrange_coeffs / lagrange_denom
+                lagrange_coeffs = lagrange_coeffs / self.lagrange_denom.to(self.device).unsqueeze(0)
                 lagrange_coeffs = lagrange_coeffs.prod(dim=-1)
 
-                b = torch.nn.functional.conv1d(b.unsqueeze(0), lagrange_coeffs.unsqueeze(1), padding=LAGRANGE_ORDER,
-                                               groups=len(b)).squeeze(0)
+                batch_result = torch.nn.functional.conv1d(
+                    batch_b.unsqueeze(0),
+                    lagrange_coeffs.unsqueeze(1),
+                    padding=LAGRANGE_ORDER,
+                    groups=n_samples
+                ).squeeze(0)
 
-                for i, idx in enumerate(idxs):
-                    A[0, torch.arange(n_samples), idx] = -b[:, i]
-            else:
-                raise NotImplementedError
-            # --- Original logic ends here ---
+                b_processed[batch_idx, :, :batch_result.size(1)] = batch_result
 
-            results_A.append(A.squeeze(0))  # Remove the leading 1 dimension
-            results_x.append(x_item)
+            # Apply processed coefficients to A matrix
+            for i in range(self.num_active_indexes):
+                indices = z_l + i
+                A[batch_indices, sample_indices, indices] = -b_processed[..., i]
 
-        # Stack results to create batched output
-        batched_A = torch.stack(results_A, dim=0)  # [batch_size, n_samples, coeff_vector_size]
-        batched_x = torch.stack(results_x, dim=0)  # [batch_size, n_samples]
+        else:
+            raise NotImplementedError(f"Interpolation type {self.interp_type} not implemented")
 
-        return batched_A, batched_x
+        return A, x
 
     def get_gain(self,
                  l_g : torch.Tensor = None,): # [batches, loop_n_frames, 1]
