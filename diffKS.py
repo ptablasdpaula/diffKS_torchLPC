@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchlpc import sample_wise_lpc
 from torchcubicspline import natural_cubic_spline_coeffs, NaturalCubicSpline
-from utils import resize_tensor_dim
+from utils import resize_tensor_dim, get_device
 
 LAGRANGE_ORDER = 5
 
@@ -85,7 +85,7 @@ class DiffKS(nn.Module):
         exc_length_s : float = 0.025,
         interp_type: str = "linear",
         use_double_precision: bool = False,
-        device: torch.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu") ,
+        device: torch.device = get_device(),
     ):
         super().__init__()
         assert loop_order >= 1, "Filter order must be at least 1"
@@ -219,17 +219,17 @@ class DiffKS(nn.Module):
                                              loop_coefficients=l_b,
                                              input=input)
 
-        loop_inv = invert_lpc(x, A)
+        if not direct:
+            loop_inv = invert_lpc(x, A)
+            ks_inv_signal = invert_lpc(resize_tensor_dim(loop_inv, self.exc_length_n, 1), exc_b)
+            self.ks_inverse_signal = ks_inv_signal
+            exc_input = ks_inv_signal
+        else:
+            exc_input = resize_tensor_dim(x, self.exc_length_n, 1)
 
-        ks_inv_signal = invert_lpc(resize_tensor_dim(loop_inv, self.exc_length_n, 1),
-                                   exc_b)
-        self.ks_inverse_signal = ks_inv_signal
+        self.exc_filter_out = sample_wise_lpc(exc_input, exc_b)
 
-        exc_filter_out = sample_wise_lpc(ks_inv_signal if direct is False else resize_tensor_dim(x, self.exc_length_n, 1),
-                                         exc_b)
-        self.exc_filter_out = exc_filter_out
-
-        y_out = sample_wise_lpc(resize_tensor_dim(exc_filter_out, n_samples, 1),
+        y_out = sample_wise_lpc(resize_tensor_dim(self.exc_filter_out, n_samples, 1),
                                 A)
 
         return y_out.to(torch.float32)
