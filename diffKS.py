@@ -91,6 +91,7 @@ class DiffKS(nn.Module):
         assert loop_order >= 1, "Filter order must be at least 1"
 
         # ====== General ================================
+        self.batch_size = batch_size
         self.sample_rate = sample_rate
         self.device = device
         self._dtype = torch.float64 if use_double_precision else torch.float32
@@ -100,15 +101,15 @@ class DiffKS(nn.Module):
         self.exc_n_frames = exc_n_frames
         self.exc_order = exc_order
         self.exc_length_n = int (exc_length_s * sample_rate)
-        self.exc_coefficients = nn.Parameter(torch.ones(batch_size, self.exc_n_frames, self.exc_order, dtype=self._dtype) * 1e-4)
+        self.exc_coefficients = nn.Parameter(torch.rand(batch_size, self.exc_n_frames, self.exc_order, dtype=self._dtype) * 1e-4)
 
         # ====== Loop Filter ============================
         self.loop_n_frames = loop_n_frames
         self.loop_order = loop_order
         self.loop_n_coefficients = loop_order + 1  # To account for DC coefficient
-        self.loop_coefficients = torch.zeros(batch_size, self.loop_n_frames, self.loop_n_coefficients,
+        self.loop_coefficients = torch.rand(batch_size, self.loop_n_frames, self.loop_n_coefficients,
                                                  dtype=self._dtype).uniform_(-2, 0)
-        self.loop_gain = nn.Parameter(torch.zeros(batch_size, loop_n_frames, 1, dtype=self._dtype))
+        self.loop_gain = nn.Parameter(torch.rand(batch_size, loop_n_frames, 1, dtype=self._dtype))
 
         # ====== Interpolation Settings ==================
         self.interp_type = interp_type
@@ -120,6 +121,60 @@ class DiffKS(nn.Module):
         # ====== Analysis Buffers =======================
         self.register_buffer("excitation_filter_out", torch.empty(batch_size, self.exc_length_n))
         self.register_buffer("ks_inverse_signal", torch.zeros(batch_size, self.exc_length_n))
+
+        # ====== METADATA table for inner shapes (no batch)
+        self._param_meta: dict[str, Tuple[Tuple[int, ...], str]] = {
+            "exc_coefficients": ((self.exc_n_frames, self.exc_order), "Parameter"),
+            "loop_coefficients": ((self.loop_n_frames, self.loop_n_coefficients), "Parameter"),
+            "loop_gain": ((self.loop_n_frames, 1), "Parameter"),
+        }
+
+    def _expect(self, tensor: torch.Tensor, name: str, shape: Tuple[int, ...],
+    ) -> torch.Tensor:
+        """Validate *shape*, then cast to model dtype / device if necessary."""
+        if tuple(tensor.shape) != shape:
+            raise ValueError(f"{name}: expected shape {shape}, got {tuple(tensor.shape)}")
+        return tensor.to(dtype=self._dtype, device=self.device)
+
+    def _prepare(self, name: str, new_value: Optional[torch.Tensor], *, inplace: bool = False,
+    ) -> torch.Tensor:
+        """Common path used by both setters and forward.
+
+        Parameters
+        ----------
+        name : str -> One of the keys of ``_param_meta``.
+        new_value : Tensor | None
+            A tensor supplied externally **or** None to indicate that the stored
+            Parameter should be used.
+        inplace : bool, default = False
+            If *True*, copy the validated value into the Parameter under
+            ``torch.no_grad()`` (used by setters).
+        """
+        inner_shape, _ = self._param_meta[name]
+        full_shape = (self.batch_size, *inner_shape)
+
+        if new_value is None:
+            return getattr(self, name)  # use the Parameter as‑is
+
+        value = self._expect(new_value, name, full_shape)
+
+        if inplace:
+            with torch.no_grad():
+                getattr(self, name).data.copy_(value)
+        return value
+
+    # setters for manual init
+    @torch.no_grad()
+    def set_exc_coefficients(self, value: torch.Tensor) -> None:
+        self._prepare("exc_coefficients", value, inplace=True)
+
+    @torch.no_grad()
+    def set_loop_coefficients(self, value: torch.Tensor) -> None:
+        self._prepare("loop_coefficients", value, inplace=True)
+
+    @torch.no_grad()
+    def set_loop_gain(self, value: torch.Tensor) -> None:
+        self._prepare("loop_gain", value, inplace=True)
 
     @property
     def interp_type(self):
@@ -150,33 +205,16 @@ class DiffKS(nn.Module):
         assert f0_frames.dim() == 2, f"f0_frames must have 2 dimensions, got shape {f0_frames.shape}"
         assert input.dim() == 2, f"target must have 2 dimensions (batch, samples), got shape {input.shape}"
 
-        if loop_coefficients is not None:
-            assert loop_coefficients.dim() == 3, f"loop_coefficients must have 3 dimensions, got shape {loop_coefficients.shape}"
-            assert loop_coefficients.size(1) == self.loop_n_frames, f"Expected {self.loop_n_frames} frames, got {loop_coefficients.size(1)}"
-            assert loop_coefficients.size(2) == self.loop_n_coefficients, f"Expected loop_coefficients.size(2)={self.loop_n_coefficients}, got {loop_coefficients.size(2)}"
-
-        if loop_gain is not None:
-            assert loop_gain.dim() == 3, f"loop_gain must have 3 dimensions, got shape {loop_gain.shape}"
-            assert loop_gain.size(1) == self.loop_n_frames, f"Expected {self.loop_n_frames} frames, got {loop_coefficients.size(1)}"
-            assert loop_gain.size(2) == 1, f"loop_gain dimension 2 must be 1, got {loop_gain.size(2)}"
-
-        if exc_coefficients is not None:
-            assert exc_coefficients.dim() == 3, f"exc_coefficients must have 3 dimensions, got shape {exc_coefficients.shape}"
-            assert exc_coefficients.size(1) == self.exc_n_frames, f"Expected {self.exc_n_frames} frames, got {exc_coefficients.size(1)}"
-            assert exc_coefficients.size(2) == self.exc_order, f"Expected exc_coefficients.size(2)={self.exc_order}, got {exc_coefficients.size(2)}"
+        l_b = self._prepare("loop_coefficients", loop_coefficients)
+        l_g = self._prepare("loop_gain", loop_gain)
+        exc_b = self._prepare("exc_coefficients", exc_coefficients)
 
         n_samples = input.size(1)
 
-        # Get constrained coefficients (handles normalization and gain)
-        l_b_constrained = self.get_constrained_coefficients(
-            l_b=loop_coefficients if loop_coefficients is not None else None,
-            l_g=loop_gain if loop_gain is not None else None,
-        )
-
+        l_b_constrained = self.get_constrained_coefficients(l_b=l_b, l_g=l_g)
         f0, l_b, exc_b = self.get_upsampled_parameters(f0_frames, n_samples,
                                                        l_b=l_b_constrained,
-                                                       exc_b=exc_coefficients)
-
+                                                       exc_b=exc_b)
         A, x = self.compute_resonator_matrix(f0=f0,
                                              loop_coefficients=l_b,
                                              input=input)
