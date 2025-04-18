@@ -1,3 +1,0 @@
-[submodule "ddsp_pytorch"]
-	path = ddsp_pytorch
-	url = https://github.com/acids-ircam/ddsp_pytorch
