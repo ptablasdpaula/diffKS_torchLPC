@@ -281,36 +281,30 @@ class DiffKS(nn.Module):
             A[batch_indices, sample_indices, indices] = -b[..., -1]
 
         elif self.interp_type == "lagrange":
-            b_processed = torch.zeros(batch_size, n_samples, self.num_active_indexes,
-                                      device=self.device, dtype=self._dtype)
+            lag_k = self._lagrange_kernel(alfa)  # (B,N,L+1)
+            B, N, M = b.shape
 
-            for batch_idx in range(batch_size):
-                batch_alfa = alfa[batch_idx]  # [n_samples]
-                batch_b = b[batch_idx]  # [n_samples, loop_n_coefficients]
+            if b.is_cuda:  # depth‑wise conv
+                inp = b.transpose(1, 2).reshape(1, B * N, M)
+                kern = lag_k.reshape(B * N, 1, LAGRANGE_ORDER + 1)
 
-                # Calculate Lagrange coefficients
-                lagrange_coeffs = batch_alfa.view(-1, 1) - torch.arange(
-                    LAGRANGE_ORDER + 1, device=self.device, dtype=self._dtype).view(1, -1)
+                b_processed = F.conv1d(
+                    inp, kern, padding=LAGRANGE_ORDER, groups=B * N
+                ).reshape(B, N, -1)  # (B,N,M+L)
 
-                # Apply denominator and masks
-                lagrange_coeffs = lagrange_coeffs.unsqueeze(1)
-                lagrange_coeffs = torch.where(self.lagrange_mask, lagrange_coeffs, 1)
-                lagrange_coeffs = lagrange_coeffs / self.lagrange_denom.to(self.device).unsqueeze(0)
-                lagrange_coeffs = lagrange_coeffs.prod(dim=-1)
+            else:  # vectorised einsum
+                L = LAGRANGE_ORDER  # = 5
+                b_unf = F.pad(b, (L, L))  # (B,N,K+2L)   pad left *and* right
+                b_unf = b_unf.unfold(-1, L + 1, 1)  # (B,N,K+2L,L+1)
+                b_processed = torch.einsum('bnml,bnl->bnm', b_unf, lag_k)
 
-                batch_result = torch.nn.functional.conv1d(
-                    batch_b.unsqueeze(0),
-                    lagrange_coeffs.unsqueeze(1),
-                    padding=LAGRANGE_ORDER,
-                    groups=n_samples
-                ).squeeze(0)
+            base_idx = z_l.unsqueeze(-1) + torch.arange(
+                self.num_active_indexes, device=self.device
+            )
 
-                b_processed[batch_idx, :, :batch_result.size(1)] = batch_result
-
-            # Apply processed coefficients to A matrix
-            for i in range(self.num_active_indexes):
-                indices = z_l + i
-                A[batch_indices, sample_indices, indices] = -b_processed[..., i]
+            A[torch.arange(B).view(-1, 1, 1),
+            torch.arange(N).view(1, -1, 1),
+            base_idx] = -b_processed
 
         else:
             raise NotImplementedError(f"Interpolation type {self.interp_type} not implemented")
@@ -367,3 +361,23 @@ class DiffKS(nn.Module):
 
     def get_excitation_filter_out(self):
         return self.excitation_filter_out
+
+    # --- helper: vectorised Lagrange kernel ---------------------------------------
+    def _lagrange_kernel(self, alfa: torch.Tensor) -> torch.Tensor:
+        """
+        alfa : [B, N]  fractional part (0…1)
+        returns a per–sample kernel of shape [B, N, L+1]  (here L = 5)
+        """
+        # α − i   for i = 0…L
+        k = torch.arange(LAGRANGE_ORDER + 1,
+                         device=alfa.device,
+                         dtype=self._dtype)  # (L+1,)
+        diff = alfa.unsqueeze(-1) - k  # (B,N,L+1)
+
+        # numerator / denominator,  mask the diagonals that would be “0/0”
+        num = diff.unsqueeze(-2)  # (B,N,1,L+1)
+        denom = self.lagrange_denom.to(alfa.device)  # (L+1,L+1)
+        kernel = torch.where(self.lagrange_mask, num, 1.) / denom  # (B,N,L+1,L+1)
+
+        # Π over the last axis → per‑sample kernel length L+1
+        return kernel.prod(-1)  # (B,N,L+1)
