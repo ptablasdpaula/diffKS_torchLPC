@@ -8,8 +8,8 @@ from utils import resize_tensor_dim, get_device
 
 LAGRANGE_ORDER = 5
 
-def spline_upsample(x: torch.Tensor,  # shape [1, Frames, D]
-                    num_samples) -> torch.Tensor:  # shape [1, Samples, D]
+def spline_upsample(x: torch.Tensor,  # shape [B, Frames, D]
+                    num_samples) -> torch.Tensor:  # shape [B, Samples, D]
     frames = x.size(1)
     t_in = torch.linspace(0, 1, steps=frames, device=x.device)
     t_out = torch.linspace(0, 1, steps=num_samples, device=x.device)
@@ -64,7 +64,9 @@ class InvertLPC(torch.autograd.Function):
         return grad_y, grad_A, grad_zi
 
 
-def invert_lpc(y: torch.Tensor, A: torch.Tensor, zi: torch.Tensor = None) -> torch.Tensor:
+def invert_lpc(y: torch.Tensor, # [B, N],
+               A: torch.Tensor, # [B, N, D], where D is order
+               zi: torch.Tensor = None) -> torch.Tensor:
     return InvertLPC.apply(y, A, zi)
 
 class DiffKS(nn.Module):
@@ -100,8 +102,9 @@ class DiffKS(nn.Module):
         # ====== Excitation Filter ======================
         self.exc_n_frames = exc_n_frames
         self.exc_order = exc_order
+        self.exc_n_coefficients = exc_order + 1 # To account for exc_g
         self.exc_length_n = int (exc_length_s * sample_rate)
-        self.exc_coefficients = nn.Parameter(torch.rand(batch_size, self.exc_n_frames, self.exc_order, dtype=self._dtype) * 1e-4)
+        self.exc_coefficients = nn.Parameter(torch.rand(batch_size, self.exc_n_frames, self.exc_n_coefficients, dtype=self._dtype) * 1e-4)
 
         # ====== Loop Filter ============================
         self.loop_n_frames = loop_n_frames
@@ -124,7 +127,7 @@ class DiffKS(nn.Module):
 
         # ====== METADATA table for inner shapes (no batch)
         self._param_meta: dict[str, Tuple[Tuple[int, ...], str]] = {
-            "exc_coefficients": ((self.exc_n_frames, self.exc_order), "Parameter"),
+            "exc_coefficients": ((self.exc_n_frames, self.exc_n_coefficients), "Parameter"),
             "loop_coefficients": ((self.loop_n_frames, self.loop_n_coefficients), "Parameter"),
             "loop_gain": ((self.loop_n_frames, 1), "Parameter"),
         }
@@ -211,10 +214,13 @@ class DiffKS(nn.Module):
 
         n_samples = input.size(1)
 
-        l_b_constrained = self.get_constrained_coefficients(l_b=l_b, l_g=l_g)
+        l_b_constrained = self.get_constrained_l_coefficients(l_b=l_b, l_g=l_g)
         f0, l_b, exc_b = self.get_upsampled_parameters(f0_frames, n_samples,
                                                        l_b=l_b_constrained,
                                                        exc_b=exc_b)
+
+        exc_b = self.get_constrained_exc_coefficients(exc_b=exc_b)
+
         A, x = self.compute_resonator_matrix(f0=f0,
                                              loop_coefficients=l_b,
                                              input=input)
@@ -349,14 +355,33 @@ class DiffKS(nn.Module):
 
         return A, x
 
+    def get_constrained_exc_coefficients(
+            self,
+            exc_b: Optional[torch.Tensor] = None  # [B, F, exc_order+1]
+    ) -> torch.Tensor:  # [B, F, exc_order]
+        """
+        The first slot of *exc_b* is interpreted as a raw gain term (``exc_g``).
+        After a sigmoid, that gain scales every AR coefficient, while the implicit
+        DC coefficient that `torchlpc.sample_wise_lpc` assumes stays at **+1**.
+        """
+        raw = exc_b if exc_b is not None else self.exc_coefficients  # [B,F,O+1]
+
+        exc_g_raw = raw[..., :1]  # shape [B, F, 1]  –– gain parameter
+        exc_a_raw = raw[..., 1:]  # shape [B, F, O]  –– AR coeffs
+
+        exc_g = torch.sigmoid(exc_g_raw)  # (0‥1)
+        exc_a = torch.sigmoid(exc_a_raw) * exc_g  # (0‥exc_g)
+
+        return exc_a  # [B, F, exc_order]
+
     def get_gain(self,
                  l_g : torch.Tensor = None,): # [batches, loop_n_frames, 1]
         return torch.sigmoid(l_g if l_g is not None else self.loop_gain)
 
-    def get_constrained_coefficients(self,
-                                     l_b : Optional[torch.Tensor] = None, # [batches, loop_n_frames, loop_n_coefficients]
-                                     l_g : Optional[torch.Tensor] = None, # [batches, loop_n_frames, 1]
-                                     ) -> torch.Tensor:
+    def get_constrained_l_coefficients(self,
+                                          l_b : Optional[torch.Tensor] = None,  # [batches, loop_n_frames, loop_n_coefficients]
+                                          l_g : Optional[torch.Tensor] = None,  # [batches, loop_n_frames, 1]
+                                          ) -> torch.Tensor:
         sigmoid_b = torch.sigmoid(l_b if l_b is not None else self.loop_coefficients)
         sum_b = sigmoid_b.sum(dim=-1, keepdim=True)
         return (sigmoid_b / sum_b) * (self.get_gain(l_g if l_g is not None else None))
