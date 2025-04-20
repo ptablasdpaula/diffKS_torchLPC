@@ -77,8 +77,8 @@ def build_usual_ks(cfg_mp: Dict[str, Any], sr: int) -> Tuple[DiffKS, torch.Tenso
     # --- Excitation filter: gently varying small reflection coeffs ------------
     exc_frames = cfg_mp["exc_n_frames"]
     t = torch.linspace(0, 1, exc_frames).unsqueeze(-1)
-    exc_coeffs = 0.2 * torch.sin(2 * math.pi * (1 + torch.arange(exc_order)) * t)
-    exc_coeffs = exc_coeffs.expand(1, -1, -1)  # [1, exc_n_frames, exc_order]
+    exc_coeffs = 0.2 * torch.sin(2 * math.pi * (1 + torch.arange(exc_order + 1)) * t)
+    exc_coeffs = exc_coeffs.expand(1, -1, -1)  # [1, exc_n_frames, exc_order + 1]
     model.set_exc_coefficients(exc_coeffs)
 
     _, _, _, gs = load_config()
@@ -148,7 +148,7 @@ def build_random_model(cfg_mp: Dict[str, Any], sr: int,
 
     model.set_loop_coefficients(torch.rand(1, loop_n_frames, loop_order + 1))
     model.set_loop_gain(torch.rand((1, loop_n_frames, 1),))
-    model.set_exc_coefficients(torch.rand(1, exc_n_frames, exc_order) * 0.1)
+    model.set_exc_coefficients(torch.rand(1, exc_n_frames, exc_order + 1) * 0.1)
 
     return model
 
