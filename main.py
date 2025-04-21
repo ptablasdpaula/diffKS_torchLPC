@@ -1,242 +1,356 @@
-import torch
-from auraloss.freq import MultiResolutionSTFTLoss as multi_stft_loss
-from tqdm import tqdm
-import matplotlib.pyplot as plt
+from __future__ import annotations
+
+import math
+import random
+from pathlib import Path
+from typing import Tuple, Dict, Any, Union
 
 import numpy as np
+import torch
+import torchaudio
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
-from diffKS import DiffKS, noise_burst
-from utils import (
-    load_config,
-    make_symmetric_mirrored_coefficient_frame_linspace,
-    ks_to_audio,
-    process_target,
-    compute_minimum_action, plot_coefficient_comparison, plot_upsampled_filter_coeffs, plot_excitation_filter_analysis,
-    plot_excitation_filter_coefficients, save_audio_torchaudio  # <--- import from utils
-)
+import pygad
+from auraloss.freq import MultiResolutionSTFTLoss as MultiSTFT
 
-def main():
-    # ==== Retrieve from config ============================
-    hp, mp, idp, gs = load_config()
+from diffKS import DiffKS
+from utils import (noise_burst, load_config, resize_tensor_dim,)
 
-    sample_rate    = gs["sample_rate"]
-    length_audio_s = gs["length_audio_s"]
-    length_audio_n = sample_rate * length_audio_s
+# -----------------------------------------------------------------------------
+# Utility helpers
+# -----------------------------------------------------------------------------
 
-    method             = hp["method"]
-    learning_rate      = hp["learning_rate"]
-    max_epochs         = hp["max_epochs"]
-    stft_weight        = hp["stft_weight"]
-    use_A_weighing     = hp["use_A_weighing"]
-    min_action_weight  = hp["min_action_weight"]
-    min_action_dist    = hp.get("min_action_distance", "l2")
+def ensure_dirs() -> None:
+    """Create output folders declared in the spec."""
+    for p in ["plots", "audio/out"]:
+        Path(p).mkdir(parents=True, exist_ok=True)
 
-    patience_epochs = hp["patience_epochs"]
-    patience_delta  = hp["patience_delta"]
 
-    exc_order       = mp["exc_order"]
-    exc_n_frames    = mp["exc_n_frames"]
-    loop_order      = mp["loop_order"]
-    loop_n_frames   = mp["loop_n_frames"]
-    f0_1_Hz, f0_2_Hz= mp["f0_1_Hz"], mp["f0_2_Hz"]
-    f0_n_frames     = mp["f0_n_frames"]
-    min_f0_hz       = mp["min_f0_hz"]
-    burst_width_s   = mp["burst_width_s"]
-    burst_length_s  = mp["burst_length_s"]
+def save_audio(path: str | Path, tensor: torch.Tensor, sr: int) -> None:
+    """Save *mono* tensor to WAV (expects shape [1, samples] or [samples])."""
+    tensor = tensor.detach().cpu()
+    if tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+    torchaudio.save(str(path), tensor, sr)
 
-    use_double_precision = mp["use_double_precision"]
-    normalize_burst = mp["normalize_burst"]
-    interp_type = mp["interp_type"]
 
-    use_in_domain = idp["use_in_domain"]
-    b_start, b_mid, b_end = idp["b_start"], idp["b_mid"], idp["b_end"]
-    t_gain = idp["gain"]
+def to_samples(f0_hz: float, sr: int) -> float:
+    """Convert fundamental (Hz) to delay in *samples* (non‑integer)."""
+    return sr / f0_hz
 
-    # ==== Generate Burst ==================================
-    burst = noise_burst(
-        sample_rate=sample_rate,
-        length_s=burst_length_s,
-        burst_width_s=burst_width_s,
-        normalize=normalize_burst,
-    )
 
-    # ==== Create f0 frames (delay lengths) ================
-    f0_1_n = sample_rate / f0_1_Hz
-    f0_2_n = sample_rate / f0_2_Hz
-    f0_frames = torch.linspace(f0_1_n, f0_2_n, f0_n_frames)
+# -----------------------------------------------------------------------------
+# Main experiment logic
+# -----------------------------------------------------------------------------
 
-    # ==== Initialize Model ================================
-    p_model = DiffKS(
-        burst=burst,
-        loop_n_frames=loop_n_frames,
-        sample_rate=sample_rate,
-        min_f0_hz=min_f0_hz,
+def build_usual_ks(cfg_mp: Dict[str, Any], sr: int) -> Tuple[DiffKS, torch.Tensor]:
+    """Return a *DiffKS* initialised to “usual” KS values plus an excitation
+    burst long enough for *exc_length_s* from the config.
+    """
+    exc_len_s: float = cfg_mp["exc_length_s"]
+    loop_order = cfg_mp["loop_order"]
+    exc_order = cfg_mp["exc_order"]
+    batch_size = cfg_mp["batch_size"]
+
+    model = DiffKS(
+        sample_rate=sr,
+        min_f0_hz=cfg_mp["min_f0_hz"],
         loop_order=loop_order,
+        loop_n_frames=cfg_mp["loop_n_frames"],
         exc_order=exc_order,
-        exc_requires_grad=True,
-        interp_type=interp_type,
-        use_double_precision=use_double_precision,
+        exc_n_frames=cfg_mp["exc_n_frames"],
+        exc_length_s=exc_len_s,
+        interp_type=cfg_mp["interp_type"],
+        use_double_precision=cfg_mp["use_double_precision"],
+        batch_size=batch_size,
+    )
+
+    # --- Configure loop filter so it behaves like the classic KS averager -------
+    loop_frames = cfg_mp["loop_n_frames"]
+
+    loop_coeffs = torch.full((batch_size, loop_frames, loop_order + 1), 0.5)  # σ(0)=0.5 everywhere
+    loop_coeffs[:, :, 0] = 0.2
+    loop_coeffs[:, :, 1] = 0.8
+    model.set_loop_coefficients(loop_coeffs)
+
+    # overall feedback gain a whisker below 1.0  → very slow decay
+    model.set_loop_gain(torch.full((batch_size, loop_frames, 1), 5.3))  # σ(5.3) ≈ 0.995
+
+    # --- Excitation filter: gently varying small reflection coeffs ------------
+    exc_frames = cfg_mp["exc_n_frames"]
+    t = torch.linspace(0, 1, exc_frames).unsqueeze(-1)
+    exc_coeffs = 0.2 * torch.sin(2 * math.pi * (1 + torch.arange(exc_order + 1)) * t)
+    exc_coeffs = exc_coeffs.expand(batch_size, -1, -1)  # [batch_size, exc_n_frames, exc_order + 1]
+    model.set_exc_coefficients(exc_coeffs)
+
+    _, _, _, gs = load_config()
+
+    # --- Generate noise burst -------------------------------------------------
+    burst = noise_burst(
+        sample_rate=sr,
+        length_s=gs["length_audio_s"],
+        burst_width_s=cfg_mp["burst_width_s"],
+        normalize=cfg_mp["normalize_burst"],
+        batch_size=batch_size,
+    )
+
+    return model, burst
+
+
+def run_usual_ks(model: DiffKS, burst: torch.Tensor, sr: int,
+                 cfg_mp: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor,
+                                                  torch.Tensor]:
+    """Propagate *burst* through *model* with base‑440 Hz plus vibrato."""
+    f0_start = cfg_mp['f0_1_Hz']
+    f0_end = cfg_mp['f0_2_Hz']
+    n_frames = cfg_mp['f0_n_frames']
+
+    batch_size = cfg_mp['batch_size']
+
+    f0_hz = torch.linspace(f0_start, f0_end, n_frames)
+    f0_frames = (sr / f0_hz).repeat(batch_size, 1)  # delay in *samples*
+
+    audio = model(f0_frames=f0_frames.to(model.device),
+                  input=burst.to(model.device),
+                  direct=True)  # in‑domain generation
+
+    exc_out = model.exc_filter_out  # [1, exc_len_samples]
+    return audio.cpu(), exc_out.cpu(), f0_frames
+
+
+def load_guitar(path: str | Path, sr_tgt: int) -> torch.Tensor:
+    """Load *audio/guitar.wav* and resample to *sr_tgt* (mono)."""
+    wav, sr_in = torchaudio.load(str(path))
+    if wav.dim() > 1:
+        wav = torch.mean(wav, dim=0, keepdim=True)  # down‑mix
+    if sr_in != sr_tgt:
+        wav = torchaudio.transforms.Resample(sr_in, sr_tgt)(wav)
+    return wav
+
+
+def build_random_model(cfg_mp: Dict[str, Any], sr: int,
+                       seed: int) -> DiffKS:
+    """Create a *DiffKS* with random weights but fixed *seed*."""
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+    loop_order = cfg_mp["loop_order"]
+    loop_n_frames = cfg_mp["loop_n_frames"]
+    exc_order = cfg_mp["exc_order"]
+    exc_n_frames = cfg_mp["exc_n_frames"]
+    batch_size = cfg_mp["batch_size"]
+
+    model = DiffKS(
+        sample_rate=sr,
+        min_f0_hz=cfg_mp["min_f0_hz"],
+        loop_order=loop_order,
+        loop_n_frames=loop_n_frames,
+        exc_order=exc_order,
         exc_n_frames=exc_n_frames,
+        exc_length_s=cfg_mp["exc_length_s"],
+        interp_type=cfg_mp["interp_type"],
+        use_double_precision=cfg_mp["use_double_precision"],
+        batch_size=batch_size,
     )
 
-    # ==== Create Baseline audio (to be optimized) =========
-    _ = ks_to_audio(
-        model=p_model,
-        out_path="initial.wav",
-        f0_frames=f0_frames,
-        sample_rate=sample_rate,
-        length_audio_s=length_audio_s
-    )
+    model.set_loop_coefficients(torch.rand(batch_size, loop_n_frames, loop_order + 1))
+    model.set_loop_gain(torch.rand((batch_size, loop_n_frames, 1),))
+    model.set_exc_coefficients(torch.rand(batch_size, exc_n_frames, exc_order + 1) * 0.1)
 
-    # ==== Generate target audio ===========================
-    if use_in_domain:
-        t_coeff_frames = make_symmetric_mirrored_coefficient_frame_linspace(
-            n_frames=loop_n_frames,
-            order=loop_order,
-            b_start=b_start,
-            b_mid=b_mid,
-            b_end=b_end
-        )
+    return model
 
-        t_model = DiffKS(
-            burst=burst,
-            loop_n_frames=loop_n_frames,
-            sample_rate=sample_rate,
-            min_f0_hz=min_f0_hz,
-            init_loop_coefficients=t_coeff_frames,
-            gain=t_gain,
-            loop_order=loop_order,
-            exc_requires_grad=False,
-            interp_type=interp_type,
-            use_double_precision=use_double_precision,
-        )
+# -----------------------------------------------------------------------------
+# Composite plotting helpers
+# -----------------------------------------------------------------------------
 
-        t_audio = ks_to_audio(
-            model=t_model,
-            out_path="target.wav",
-            f0_frames=f0_frames,
-            sample_rate=sample_rate,
-            length_audio_s=length_audio_s
-        )
-    else:
-        t_audio = process_target(
-            target_path="audio/guitar.wav",
-            out_path="audio/out/target.wav",
-            target_sample_rate=sample_rate,
-            target_length_samples=length_audio_n
-        )
+def composite_plot(fig_path: str,
+                   signals: Dict[str, torch.Tensor],
+                   coeffs: Dict[str, Union[np.ndarray, torch.Tensor]]) -> None:
+    """
+    Plot a set of waveforms (‘signals’) and time‑varying filter coefficients
+    (‘coeffs’) on a single canvas and save to *fig_path*.
+
+    • Each entry in *signals* is a mono tensor – shape [..., samples].
+    • Each entry in *coeffs* is either a 1‑D trajectory (time) or a 2‑D matrix
+      (time, n_coeffs).  All taps are plotted if 2‑D.
+    """
+    n_rows = max(len(signals), len(coeffs))
+    fig, axs = plt.subplots(n_rows, 2, figsize=(14, 3 * n_rows))
+    axs = axs.ravel()
+
+    # --------------------------------------------------------------------- #
+    # 1.  Waveforms
+    # --------------------------------------------------------------------- #
+    row = 0
+    for name, wav in signals.items():
+        ax = axs[row * 2]
+        ax.plot(wav.squeeze().detach().numpy())
+        ax.set_title(name)
+        ax.set_xlabel("samples")
+        ax.grid(True)
+        row += 1
+
+    # --------------------------------------------------------------------- #
+    # 2.  Coefficient trajectories
+    # --------------------------------------------------------------------- #
+    row = 0
+    for name, traj in coeffs.items():
+        ax = axs[row * 2 + 1]
+        traj_np = traj if isinstance(traj, np.ndarray) else traj
+        traj_np = traj_np if isinstance(traj_np, np.ndarray) else traj_np.cpu().numpy()
+
+        if traj_np.ndim == 1:                       # single trajectory
+            ax.plot(traj_np, label=name)
+        else:                                       # multiple taps
+            for k in range(traj_np.shape[1]):
+                ax.plot(traj_np[:, k], label=f"{name}-b{k}")
+        ax.set_title(name)
+        ax.set_xlabel("samples")
+        ax.grid(True)
+        ax.legend(loc="upper right")
+        row += 1
+
+    plt.tight_layout()
+    plt.savefig(fig_path)
+    plt.close(fig)
 
 
 
-    loss_fn = multi_stft_loss(scale_invariance=True,
-                              perceptual_weighting=use_A_weighing,
-                              sample_rate=sample_rate, )
+# -----------------------------------------------------------------------------
+# Training loop ----------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
-    # For plotting the loss curve
+# -----------------------------------------------------------------------------
+# Training loop - works for BOTH in‑domain and out‑of‑domain cases
+# -----------------------------------------------------------------------------
+def optimise_model(model: DiffKS,
+                   input_signal: torch.Tensor,    # what goes *into* the model
+                   target      : torch.Tensor,    # waveform we want to match
+                   f0_frames   : torch.Tensor,    # delay‑trajectory (ctrl‑rate)
+                   direct      : bool,            # True→noise‑burst path
+                   hp         : Dict[str, Any],) -> None:
+    """
+    Optimise *model* so that model(input_signal) ≈ target under STFT loss.
+
+    Parameters
+    ----------
+    model : DiffKS
+    input_signal : [B, samples] tensor fed to the forward‑pass
+    target : [B, samples] reference audio
+    f0_frames : [B, n_ctrl_frames] delay lengths in *samples*
+    direct : bool
+        Passed straight to ``DiffKS.forward``.  True ⇒ use the burst path
+        (Karplus‑Strong); False ⇒ inverse‑filter path.
+    hp : hyperparameter sub‑dict from config
+    """
+    _, mp, _, gs = load_config()
+
+    method = hp.get('method', 'gradient')
+
     loss_curve = []
 
-    bad_epochs = 0  # For Early Stopping
+    if method == 'gradient':
+        optimiser = torch.optim.Adam(model.parameters(), lr=hp["learning_rate"])
 
-    progress_bar = tqdm(range(max_epochs), desc="Training")
+        loss_fn = MultiSTFT(scale_invariance=True,
+                            perceptual_weighting=hp["use_A_weighing"],
+                            sample_rate=gs["sample_rate"])
 
-    # should probably factor this out into classes / methods - can do that once NN implementation is there
-    if method == "gradient":
-        # ==== Setup optimizer and loss ========================
-        optimizer = torch.optim.Adam(p_model.parameters(), lr=learning_rate)
-        for epoch in progress_bar:
-            # Forward
-            output = p_model(f0_frames=f0_frames,
-                             n_samples=length_audio_n,
-                             target=t_audio if use_in_domain is False else None,)
+        bad_epochs = 0
+        pbar = tqdm(range(hp["max_epochs"]), desc="Training")
 
-            # Multi-resolution STFT loss
-            stft_loss = loss_fn(
-                output.unsqueeze(0).unsqueeze(0),
-                t_audio.unsqueeze(0).unsqueeze(0)
-            ) * stft_weight
+        for epoch in pbar:
+            # forward -------------------------------------------------------------
+            out = model(f0_frames=f0_frames.to(model.device),
+                        input=input_signal.to(model.device),
+                        direct=direct)
 
-            loss = stft_loss
+            loss = loss_fn(out.unsqueeze(1),
+                           target.to(model.device).unsqueeze(1)) * hp["stft_weight"]
 
-            if loop_n_frames > 1:
-                # Minimum-action loss on raw coeff frames
-                min_action_loss = compute_minimum_action(
-                    p_model.loop_coefficients,
-                    distance=min_action_dist
-                ) * min_action_weight
+            # backward ------------------------------------------------------------
+            optimiser.zero_grad()
+            loss.backward(retain_graph=True)
+            optimiser.step()
 
-                # Combine them with separate weights
-                loss += min_action_loss
+            # bookkeeping ---------------------------------------------------------
+            l = loss.item()
+            loss_curve.append(l)
+            pbar.set_postfix(loss=f"{l:.4f}")
 
-            # Backprop
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            # Track and display
-            loss_curve.append(loss.item())
-
-            if loop_n_frames > 1:
-                progress_bar.set_postfix({
-                    "stft_loss": f"{stft_loss.item():.4f}",
-                    "ma_loss": f"{min_action_loss.item():.4f}",
-                    "total": f"{loss.item():.4f}"
-                })
-            else:
-                progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
-
-            if loss.item() < patience_delta:
-                bad_epochs += 1
-            else:
-                bad_epochs = 0
-
-            if bad_epochs >= patience_epochs:
-                print(f"No improvement after {patience_epochs} epochs. Early stopping at epoch {epoch}.")
+            # early‑stopping ------------------------------------------------------
+            bad_epochs = bad_epochs + 1 if l < hp["patience_delta"] else 0
+            if bad_epochs >= hp["patience_epochs"]:
                 break
 
     elif method == "genetic":
-        import pygad
+        loop_n_frames = mp["loop_n_frames"]
+        exc_n_frames = mp["exc_n_frames"]
+
+        loop_order = mp["loop_order"]
+        exc_order = mp["exc_order"]
+
+        use_double_precision = mp["use_double_precision"]
+
+        total_loop_coeffs = loop_n_frames * (loop_order + 1)
+        total_exc_coeffs = exc_n_frames * (exc_order + 1)
+
+        num_generations = hp["max_epochs"]
+        num_parents_mating = 18
+        sol_per_pop = mp["batch_size"]
+
+        loss_fn = MultiSTFT(scale_invariance=True,
+                            perceptual_weighting=hp["use_A_weighing"],
+                            sample_rate=gs["sample_rate"])
+
+        def solution_to_coeffs(solution: np.ndarray):
+            num_sols = solution.shape[0]
+            start, end = 0, total_loop_coeffs
+            loop_coeffs = solution[:, start:end].reshape((num_sols, loop_n_frames, loop_order + 1))
+
+            start = end
+            end = start + 1
+            loop_gain = solution[:, start:end].reshape((num_sols, loop_n_frames, 1))
+
+            start = end
+            end = start + total_exc_coeffs
+            assert end == solution.shape[-1]
+            exc_coeffs = solution[:, start:end].reshape((num_sols, exc_n_frames, exc_order + 1))
+
+            return loop_coeffs, loop_gain, exc_coeffs
+
         def fitness_func(ga_instance, solution, solution_idx):
             with torch.no_grad():
+                loop_coeffs, loop_gain, exc_coeffs = solution_to_coeffs(solution)
 
-                # assert loop_n_frames * (loop_order+1) + 1 + exc_n_frames * (exc_order+1) == len(solution)
-                loop_coeffs = solution[:loop_n_frames * (loop_order+1)].reshape((loop_n_frames, loop_order+1))
-                # loop_gain = solution[loop_n_frames * (loop_order+1):loop_n_frames * (loop_order+1) + 1]
-                # exc_coeffs = solution[loop_n_frames * (loop_order+1) + 1:loop_n_frames * (loop_order+1) + 1 + exc_n_frames * (exc_order+1)].reshape((exc_n_frames, exc_order+1))
-                output = p_model(f0_frames=f0_frames,
-                                 n_samples=length_audio_n,
-                                 target=t_audio if use_in_domain is False else None,
-                                 loop_coefficients=torch.tensor(loop_coeffs),
-                                 loop_gain=t_model.loop_gain,
-                                 # exc_coefficients=torch.tensor(exc_coeffs),
-                                 )
+                out = model(f0_frames=f0_frames.to(model.device),
+                            input=input_signal.to(model.device),
+                            direct=direct,
+                            loop_coefficients=torch.from_numpy(loop_coeffs).to(model.device),
+                            loop_gain=torch.from_numpy(loop_gain).to(model.device),
+                            exc_coefficients=torch.from_numpy(exc_coeffs).to(model.device),
+                            )
 
-                # Multi-resolution STFT loss
-                stft_loss = loss_fn(
-                    output.unsqueeze(0).unsqueeze(0),
-                    t_audio.unsqueeze(0).unsqueeze(0)
-                ).item()
-                if loop_n_frames > 1:
-                    # Minimum-action loss on raw coeff frames
-                    min_action_loss = compute_minimum_action(
-                        loop_coeffs,
-                        distance=min_action_dist
-                    ).item()
-                    return [-stft_loss, -min_action_loss]
-                return -stft_loss
-
-        num_generations = 400
-        num_parents_mating = 18
+                tgt = target.to(model.device).unsqueeze(1)
+                stft_loss = []
+                for item in out:
+                    stft_loss.append(-loss_fn(
+                        item.view(1, 1, -1),
+                        tgt
+                    ).item())
+                return stft_loss
 
         fitness_function = fitness_func
 
-        sol_per_pop = 60
-        num_genes = loop_n_frames * (loop_order+1)# + 1 + exc_n_frames * (exc_order+1)
+        num_genes = total_loop_coeffs + 1 + total_exc_coeffs
 
         init_range_low = -1
         init_range_high = 1
 
         parent_selection_type = "sss"
-        keep_parents = -1
+        keep_parents = 0
 
         crossover_type = "single_point"
 
@@ -245,8 +359,10 @@ def main():
 
         def on_gen(ga_instance):
             print("Generation : ", ga_instance.generations_completed)
-            print("Best solution : ", p_model.get_constrained_coefficients(l_b=torch.tensor(ga_instance.best_solution()[0]).view(loop_n_frames, loop_order+1), l_g=t_model.loop_gain, for_plotting=True), "Truth : ", t_model.get_constrained_coefficients(for_plotting=True))
-            print("Fitness of the best solution :", ga_instance.best_solution()[1])
+
+            fitness = ga_instance.best_solution()[1]
+            loss_curve.append(fitness)
+            print("Fitness of the best solution :", fitness)
 
         ga_instance = pygad.GA(
             num_generations=num_generations,
@@ -258,109 +374,182 @@ def main():
             init_range_high=init_range_high,
             parent_selection_type=parent_selection_type,
             keep_parents=keep_parents,
-            keep_elitism=3,
+            keep_elitism=0,
             crossover_type=crossover_type,
             mutation_type=mutation_type,
             # mutation_percent_genes=mutation_percent_genes,
             random_mutation_min_val=-0.1,
             random_mutation_max_val=0.1,
-            mutation_probability=0.9,
-            crossover_probability=0.9,
+            mutation_probability=0.5,
             on_generation=on_gen,
             gene_type=np.float64 if use_double_precision else np.float32,
+            fitness_batch_size=sol_per_pop,
         )
 
         ga_instance.run()
 
-    print("Training finished")
+        loop_coeffs, loop_gain, exc_coeffs = solution_to_coeffs(ga_instance.best_solution()[0][None, :])
 
-    # ==== Plot final loss curve ===========================
-    plt.figure()
-    plt.plot(loss_curve, label="Training Loss")
-    plt.title("Training Loss Curve")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig("plots/loss_curve.png")  # or plt.show()
+        loop_coeffs = torch.from_numpy(loop_coeffs).to(model.device).repeat(sol_per_pop, 1, 1)
+        loop_gain = torch.from_numpy(loop_gain).to(model.device).repeat(sol_per_pop, 1, 1)
+        exc_coeffs = torch.from_numpy(exc_coeffs).to(model.device).repeat(sol_per_pop, 1, 1)
+
+        model.set_exc_coefficients(exc_coeffs)
+        model.set_loop_coefficients(loop_coeffs)
+        model.set_loop_gain(loop_gain)
+
+    # ---------- save loss curve ---------------------------------------------
+    plt.figure(figsize=(8, 3))
+    plt.plot(loss_curve)
+    plt.title("Training loss")
+    plt.xlabel("epoch"); plt.ylabel("STFT loss")
+    plt.grid(True); plt.tight_layout()
+    plt.savefig("plots/loss_curve.png")
     plt.close()
 
-    # ==== Plot predicted vs target reflection coeffs ======
-    with torch.no_grad():
-        pred_coeffs = p_model.get_constrained_coefficients(for_plotting=True)
-        target_coeffs = t_model.get_constrained_coefficients(for_plotting=True) if use_in_domain else None
+# -----------------------------------------------------------------------------
+# Entry‑point ------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
-        plot_coefficient_comparison(
-            predicted_coeffs=pred_coeffs,
-            target_coeffs=target_coeffs,
-            save_path="plots/coefficient_trajectories.png"
-        )
+def main() -> None:
+    ensure_dirs()
+    hp, mp, idp, gs = load_config()
+    sample_rate: int = gs["sample_rate"]
 
-        print (f"The Predicted Gain is {p_model.get_gain()}")
-        if use_in_domain: print(f"The Target Gain is {t_model.get_gain()}")
+    # -------------------------------------------------------------------------
+    # 1–2.  In‑domain synthetic reference using “usual” KS ---------------------
+    model_id, burst = build_usual_ks(mp, sample_rate)
+    in_domain_audio, exc_after, f0_id = run_usual_ks(model_id, burst, sample_rate, mp)
 
-    # ==== Plot predicted FINAL coefficients (after upsampling)
-    plot_upsampled_filter_coeffs(
-        model=p_model,
-        f0_frames=f0_frames,
-        sample_rate=sample_rate,
-        length_audio_s=length_audio_s,
-        title="Cubic predicted",
-        save_path="plots/coefficient_upsampled.png"
-    )
+    save_audio("audio/out/in_domain.wav", in_domain_audio, sample_rate)
+    save_audio("audio/out/burst.wav", burst, sample_rate)
+    save_audio("audio/out/burst_exc.wav", exc_after, sample_rate)
 
-    # ==== Excitation Filter Analysis =============================
-    with torch.no_grad():
-        exc_filt_out = p_model.get_excitation_filter_out()
-        exc_coeffs = p_model.exc_coefficients
-        burst_in = p_model.excitation
+    # -------------------------------------------------------------------------
+    # 3.  Load & prepare guitar -------------------------------------------------
+    guitar = load_guitar("audio/guitar.wav", sample_rate)
+    save_audio("audio/out/guitar_sr.wav", guitar, sample_rate)
 
-    plot_excitation_filter_analysis(
-        burst=burst_in,
-        exc_filt_out=exc_filt_out,
-        exc_coeffs=exc_coeffs,
-        sample_rate=sample_rate,
-        max_time_s=burst_length_s,
-        save_path="plots/excitation_filter_analysis.png",
-        show_plot=False
-    )
+    # -------------------------------------------------------------------------
+    # 4.  New random model ------------------------------------------------------
+    seed = gs.get("random_seed", 1234)
+    model_opt = build_random_model(mp, sample_rate, seed)
 
-    # ==== Plot Excitation Filter coefficients after upsampling ==
-    plot_excitation_filter_coefficients(
-        model=p_model,
-        f0_frames=f0_frames,
-        sample_rate=sample_rate,
-        length_audio_s=length_audio_s,
-        title="Excitation Filter Coefficients",
-        save_path="plots/excitation_coefficients.png"
-    )
+    batch_size = mp["batch_size"]
 
-    # ==== Plot inverse filtered signal (plucking) =========
-    inv_filt_signal = p_model.get_inverse_filtered_signal()
-    time_axis = torch.arange(len(inv_filt_signal)) / sample_rate
+    # -------------------------------------------------------------------------
+    # 5–6.  Forward / optimisation --------------------------------------------
+    use_in_domain = idp["use_in_domain"]
+    if use_in_domain:
+        input_sig = burst  # noise burst → direct=True
+        direct_flag = True
+        target_audio = in_domain_audio
+    else:
+        input_sig = guitar  # real audio → direct=False
+        input_sig = input_sig.repeat((batch_size, 1))
+        direct_flag = False
+        target_audio = guitar
 
-    plt.figure(figsize=(10, 4))
-    plt.plot(time_axis, inv_filt_signal.detach().numpy())
-    plt.title("Inverse Filtered Signal (Plucking Excitation)")
-    plt.xlabel("Time (s)")
-    plt.ylabel("Amplitude")
-    plt.grid(True)
+    f0_frames_opt = f0_id
+
+    optimise_model(model_opt,
+                   input_signal=input_sig,
+                   target=target_audio,
+                   f0_frames=f0_frames_opt,
+                   direct=direct_flag,
+                   hp=hp)
+
+    optim_audio = model_opt(f0_frames=f0_frames_opt.to(model_opt.device),
+                            input=input_sig.to(model_opt.device),
+                            direct=direct_flag).cpu()[0, ...]
+
+    save_audio("audio/out/optimized_model.wav", optim_audio, sample_rate)
+
+    # -------------------------------------------------------------------------
+    # Upsampled coefficients for comparison ------------------------------------
+    n_samp = target_audio.shape[-1]
+    _, l_b_opt, exc_b_opt = model_opt.get_upsampled_parameters(f0=f0_frames_opt,
+                                                              num_samples=n_samp)
+    l_b_opt = l_b_opt[0].squeeze().detach().cpu().numpy()
+    exc_b_opt = exc_b_opt[0].squeeze().detach().cpu().numpy()
+
+    coeffs_dict = {
+        "Loop coeff (opt.)": l_b_opt,  # shape (time, 2)  → DC + z‑1
+        "Exc coeff (opt.)": exc_b_opt,  # shape (time, 5)
+    }
+
+    signals_dict = {
+        "Target": target_audio,
+        "Optimised": optim_audio,
+    }
+
+    if use_in_domain:  # direct = True
+        signals_dict["Noise burst"] = resize_tensor_dim(burst, exc_after.size(1), 1)
+        signals_dict["Burst after exc"] = exc_after
+    else:  # direct = False
+        inv_sig = model_opt.get_inverse_filtered_signal().cpu()
+        exc_after_opt = model_opt.exc_filter_out.cpu()
+        signals_dict["Inverse filtered"] = inv_sig
+        signals_dict["After excitation"] = exc_after_opt
+
+    # --- Coefficient comparison: in‑domain vs optimised ----------------------
+    _, l_b_id, exc_b_id = model_id.get_upsampled_parameters(f0=f0_id,
+                                                            num_samples=n_samp)
+    _, l_b_opt, exc_b_opt = model_opt.get_upsampled_parameters(f0=f0_frames_opt,
+                                                               num_samples=n_samp)
+
+    fig, ax = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
+
+    # loop coefficients (all taps)
+    for k in range(l_b_id.shape[-1]):
+        ax[0].plot(l_b_id[0, :, k].cpu(), label=f'In‑domain b{k}', linewidth=1)
+        ax[0].plot(l_b_opt[0, :, k].cpu(), label=f'Optimised b{k}', linestyle='--')
+    ax[0].set_title('Loop coefficients (upsampled)')
+    ax[0].legend();
+    ax[0].grid(True)
+
+    # excitation coefficients (all 5 taps)
+    exc_len_samples = int(mp['exc_length_s'] * sample_rate)
+
+    ax[1].set_xlim(0, exc_len_samples)  # limit x‑axis
+
+    for k in range(exc_b_id.shape[-1]):
+        ax[1].plot(exc_b_id[0, :exc_len_samples, k].detach(),
+                   label=f'In‑domain a{k}', linewidth=1)
+        ax[1].plot(exc_b_opt[0, :exc_len_samples, k].detach(),
+                   label=f'Optimised a{k}', linestyle='--')
+
+    ax[1].set_title('Excitation coefficients (upsampled)')
+    ax[1].legend();
+    ax[1].grid(True)
+
     plt.tight_layout()
-    plt.savefig("plots/inverse_filtered_signal.png")  # or use plt.show() to display it
-    plt.close()
+    plt.savefig('plots/in_domain_vs_excitation.png')
+    plt.close(fig)
 
-    save_audio_torchaudio(inv_filt_signal, sample_rate=sample_rate, out_path="audio/out/inversed.wav")
+    # add reference coeffs if in‑domain ----------------------------------------
+    if use_in_domain:
+        _, l_b_id, exc_b_id = model_id.get_upsampled_parameters(f0=f0_id,
+                                                                num_samples=n_samp)
+        if use_in_domain:  # add references when they exist
+            coeffs_dict["Loop coeff(ref.)"] = l_b_id.squeeze().detach().numpy()
+            coeffs_dict["Exc coeff (ref.)"] = exc_b_id.squeeze().detach().numpy()
 
-    # ==== Save final model output =========================
-    with torch.no_grad():
-        ks_to_audio(
-            model=p_model,
-            out_path="optimized_model.wav",
-            f0_frames=f0_frames,
-            sample_rate=sample_rate,
-            length_audio_s=length_audio_s,
-            target_audio=t_audio,
-        )
+    composite_plot("plots/composite.png", signals_dict, coeffs_dict)
+
+    # -------------------------------------------------------------------------
+    # 6.  Extra diagnostics for the trained model ------------------------------
+    if not use_in_domain:
+        inv_signal = model_opt.get_inverse_filtered_signal().cpu()
+        save_audio("audio/out/inverse_filtered.wav", inv_sig, sample_rate)
+        exc_after_opt = model_opt.exc_filter_out.cpu()
+        plt.figure(figsize=(12, 4))
+        plt.plot(inv_signal.squeeze().detach().numpy(), label="Inverse filtered")
+        plt.plot(exc_after_opt.squeeze().detach().numpy(), label="After excitation", alpha=0.7)
+        plt.legend(); plt.grid(True)
+        plt.tight_layout()
+        plt.savefig("plots/inverse_excitation_opt.png")
+        plt.close()
 
 if __name__ == "__main__":
     main()

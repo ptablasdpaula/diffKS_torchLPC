@@ -1,3 +1,7 @@
 .idea
 __pycache__
 log
+/plots/*
+!/plots/.gitkeep
+/audio/out/
+!/audio/out/.gitkeep

@@ -1,7 +1,8 @@
 {
   "hyperparameters": {
-    "learning_rate": 0.1,
-    "max_epochs": 100,
+    "method": "gradient",
+    "learning_rate": 0.03,
+    "max_epochs": 500,
     "stft_weight": 100,
     "use_A_weighing": true,
     "min_action_weight": 10,
@@ -12,6 +13,7 @@
   "model_params": {
     "exc_order": 5,
     "exc_n_frames": 100,
+    "exc_length_s": 0.025,
     "loop_order": 1,
     "loop_n_frames": 1,
     "f0_1_Hz": 155.6,
@@ -22,7 +24,8 @@
     "burst_length_s": 0.025,
     "use_double_precision": false,
     "normalize_burst": true,
-    "interp_type": "lagrange"
+    "interp_type": "lagrange",
+    "batch_size": 1
   },
   "in_domain_params": {
     "use_in_domain": false,
