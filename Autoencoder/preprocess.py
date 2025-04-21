@@ -13,6 +13,7 @@ def _extract_loudness(signal, sampling_rate, block_size, n_fft=2048):
     )
     S = np.log(abs(S) + 1e-7)
     f = librosa.fft_frequencies(sr=sampling_rate, n_fft=n_fft)
+    f = np.maximum(f, 1e-7)
     a_weight = librosa.A_weighting(f)
 
     S = S + a_weight.reshape(-1, 1)
@@ -105,13 +106,14 @@ class NsynthDataset(Dataset):
 
     def __init__(
             self,
-            root_dir,  # …/data/nsynth
-            split="test",  # 'train' | 'valid' | 'test'
-            families=("guitar",),  # keep anything in this set
-            sources=("acoustic",),  # ditto for instrument_source_str
+            root_dir,
+            split="test",
+            families=("guitar",),
+            sources=("acoustic",),
             sample_rate=16000,
             hop_size=256,
-            segment_length=None  # None → entire 4‑s clip
+            segment_length=None,
+            max_size=None
     ):
         self.sr = sample_rate
         self.hop_size = hop_size
@@ -124,38 +126,51 @@ class NsynthDataset(Dataset):
             meta = json.load(fp)
 
         # ─── Keep only wanted instruments ─────────────────── #
-        self.items = []
+        matched_files = []
         for key, m in meta.items():
-            if m["instrument_family_str"] not in families:      continue
-            if m["instrument_source_str"] not in sources:       continue
-            wav = os.path.join(split_dir, "audio", f"{key}.wav")
-            self.items.append(wav)
+            if m["instrument_family_str"] not in families: continue
+            if m["instrument_source_str"] not in sources: continue
+            wav_path = os.path.join(split_dir, "audio", f"{key}.wav")
+            matched_files.append(wav_path)
 
-        if not self.items:
+        # Limit dataset size if specified
+        if max_size is not None and max_size > 0:
+            matched_files = matched_files[:max_size]
+
+        if not matched_files:
             raise RuntimeError("No files matched the given filters!")
 
+        # Precompute features for the limited set of files
+        self.cached_data = []
+        for wav_path in matched_files:
+            audio, _ = librosa.load(wav_path, sr=self.sr, mono=True)
+
+            if self.seg_len:
+                if len(audio) < self.seg_len:
+                    audio = np.pad(audio, (0, self.seg_len - len(audio)))
+                else:
+                    audio = audio[: self.seg_len]
+
+            # Precompute features once
+            pitch = extract_pitch(audio, self.sr, self.hop_size)
+            loudness = _extract_loudness(audio, self.sr, self.hop_size)
+
+            # Convert to tensors
+            audio_tensor = torch.from_numpy(audio.astype(np.float32))
+            pitch_tensor = torch.from_numpy(pitch.astype(np.float32)).unsqueeze(-1)
+            loudness_tensor = torch.from_numpy(loudness.astype(np.float32)).unsqueeze(-1)
+
+            self.cached_data.append((audio_tensor, pitch_tensor, loudness_tensor))
+
         print(f"[NSynthDataset] split={split}, "
-              f"{len(self.items)} files, "
+              f"{len(self.cached_data)} files (max_size={max_size}), "
               f"families={families}, sources={sources}")
 
-    # ───────────────────────────────────────────────────────── #
+        if not self.cached_data:
+            raise RuntimeError("No files matched the given filters!")
+
     def __len__(self):
-        return len(self.items)
+        return len(self.cached_data)
 
     def __getitem__(self, idx):
-        path = self.items[idx]
-        audio, _ = librosa.load(path, sr=self.sr, mono=True)
-        if self.seg_len:  # optional slicing
-            if len(audio) < self.seg_len:
-                audio = np.pad(audio, (0, self.seg_len - len(audio)))
-            else:
-                audio = audio[: self.seg_len]
-
-        # ── Feature extraction (frame hop = hop_size) ───────── #
-        pitch = extract_pitch(audio, self.sr, self.hop_size)  # [F]
-        loud = _extract_loudness(audio, self.sr, self.hop_size)  # [F]
-
-        # Torchify & add channel dim expected by your model
-        return (torch.from_numpy(audio.astype(np.float32)),
-                torch.from_numpy(pitch.astype(np.float32)).unsqueeze(-1),
-                torch.from_numpy(loud.astype(np.float32)).unsqueeze(-1))
+        return self.cached_data[idx]
