@@ -19,7 +19,7 @@ config = {
     "exc_order":       10,
     "exc_n_frames":    100,
     "sample_rate":     16000,
-    "batch_size":      8,
+    "batch_size":      1,
     "learning_rate":   1e-3,
     "num_epochs":      300,
     "eval_interval":   50,

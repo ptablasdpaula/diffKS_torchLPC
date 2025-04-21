@@ -2,6 +2,10 @@ import json, os, librosa, torch
 import numpy as np
 from torch.utils.data import Dataset
 from ddsp_pytorch.ddsp.core import extract_pitch
+from tqdm import tqdm
+import pesto
+import torchaudio
+import librosa
 
 def _extract_loudness(signal, sampling_rate, block_size, n_fft=2048):
     S = librosa.stft(
@@ -85,24 +89,13 @@ class SingleAudioDataset(Dataset):
 
 class NsynthDataset(Dataset):
     """
-    Each item  ->  (audio [T],  pitch [F,1],  loudness [F,1])
-    All audio in NSynth is 4s @ 16kHz  (64000 samples, 1000 frames if hop=64)
+    NSynth dataset implementation using PESTO for pitch extraction
+    with batch dimension handling
     """
-    _FAMILY_STR = {"bass",
-                   "brass",
-                   "flute",
-                   "guitar",
-                   "keyboard",
-                   "mallet",
-                   "organ",
-                   "reeds",
-                   "string",
-                   "synth_lead",
-                   "vocal"}
+    _FAMILY_STR = {"bass", "brass", "flute", "guitar", "keyboard", "mallet",
+                   "organ", "reeds", "string", "synth_lead", "vocal"}
 
-    _SRC_STR = {"acoustic",
-                "electronic",
-                "synthetic"}
+    _SRC_STR = {"acoustic", "electronic", "synthetic"}
 
     def __init__(
             self,
@@ -112,20 +105,18 @@ class NsynthDataset(Dataset):
             sources=("acoustic",),
             sample_rate=16000,
             hop_size=256,
-            segment_length=None,
+            segment_length=16000 * 4,
             max_size=None
     ):
         self.sr = sample_rate
         self.hop_size = hop_size
-        self.seg_len = segment_length
+        self.segment_length = segment_length
 
-        # ─── Load metadata ─────────────────────────────────── #
         split_dir = os.path.join(root_dir, f"nsynth-{split}")
         meta_path = os.path.join(split_dir, "examples.json")
         with open(meta_path) as fp:
             meta = json.load(fp)
 
-        # ─── Keep only wanted instruments ─────────────────── #
         matched_files = []
         for key, m in meta.items():
             if m["instrument_family_str"] not in families: continue
@@ -133,44 +124,113 @@ class NsynthDataset(Dataset):
             wav_path = os.path.join(split_dir, "audio", f"{key}.wav")
             matched_files.append(wav_path)
 
-        # Limit dataset size if specified
         if max_size is not None and max_size > 0:
             matched_files = matched_files[:max_size]
 
         if not matched_files:
             raise RuntimeError("No files matched the given filters!")
 
-        # Precompute features for the limited set of files
-        self.cached_data = []
-        for wav_path in matched_files:
-            audio, _ = librosa.load(wav_path, sr=self.sr, mono=True)
+        # Initialize lists to store data
+        self.signals = []
+        self.pitches = []
+        self.loudness = []
+        self.file_indices = []  # To track where each file starts
 
-            if self.seg_len:
-                if len(audio) < self.seg_len:
-                    audio = np.pad(audio, (0, self.seg_len - len(audio)))
-                else:
-                    audio = audio[: self.seg_len]
+        print(f"Preprocessing {len(matched_files)} files...")
+        file_start_idx = 0
 
-            # Precompute features once
-            pitch = extract_pitch(audio, self.sr, self.hop_size)
-            loudness = _extract_loudness(audio, self.sr, self.hop_size)
+        for file_path in tqdm(matched_files):
+            # Use librosa to load audio
+            audio_np, sr = librosa.load(file_path, sr=sample_rate, mono=True)
+
+            # Load with torchaudio for PESTO
+            waveform, sr_torch = torchaudio.load(file_path)
+            if waveform.shape[0] > 1:  # Convert stereo to mono
+                waveform = waveform.mean(dim=0)
+
+            # Resample if needed for PESTO
+            if sr_torch != sample_rate:
+                resampler = torchaudio.transforms.Resample(orig_freq=sr_torch, new_freq=sample_rate)
+                waveform = resampler(waveform)
+
+            print(f"Audio loaded: {len(audio_np)} samples")
+
+            # Pad to multiple of segment_length
+            pad_size = (segment_length - len(audio_np) % segment_length) % segment_length
+            audio_np = np.pad(audio_np, (0, pad_size), 'constant')
+            print(f"Audio after padding: {len(audio_np)} samples")
+
+            # Extract loudness
+            print("Extracting loudness features...")
+            loudness = _extract_loudness(audio_np, sample_rate, hop_size)
+            print(f"Loudness shape: {loudness.shape}")
+
+            # Extract pitch using PESTO
+            print("Extracting pitch with PESTO...")
+            # Ensure waveform has a batch dimension for PESTO
+            if len(waveform.shape) == 1:
+                waveform = waveform.unsqueeze(0)
+
+            timesteps, pitch, confidence, _ = pesto.predict(waveform, sample_rate)
+            print(f"PESTO output - timesteps: {len(timesteps)}, pitch shape: {pitch.shape}")
+
+            # PESTO returns [batch, time] shaped tensors
+            pitch_np = pitch[0].numpy()  # Get first batch
+
+            # Calculate expected number of frames
+            expected_frames = len(audio_np) // hop_size
+
+            # Create interpolation points
+            orig_times = timesteps.numpy()
+            target_times = np.arange(expected_frames) * hop_size / sample_rate
+
+            # Resample pitch to match our frame rate
+            resampled_pitch = np.interp(
+                target_times,
+                orig_times,
+                pitch_np,
+                left=pitch_np[0],
+                right=pitch_np[-1]
+            )
 
             # Convert to tensors
-            audio_tensor = torch.from_numpy(audio.astype(np.float32))
-            pitch_tensor = torch.from_numpy(pitch.astype(np.float32)).unsqueeze(-1)
-            loudness_tensor = torch.from_numpy(loudness.astype(np.float32)).unsqueeze(-1)
+            audio_tensor = torch.from_numpy(audio_np.astype(np.float32))
+            pitch_tensor = torch.from_numpy(resampled_pitch.astype(np.float32))
+            loudness_tensor = torch.from_numpy(loudness.astype(np.float32))
 
-            self.cached_data.append((audio_tensor, pitch_tensor, loudness_tensor))
+            # Divide into segments and add to dataset
+            num_segments = len(audio_np) // segment_length
+            for i in range(num_segments):
+                start_sample = i * segment_length
+                end_sample = start_sample + segment_length
 
-        print(f"[NSynthDataset] split={split}, "
-              f"{len(self.cached_data)} files (max_size={max_size}), "
-              f"families={families}, sources={sources}")
+                # Audio segment
+                audio_segment = audio_tensor[start_sample:end_sample]
 
-        if not self.cached_data:
-            raise RuntimeError("No files matched the given filters!")
+                # Feature segments
+                start_frame = start_sample // hop_size
+                end_frame = start_frame + (segment_length // hop_size)
+
+                pitch_segment = pitch_tensor[start_frame:end_frame]
+                loudness_segment = loudness_tensor[start_frame:end_frame]
+
+                self.signals.append(audio_segment)
+                self.pitches.append(pitch_segment.unsqueeze(-1))  # [F, 1]
+                self.loudness.append(loudness_segment.unsqueeze(-1))  # [F, 1]
+
+            # Track file boundaries
+            file_end_idx = len(self.signals)
+            self.file_indices.append((file_start_idx, file_end_idx))
+            file_start_idx = file_end_idx
+
+        print(f"Dataset created with {len(self.signals)} segments from {len(matched_files)} files")
 
     def __len__(self):
-        return len(self.cached_data)
+        return len(self.signals)
 
     def __getitem__(self, idx):
-        return self.cached_data[idx]
+        return (
+            self.signals[idx],
+            self.pitches[idx],
+            self.loudness[idx]
+        )
