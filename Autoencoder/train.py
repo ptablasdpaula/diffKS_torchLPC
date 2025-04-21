@@ -24,6 +24,7 @@ config = {
     "num_epochs":      300,
     "eval_interval":   50,
     "save_dir":        "runs/ks_nsynth",
+    "num_samples":     1,
     # dataset options
     "split":           "test",                 # train / valid / test
     "families":        ["guitar"],
@@ -37,6 +38,11 @@ def main():
     wandb.init(project="diffks-autoencoder", config=config)
     device = get_device()
 
+    # ─── Create save directories ───────────────────────────────── #
+    full_save_path = os.path.abspath(config["save_dir"])
+    os.makedirs(full_save_path, exist_ok=True)
+    print(f"Using save directory: {full_save_path}")
+
     # ─── Data ─────────────────────────────────────────────────── #
     dataset = NsynthDataset(
         root_dir    = NSYNTH_DIR,
@@ -46,6 +52,7 @@ def main():
         sample_rate = config["sample_rate"],
         hop_size    = 256,
         segment_length = n_samples,
+        max_size= config["num_samples"]
     )
 
     loader = DataLoader(dataset,
@@ -87,61 +94,75 @@ def main():
     best_loss = float('inf')
     step = 0
 
-    for epoch in range(config["num_epochs"]):
-        print(f"\n{'=' * 30}\nStarting Epoch {epoch + 1}/{config['num_epochs']}\n{'=' * 30}")
+    epochs_pbar = tqdm(range(config["num_epochs"]), desc="Training Progress", position=0)
+
+    for epoch in epochs_pbar:
         model.train()
         epoch_loss = 0.0
+        batch_count = len(loader)
+        total_samples = len(dataset)
 
-        progress_bar = tqdm(loader, desc=f"Epoch {epoch + 1}/{config['num_epochs']}")
-        for batch_idx, (audio, pitch, loudness) in enumerate(progress_bar):
+        for batch_idx, (audio, pitch, loudness) in enumerate(loader):
+            batch_size = audio.shape[0]  # Actual batch size (may be smaller for last batch)
+            samples_processed = batch_idx * config["batch_size"] + batch_size
+
             audio = audio.to(device)
             pitch = pitch.to(device)
             loudness = loudness.to(device)
 
             loudness = (loudness - mean_loudness) / (std_loudness + 1e-6)
 
-            output = model(pitch=pitch,
-                           loudness=loudness,
-                           input=audio)
+            epochs_pbar.set_description(
+                f"Epoch {epoch + 1}/{config['num_epochs']} [Batch {batch_idx + 1}/{batch_count}, "
+                f"Samples {samples_processed}/{total_samples}]")
 
+            output = model(pitch=pitch, loudness=loudness, input=audio)
             loss = multi_resolution_stft_loss(output.unsqueeze(1), audio.unsqueeze(1))
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            # Update progress bar
-            progress_bar.set_postfix(loss=loss.item())
+            # Update progress bar postfix with current loss
+            epochs_pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-            # Log loss to wandb
-            wandb.log({"loss": loss.item(), "step": step})
+            # Log loss to wandb with step to ensure proper ordering
+            wandb.log({"loss": loss.item(), "batch": batch_idx, "step": step})
             epoch_loss += loss.item()
             step += 1
 
-        # Calculate average epoch loss
         avg_epoch_loss = epoch_loss / len(loader)
-        wandb.log({"epoch_loss": avg_epoch_loss, "epoch": epoch})
 
-        # Evaluate and save model periodically
+        wandb.log({
+            "epoch_loss": avg_epoch_loss,
+            "epoch": epoch,
+            "step": step - 1  # Use the last step from this epoch
+        })
+
+        epochs_pbar.set_description(f"Epoch {epoch + 1}/{config['num_epochs']}")
+        epochs_pbar.set_postfix(avg_loss=f"{avg_epoch_loss:.4f}")
+
         if (epoch + 1) % config["eval_interval"] == 0:
-            # Save model if it's the best so far
+            epochs_pbar.write(f"\nEvaluating at epoch {epoch + 1}...")
+
             if avg_epoch_loss < best_loss:
                 best_loss = avg_epoch_loss
-                torch.save(model.state_dict(), os.path.join(config["save_dir"], 'best_model.pth'))
-                print(f"Saved best model with loss: {best_loss:.4f}")
+                model_path = os.path.join(config["save_dir"], 'best_model.pth')
+                torch.save(model.state_dict(), model_path)
+                epochs_pbar.write(f"Saved best model with loss: {best_loss:.4f} to {model_path}")
 
-            # Save latest model
+            latest_path = os.path.join(config["save_dir"], 'latest_model.pth')
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_epoch_loss,
-            }, os.path.join(config["save_dir"], 'latest_model.pth'))
+            }, latest_path)
+            epochs_pbar.write(f"Saved latest checkpoint to {latest_path}")
 
             # Generate audio sample
             model.eval()
             with torch.no_grad():
-                # Get first batch from dataloader for consistent evaluation
                 eval_data = next(iter(loader))
                 eval_audio, eval_pitch, eval_loudness = [x.to(device) for x in eval_data]
                 eval_loudness = (eval_loudness - mean_loudness) / std_loudness
@@ -149,9 +170,11 @@ def main():
                 hidden = model.get_hidden(eval_pitch, eval_loudness)
 
                 loop_coeffs = model.loop_coeff_proj(hidden).reshape(
-                    config["batch_size"], config["loop_n_frames"], model.loop_order + 1)
+                    eval_audio.shape[0], config["loop_n_frames"], model.loop_order + 1)
                 exc_coeffs = model.exc_coeff_proj(hidden).reshape(
-                    config["batch_size"], config["exc_n_frames"], model.exc_order + 1)
+                    eval_audio.shape[0], config["exc_n_frames"], model.exc_order + 1)
+
+                epochs_pbar.write(f"Generating coefficient plots...")
 
                 # For excitation coefficients
                 exc_data = []
@@ -169,10 +192,11 @@ def main():
                         exc_table,
                         "frame",
                         "value",
-                        title="All Excitation Coefficients",
+                        title=f"Excitation Coefficients (Epoch {epoch + 1})",
                         stroke="coefficient"
                     ),
-                    "epoch": epoch
+                    "epoch": epoch,
+                    "step": step
                 })
 
                 # For loop coefficients
@@ -191,10 +215,11 @@ def main():
                         loop_table,
                         "frame",
                         "value",
-                        title="All Loop Coefficients",
+                        title=f"Loop Coefficients (Epoch {epoch + 1})",
                         stroke="coefficient"
                     ),
-                    "epoch": epoch
+                    "epoch": epoch,
+                    "step": step
                 })
 
                 # For pitch
@@ -211,16 +236,19 @@ def main():
                         pitch_table,
                         "frame",
                         "value",
-                        title="Pitch Over Time"
+                        title=f"Pitch Over Time (Epoch {epoch + 1})"
                     ),
-                    "epoch": epoch
+                    "epoch": epoch,
+                    "step": step
                 })
+
+                epochs_pbar.write(f"Generating audio samples...")
 
                 # Generate audio
                 eval_output = model(eval_pitch, eval_loudness, input=eval_audio)
 
                 # Save a few examples
-                for sample_idx in range(min(3, config["batch_size"])):
+                for sample_idx in range(min(3, eval_audio.shape[0])):
                     # Original audio
                     original = eval_audio[sample_idx].cpu().numpy()
 
@@ -231,11 +259,9 @@ def main():
                     comparison = np.concatenate([original, reconstructed])
 
                     # Save audio file
-                    sf.write(
-                        os.path.join(config["save_dir"], f'sample_epoch{epoch + 1}_ex{sample_idx}.wav'),
-                        comparison,
-                        config["sample_rate"]
-                    )
+                    audio_path = os.path.join(config["save_dir"], f'sample_epoch{epoch + 1}_ex{sample_idx}.wav')
+                    sf.write(audio_path, comparison, config["sample_rate"])
+                    epochs_pbar.write(f"Saved audio sample to {audio_path}")
 
                     # Log audio to wandb
                     wandb.log({
@@ -244,7 +270,8 @@ def main():
                             caption=f"Epoch {epoch + 1} Example {sample_idx} (Original + Reconstructed)",
                             sample_rate=config["sample_rate"]
                         ),
-                        "epoch": epoch
+                        "epoch": epoch,
+                        "step": step
                     })
 
     # Finish wandb run
