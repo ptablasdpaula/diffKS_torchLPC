@@ -117,10 +117,12 @@ class DiffKS(nn.Module):
         # ====== Interpolation Settings ==================
         self.interp_type = interp_type
 
-        self.lagrange_denom = torch.arange(LAGRANGE_ORDER, -1, -1).view(-1, 1) - torch.arange(LAGRANGE_ORDER + 1).view(1, -1)
-        self.lagrange_mask = self.lagrange_denom != 0
-        self.lagrange_denom = torch.where(self.lagrange_mask, self.lagrange_denom, 1)
-
+        self.register_buffer("lagrange_denom",
+                             torch.arange(LAGRANGE_ORDER, -1, -1).view(-1, 1) -
+                             torch.arange(LAGRANGE_ORDER + 1).view(1, -1))
+        self.register_buffer("lagrange_mask", self.lagrange_denom != 0)
+        self.register_buffer("lagrange_denom_masked",
+                             torch.where(self.lagrange_mask, self.lagrange_denom, 1))
         # ====== Analysis Buffers =======================
         self.register_buffer("excitation_filter_out", torch.empty(batch_size, self.exc_length_n))
         self.register_buffer("ks_inverse_signal", torch.zeros(batch_size, self.exc_length_n))
@@ -259,17 +261,7 @@ class DiffKS(nn.Module):
             A: Coefficient matrix [batch_size, n_samples, coeff_vector_size]
             x: Modified excitation signal [batch_size, n_samples]
         """
-        assert f0.dim() == 2, f"f0 must have 2 dimensions, got shape {f0.shape}"
-        assert loop_coefficients.dim() == 3, f"loop_coefficients must have 3 dimensions, got shape {loop_coefficients.shape}"
-
         batch_size, n_samples = f0.shape
-        assert loop_coefficients.size(
-            0) == batch_size, f"Batch size mismatch: f0 has {batch_size}, loop_coefficients has {loop_coefficients.size(0)}"
-        assert loop_coefficients.size(
-            1) == n_samples, f"Sample count mismatch: f0 has {n_samples}, loop_coefficients has {loop_coefficients.size(1)}"
-        assert loop_coefficients.size(
-            2) == self.loop_n_coefficients, f"Coefficient count mismatch: expected {self.loop_n_coefficients}, got {loop_coefficients.size(2)}"
-        assert input.size(1) == n_samples, f"Input sample count mismatch: expected {n_samples}, got {input.size(1)}"
 
         x = input
         b = loop_coefficients  # [batch_size, n_samples, loop_n_coefficients]
@@ -384,7 +376,8 @@ class DiffKS(nn.Module):
                                           ) -> torch.Tensor:
         sigmoid_b = torch.sigmoid(l_b if l_b is not None else self.loop_coefficients)
         sum_b = sigmoid_b.sum(dim=-1, keepdim=True)
-        return (sigmoid_b / sum_b) * (self.get_gain(l_g if l_g is not None else None))
+        result = (sigmoid_b / sum_b) * (self.get_gain(l_g if l_g is not None else None))
+        return result.to(self.device)
 
     def get_upsampled_parameters(
             self,
@@ -417,7 +410,7 @@ class DiffKS(nn.Module):
         else:
             exc_b_i = spline_upsample(exc_b_frames_.to(dtype=self._dtype), exc_length_n)
 
-        return f0_i, loop_b_i, exc_b_i
+        return f0_i.to(self.device), loop_b_i.to(self.device), exc_b_i.to(self.device)
 
     def get_inverse_filtered_signal(self):
         return self.ks_inverse_signal
@@ -439,8 +432,13 @@ class DiffKS(nn.Module):
 
         # numerator / denominator,  mask the diagonals that would be “0/0”
         num = diff.unsqueeze(-2)  # (B,N,1,L+1)
+
+        mask = self.lagrange_mask.to(alfa.device)
         denom = self.lagrange_denom.to(alfa.device)  # (L+1,L+1)
-        kernel = torch.where(self.lagrange_mask, num, 1.) / denom  # (B,N,L+1,L+1)
+
+        safe_denom = torch.where(mask, denom, 1.) + 1e-6
+
+        kernel = torch.where(mask, num, 1.) / safe_denom  # (B,N,L+1,L+1)
 
         # Π over the last axis → per‑sample kernel length L+1
         return kernel.prod(-1)  # (B,N,L+1)

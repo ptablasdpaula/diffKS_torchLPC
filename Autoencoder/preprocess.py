@@ -1,10 +1,9 @@
-import torch
+import json, os, librosa, torch
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
-import librosa
+from torch.utils.data import Dataset
 from ddsp_pytorch.ddsp.core import extract_pitch
 
-def extract_loudness(signal, sampling_rate, block_size, n_fft=2048):
+def _extract_loudness(signal, sampling_rate, block_size, n_fft=2048):
     S = librosa.stft(
         signal,
         n_fft=n_fft,
@@ -55,7 +54,7 @@ class SingleAudioDataset(Dataset):
         self.pitch = extract_pitch(audio_np, 16000, self.hop_size)
 
         # Extract loudness
-        self.loudness = extract_loudness(audio_np, 16000, self.hop_size)
+        self.loudness = _extract_loudness(audio_np, 16000, self.hop_size)
 
         # Convert to torch tensors
         self.pitch = torch.from_numpy(self.pitch.astype(np.float32))
@@ -82,3 +81,81 @@ class SingleAudioDataset(Dataset):
         return (audio_segment,
                 pitch_segment.unsqueeze(-1),    # [F, 1]
                 loudness_segment.unsqueeze(-1)) # [F, 1]
+
+class NsynthDataset(Dataset):
+    """
+    Each item  ->  (audio [T],  pitch [F,1],  loudness [F,1])
+    All audio in NSynth is 4s @ 16kHz  (64000 samples, 1000 frames if hop=64)
+    """
+    _FAMILY_STR = {"bass",
+                   "brass",
+                   "flute",
+                   "guitar",
+                   "keyboard",
+                   "mallet",
+                   "organ",
+                   "reeds",
+                   "string",
+                   "synth_lead",
+                   "vocal"}
+
+    _SRC_STR = {"acoustic",
+                "electronic",
+                "synthetic"}
+
+    def __init__(
+            self,
+            root_dir,  # …/data/nsynth
+            split="test",  # 'train' | 'valid' | 'test'
+            families=("guitar",),  # keep anything in this set
+            sources=("acoustic",),  # ditto for instrument_source_str
+            sample_rate=16000,
+            hop_size=256,
+            segment_length=None  # None → entire 4‑s clip
+    ):
+        self.sr = sample_rate
+        self.hop_size = hop_size
+        self.seg_len = segment_length
+
+        # ─── Load metadata ─────────────────────────────────── #
+        split_dir = os.path.join(root_dir, f"nsynth-{split}")
+        meta_path = os.path.join(split_dir, "examples.json")
+        with open(meta_path) as fp:
+            meta = json.load(fp)
+
+        # ─── Keep only wanted instruments ─────────────────── #
+        self.items = []
+        for key, m in meta.items():
+            if m["instrument_family_str"] not in families:      continue
+            if m["instrument_source_str"] not in sources:       continue
+            wav = os.path.join(split_dir, "audio", f"{key}.wav")
+            self.items.append(wav)
+
+        if not self.items:
+            raise RuntimeError("No files matched the given filters!")
+
+        print(f"[NSynthDataset] split={split}, "
+              f"{len(self.items)} files, "
+              f"families={families}, sources={sources}")
+
+    # ───────────────────────────────────────────────────────── #
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        path = self.items[idx]
+        audio, _ = librosa.load(path, sr=self.sr, mono=True)
+        if self.seg_len:  # optional slicing
+            if len(audio) < self.seg_len:
+                audio = np.pad(audio, (0, self.seg_len - len(audio)))
+            else:
+                audio = audio[: self.seg_len]
+
+        # ── Feature extraction (frame hop = hop_size) ───────── #
+        pitch = extract_pitch(audio, self.sr, self.hop_size)  # [F]
+        loud = _extract_loudness(audio, self.sr, self.hop_size)  # [F]
+
+        # Torchify & add channel dim expected by your model
+        return (torch.from_numpy(audio.astype(np.float32)),
+                torch.from_numpy(pitch.astype(np.float32)).unsqueeze(-1),
+                torch.from_numpy(loud.astype(np.float32)).unsqueeze(-1))

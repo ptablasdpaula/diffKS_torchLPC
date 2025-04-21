@@ -186,7 +186,7 @@ def composite_plot(fig_path: str,
     row = 0
     for name, wav in signals.items():
         ax = axs[row * 2]
-        ax.plot(wav.squeeze().detach().numpy())
+        ax.plot(wav.squeeze().detach().cpu().numpy())
         ax.set_title(name)
         ax.set_xlabel("samples")
         ax.grid(True)
@@ -514,9 +514,9 @@ def main() -> None:
     ax[1].set_xlim(0, exc_len_samples)  # limit x‑axis
 
     for k in range(exc_b_id.shape[-1]):
-        ax[1].plot(exc_b_id[0, :exc_len_samples, k].detach(),
+        ax[1].plot(exc_b_id[0, :exc_len_samples, k].cpu().detach(),
                    label=f'In‑domain a{k}', linewidth=1)
-        ax[1].plot(exc_b_opt[0, :exc_len_samples, k].detach(),
+        ax[1].plot(exc_b_opt[0, :exc_len_samples, k].cpu().detach(),
                    label=f'Optimised a{k}', linestyle='--')
 
     ax[1].set_title('Excitation coefficients (upsampled)')
@@ -532,8 +532,8 @@ def main() -> None:
         _, l_b_id, exc_b_id = model_id.get_upsampled_parameters(f0=f0_id,
                                                                 num_samples=n_samp)
         if use_in_domain:  # add references when they exist
-            coeffs_dict["Loop coeff(ref.)"] = l_b_id.squeeze().detach().numpy()
-            coeffs_dict["Exc coeff (ref.)"] = exc_b_id.squeeze().detach().numpy()
+            coeffs_dict["Loop coeff(ref.)"] = l_b_id.squeeze().detach().cpu().numpy()
+            coeffs_dict["Exc coeff (ref.)"] = exc_b_id.squeeze().detach().cpu().numpy()
 
     composite_plot("plots/composite.png", signals_dict, coeffs_dict)
 
@@ -544,8 +544,8 @@ def main() -> None:
         save_audio("audio/out/inverse_filtered.wav", inv_sig, sample_rate)
         exc_after_opt = model_opt.exc_filter_out.cpu()
         plt.figure(figsize=(12, 4))
-        plt.plot(inv_signal.squeeze().detach().numpy(), label="Inverse filtered")
-        plt.plot(exc_after_opt.squeeze().detach().numpy(), label="After excitation", alpha=0.7)
+        plt.plot(inv_signal.squeeze().detach().cpu().numpy(), label="Inverse filtered")
+        plt.plot(exc_after_opt.squeeze().detach().cpu().numpy(), label="After excitation", alpha=0.7)
         plt.legend(); plt.grid(True)
         plt.tight_layout()
         plt.savefig("plots/inverse_excitation_opt.png")
