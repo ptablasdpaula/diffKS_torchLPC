@@ -333,6 +333,8 @@ class DiffKS(nn.Module):
             lag_k = self._lagrange_kernel(alfa)  # (B,N,L+1)
             B, N, M = b.shape
 
+            original_sum = b.abs().sum(dim=-1)
+
             if b.is_cuda:  # depth‑wise conv
                 inp = b.transpose(1, 2).reshape(1, B * N, M)
                 kern = lag_k.reshape(B * N, 1, LAGRANGE_ORDER + 1)
@@ -346,6 +348,19 @@ class DiffKS(nn.Module):
                 b_unf = F.pad(b, (L, L))  # (B,N,K+2L)   pad left *and* right
                 b_unf = b_unf.unfold(-1, L + 1, 1)  # (B,N,K+2L,L+1)
                 b_processed = torch.einsum('bnml,bnl->bnm', b_unf, lag_k)
+
+            processed_sum = b_processed.abs().sum(dim=-1)  # [B, N]
+
+            # Find max difference as a diagnostic
+            sum_diff = (original_sum - processed_sum).abs()
+            max_diff_val, max_idx = sum_diff.view(-1).max(dim=0)
+            batch_idx = max_idx // N
+            time_idx = max_idx % N
+
+            if max_diff_val > 0.01:
+                print(f"⚠️ Coefficient sum changed: original={original_sum[batch_idx, time_idx].item():.4f}, "
+                      f"processed={processed_sum[batch_idx, time_idx].item():.4f}, "
+                      f"at [{batch_idx.item()}, {time_idx.item()}]")
 
             base_idx = z_l.unsqueeze(-1) + torch.arange(
                 self.num_active_indexes, device=self.device
@@ -470,4 +485,9 @@ class DiffKS(nn.Module):
         kernel = torch.where(mask, num, 1.) / safe_denom  # (B,N,L+1,L+1)
 
         # Π over the last axis → per‑sample kernel length L+1
-        return kernel.prod(-1)  # (B,N,L+1)
+        kernel = kernel.prod(-1)  # (B,N,L+1)
+
+        kernel_sum = kernel.sum(dim=-1, keepdim=True)
+        kernel = kernel / kernel_sum
+
+        return kernel
