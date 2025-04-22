@@ -217,17 +217,18 @@ class DiffKS(nn.Module):
 
         n_samples = input.size(1)
 
-        l_b_constrained = self.get_constrained_l_coefficients(l_b=l_b, l_g=l_g)
-        f0, l_b, exc_b = self.get_upsampled_parameters(f0_frames, n_samples,
-                                                       l_b=l_b_constrained,
-                                                       exc_b=exc_b)
+        f0, l_b, l_g, exc_b = self.get_upsampled_parameters(
+            f0_frames, n_samples,
+            l_b=l_b, l_g=l_g, exc_b=exc_b
+        )
+
+        l_b = self.get_constrained_l_coefficients(l_b=l_b, l_g=l_g)
 
         l_b_circle = l_b.abs().sum(dim=-1)          # → [B, T]
         # --- debug block: checks Σ|A[b,t,:]| in one shot ----
         max_gain, flat_idx = l_b_circle.view(-1).max(dim=0)
         if max_gain >= 1.0:
             print(f"⚠️ Σ|l_b| = {max_gain:.4f}")
-
 
         exc_b = self.get_constrained_exc_coefficients(exc_b=exc_b)
 
@@ -370,8 +371,8 @@ class DiffKS(nn.Module):
 
     def get_constrained_exc_coefficients(
             self,
-            exc_b: Optional[torch.Tensor] = None  # [B, F, exc_order+1]
-    ) -> torch.Tensor:  # [B, F, exc_order]
+            exc_b: Optional[torch.Tensor] = None  # [B, samples, exc_order+1]
+    ) -> torch.Tensor:  # [B, samples, exc_order]
         """
         The first slot of *exc_b* is interpreted as a raw gain term (``exc_g``).
         After a sigmoid, that gain scales every AR coefficient, while the implicit
@@ -379,25 +380,25 @@ class DiffKS(nn.Module):
         """
         raw = exc_b if exc_b is not None else self.exc_coefficients  # [B,F,O+1]
 
-        exc_g_raw = raw[..., :1]  # shape [B, F, 1]  –– gain parameter
-        exc_a_raw = raw[..., 1:]  # shape [B, F, O]  –– AR coeffs
+        exc_g_raw = raw[..., :1]  # shape [B, samples, 1]  –– gain parameter
+        exc_a_raw = raw[..., 1:]  # shape [B, samples, exc_order]  –– AR coeffs
 
         exc_g = torch.sigmoid(exc_g_raw)  # (0‥1)
         exc_a = torch.sigmoid(exc_a_raw) * exc_g  # (0‥exc_g)
 
-        return exc_a  # [B, F, exc_order]
+        return exc_a
 
     def get_gain(self,
-                 l_g : torch.Tensor = None,): # [batches, loop_n_frames, 1]
-        return torch.sigmoid(l_g if l_g is not None else self.loop_gain)
+                 l_g : torch.Tensor): # [batches, samples, 1]
+        return torch.sigmoid(l_g)
 
     def get_constrained_l_coefficients(self,
-                                          l_b : Optional[torch.Tensor] = None,  # [batches, loop_n_frames, loop_n_coefficients]
-                                          l_g : Optional[torch.Tensor] = None,  # [batches, loop_n_frames, 1]
+                                          l_b : torch.Tensor,  # [batches, samples, loop_n_coefficients]
+                                          l_g : torch.Tensor,  # [batches, samples, 1]
                                           ) -> torch.Tensor:
-        sigmoid_b = torch.sigmoid(l_b if l_b is not None else self.loop_coefficients)
+        sigmoid_b = torch.sigmoid(l_b)
         sum_b = sigmoid_b.sum(dim=-1, keepdim=True)
-        result = (sigmoid_b / sum_b) * (self.get_gain(l_g if l_g is not None else None))
+        result = (sigmoid_b / sum_b) * (self.get_gain(l_g))
         return result.to(self.device)
 
     def get_upsampled_parameters(
@@ -405,10 +406,12 @@ class DiffKS(nn.Module):
             f0: torch.Tensor, # [batches, f_0_frames,]
             num_samples: int,
             l_b: Optional[torch.Tensor] = None, # [batches, loop_n_frames, loop_n_coefficients]
+            l_g: Optional[torch.Tensor] = None, # [batches, loop_n_frames, 1]
             exc_b: Optional[torch.Tensor] = None, # [batches, exc_n_frames, exc_order]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
         loop_b_frames_ = l_b if l_b is not None else self.loop_coefficients
+        loop_g_frames = l_g if l_g is not None else self.loop_gain
         exc_b_frames_ = exc_b if exc_b is not None else self.exc_coefficients
 
         batch_size = f0.size(0)
@@ -423,15 +426,17 @@ class DiffKS(nn.Module):
 
         if self.loop_n_frames == 1:
             loop_b_i = loop_b_frames_.repeat(1, num_samples, 1)
+            loop_g_i = loop_g_frames.repeat(1, num_samples, 1)
         else:
             loop_b_i = spline_upsample(loop_b_frames_.to(dtype=self._dtype), num_samples)
+            loop_g_i = spline_upsample(loop_g_frames.to(dtype=self._dtype), num_samples)
 
         if self.exc_n_frames == 1:
             exc_b_i = exc_b_frames_.repeat(1, exc_length_n, 1)
         else:
             exc_b_i = spline_upsample(exc_b_frames_.to(dtype=self._dtype), exc_length_n)
 
-        return f0_i.to(self.device), loop_b_i.to(self.device), exc_b_i.to(self.device)
+        return f0_i.to(self.device), loop_b_i.to(self.device), loop_g_i.to(self.device), exc_b_i.to(self.device)
 
     def get_inverse_filtered_signal(self):
         return self.ks_inverse_signal
