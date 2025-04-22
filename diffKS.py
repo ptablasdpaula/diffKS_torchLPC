@@ -459,7 +459,4 @@ class DiffKS(nn.Module):
         # Π over the last axis → per‑sample kernel length L+1
         kernel = kernel.prod(-1)  # (B,N,L+1)
 
-        kernel_sum = kernel.sum(dim=-1, keepdim=True)
-        kernel = kernel / kernel_sum
-
         return kernel
