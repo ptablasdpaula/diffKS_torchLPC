@@ -123,6 +123,7 @@ class DiffKS(nn.Module):
         self.register_buffer("lagrange_mask", self.lagrange_denom != 0)
         self.register_buffer("lagrange_denom_masked",
                              torch.where(self.lagrange_mask, self.lagrange_denom, 1))
+
         # ====== Analysis Buffers =======================
         self.register_buffer("excitation_filter_out", torch.empty(batch_size, self.exc_length_n))
         self.register_buffer("ks_inverse_signal", torch.zeros(batch_size, self.exc_length_n))
@@ -221,6 +222,13 @@ class DiffKS(nn.Module):
                                                        l_b=l_b_constrained,
                                                        exc_b=exc_b)
 
+        l_b_circle = l_b.abs().sum(dim=-1)          # → [B, T]
+        # --- debug block: checks Σ|A[b,t,:]| in one shot ----
+        max_gain, flat_idx = l_b_circle.view(-1).max(dim=0)
+        if max_gain >= 1.0:
+            print(f"⚠️ Σ|l_b| = {max_gain:.4f}")
+
+
         exc_b = self.get_constrained_exc_coefficients(exc_b=exc_b)
 
         A, x = self.compute_resonator_matrix(f0=f0,
@@ -239,6 +247,10 @@ class DiffKS(nn.Module):
 
         y_out = sample_wise_lpc(resize_tensor_dim(self.exc_filter_out, n_samples, 1),
                                 A)
+
+        y_sum = y_out.abs().max().item()
+        if y_sum > 1:
+            print(f"⚠️ y > 1 = {y_sum:.4f}")
 
         return y_out.to(torch.float32)
 
@@ -344,6 +356,15 @@ class DiffKS(nn.Module):
 
         else:
             raise NotImplementedError(f"Interpolation type {self.interp_type} not implemented")
+
+        A_sum = A.abs().sum(dim=-1, keepdim=True)          # → [B, T]
+
+        # --- debug block: checks Σ|A[b,t,:]| in one shot ----
+        max_gain, flat_idx = A_sum.view(-1).max(dim=0)
+        if max_gain >= 1.0:
+            b = flat_idx // n_samples
+            t = flat_idx %  n_samples
+            print(f"⚠️ Σ|A| = {max_gain:.4f} at [{b}, {t}]")
 
         return A, x
 
