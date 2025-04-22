@@ -249,10 +249,6 @@ class DiffKS(nn.Module):
         y_out = sample_wise_lpc(resize_tensor_dim(self.exc_filter_out, n_samples, 1),
                                 A)
 
-        y_sum = y_out.abs().max().item()
-        if y_sum > 1:
-            print(f"⚠️ y > 1 = {y_sum:.4f}")
-
         return y_out.to(torch.float32)
 
     def compute_resonator_matrix(
@@ -333,8 +329,6 @@ class DiffKS(nn.Module):
             lag_k = self._lagrange_kernel(alfa)  # (B,N,L+1)
             B, N, M = b.shape
 
-            original_sum = b.abs().sum(dim=-1)
-
             if b.is_cuda:  # depth‑wise conv
                 inp = b.transpose(1, 2).reshape(1, B * N, M)
                 kern = lag_k.reshape(B * N, 1, LAGRANGE_ORDER + 1)
@@ -349,19 +343,6 @@ class DiffKS(nn.Module):
                 b_unf = b_unf.unfold(-1, L + 1, 1)  # (B,N,K+2L,L+1)
                 b_processed = torch.einsum('bnml,bnl->bnm', b_unf, lag_k)
 
-            processed_sum = b_processed.abs().sum(dim=-1)  # [B, N]
-
-            # Find max difference as a diagnostic
-            sum_diff = (original_sum - processed_sum).abs()
-            max_diff_val, max_idx = sum_diff.view(-1).max(dim=0)
-            batch_idx = max_idx // N
-            time_idx = max_idx % N
-
-            if max_diff_val > 0.01:
-                print(f"⚠️ Coefficient sum changed: original={original_sum[batch_idx, time_idx].item():.4f}, "
-                      f"processed={processed_sum[batch_idx, time_idx].item():.4f}, "
-                      f"at [{batch_idx.item()}, {time_idx.item()}]")
-
             base_idx = z_l.unsqueeze(-1) + torch.arange(
                 self.num_active_indexes, device=self.device
             )
@@ -372,15 +353,6 @@ class DiffKS(nn.Module):
 
         else:
             raise NotImplementedError(f"Interpolation type {self.interp_type} not implemented")
-
-        A_sum = A.abs().sum(dim=-1, keepdim=True)          # → [B, T]
-
-        # --- debug block: checks Σ|A[b,t,:]| in one shot ----
-        max_gain, flat_idx = A_sum.view(-1).max(dim=0)
-        if max_gain >= 1.0:
-            b = flat_idx // n_samples
-            t = flat_idx %  n_samples
-            print(f"⚠️ Σ|A| = {max_gain:.4f} at [{b}, {t}]")
 
         return A, x
 
