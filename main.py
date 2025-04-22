@@ -492,19 +492,57 @@ def main() -> None:
         signals_dict["Inverse filtered"] = inv_sig
         signals_dict["After excitation"] = exc_after_opt
 
-    # --- Coefficient comparison: in‑domain vs optimised ----------------------
-    _, l_b_id, l_g, exc_b_id = model_id.get_upsampled_parameters(f0=f0_id,
-                                                            num_samples=n_samp)
-    _, l_b_opt, l_g, exc_b_opt = model_opt.get_upsampled_parameters(f0=f0_frames_opt,
-                                                               num_samples=n_samp)
+    # -------------------------------------------------------------------------
+    # Upsampled and constrained coefficients for comparison ---------------------
+    n_samp = target_audio.shape[-1]
+    # First get upsampled parameters
+    _, l_b_opt_up, l_g_opt_up, exc_b_opt_up = model_opt.get_upsampled_parameters(
+        f0=f0_frames_opt,
+        num_samples=n_samp
+    )
+    # Then apply constraints to the upsampled parameters
+    l_b_opt = model_opt.get_constrained_l_coefficients(l_b=l_b_opt_up, l_g=l_g_opt_up)
+    exc_b_opt = model_opt.get_constrained_exc_coefficients(exc_b=exc_b_opt_up)
+    l_b_opt = l_b_opt.squeeze().detach().cpu().numpy()
+    exc_b_opt = exc_b_opt.squeeze().detach().cpu().numpy()
+
+    coeffs_dict = {
+        "Loop coeff (opt.)": l_b_opt,  # Now showing constrained values
+        "Exc coeff (opt.)": exc_b_opt,  # Now showing constrained values
+    }
+
+    signals_dict = {
+        "Target": target_audio,
+        "Optimised": optim_audio,
+    }
+
+    if use_in_domain:  # direct = True
+        signals_dict["Noise burst"] = resize_tensor_dim(burst, exc_after.size(1), 1)
+        signals_dict["Burst after exc"] = exc_after
+    else:  # direct = False
+        inv_sig = model_opt.get_inverse_filtered_signal().cpu()
+        exc_after_opt = model_opt.exc_filter_out.cpu()
+        signals_dict["Inverse filtered"] = inv_sig
+        signals_dict["After excitation"] = exc_after_opt
+
+    # --- Coefficient comparison: in‑domain vs optimised ----------------------
+    # Get upsampled parameters for both models
+    _, l_b_id_up, l_g_id_up, exc_b_id_up = model_id.get_upsampled_parameters(f0=f0_id, num_samples=n_samp)
+    _, l_b_opt_up, l_g_opt_up, exc_b_opt_up = model_opt.get_upsampled_parameters(f0=f0_frames_opt, num_samples=n_samp)
+
+    # Apply constraints to get final parameters
+    l_b_id = model_id.get_constrained_l_coefficients(l_b=l_b_id_up, l_g=l_g_id_up)
+    exc_b_id = model_id.get_constrained_exc_coefficients(exc_b=exc_b_id_up)
+    l_b_opt = model_opt.get_constrained_l_coefficients(l_b=l_b_opt_up, l_g=l_g_opt_up)
+    exc_b_opt = model_opt.get_constrained_exc_coefficients(exc_b=exc_b_opt_up)
 
     fig, ax = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
 
     # loop coefficients (all taps)
     for k in range(l_b_id.shape[-1]):
-        ax[0].plot(l_b_id[0, :, k].cpu(), label=f'In‑domain b{k}', linewidth=1)
-        ax[0].plot(l_b_opt[0, :, k].cpu(), label=f'Optimised b{k}', linestyle='--')
-    ax[0].set_title('Loop coefficients (upsampled)')
+        ax[0].plot(l_b_id[0, :, k].detach().cpu(), label=f'In‑domain b{k}', linewidth=1)
+        ax[0].plot(l_b_opt[0, :, k].detach().cpu(), label=f'Optimised b{k}', linestyle='--')
+    ax[0].set_title('Loop coefficients (upsampled & constrained)')
     ax[0].legend();
     ax[0].grid(True)
 
@@ -519,7 +557,7 @@ def main() -> None:
         ax[1].plot(exc_b_opt[0, :exc_len_samples, k].cpu().detach(),
                    label=f'Optimised a{k}', linestyle='--')
 
-    ax[1].set_title('Excitation coefficients (upsampled)')
+    ax[1].set_title('Excitation coefficients (upsampled & constrained)')
     ax[1].legend();
     ax[1].grid(True)
 
@@ -529,11 +567,16 @@ def main() -> None:
 
     # add reference coeffs if in‑domain ----------------------------------------
     if use_in_domain:
-        _, l_b_id, l_g, exc_b_id = model_id.get_upsampled_parameters(f0=f0_id,
-                                                                num_samples=n_samp)
-        if use_in_domain:  # add references when they exist
-            coeffs_dict["Loop coeff(ref.)"] = l_b_id.squeeze().detach().cpu().numpy()
-            coeffs_dict["Exc coeff (ref.)"] = exc_b_id.squeeze().detach().cpu().numpy()
+        # Get upsampled parameters
+        _, l_b_id_up, l_g_id_up, exc_b_id_up = model_id.get_upsampled_parameters(f0=f0_id, num_samples=n_samp)
+
+        # Apply constraints
+        l_b_id = model_id.get_constrained_l_coefficients(l_b=l_b_id_up, l_g=l_g_id_up)
+        exc_b_id = model_id.get_constrained_exc_coefficients(exc_b=exc_b_id_up)
+
+        # Add to visualization dictionary
+        coeffs_dict["Loop coeff(ref.)"] = l_b_id.squeeze().detach().cpu().numpy()
+        coeffs_dict["Exc coeff (ref.)"] = exc_b_id.squeeze().detach().cpu().numpy()
 
     composite_plot("plots/composite.png", signals_dict, coeffs_dict)
 
