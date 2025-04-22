@@ -468,7 +468,7 @@ def main() -> None:
     # -------------------------------------------------------------------------
     # Upsampled coefficients for comparison ------------------------------------
     n_samp = target_audio.shape[-1]
-    _, l_b_opt, exc_b_opt = model_opt.get_upsampled_parameters(f0=f0_frames_opt,
+    _, l_b_opt, _, exc_b_opt = model_opt.get_upsampled_parameters(f0=f0_frames_opt,
                                                               num_samples=n_samp)
     l_b_opt = l_b_opt[0].squeeze().detach().cpu().numpy()
     exc_b_opt = exc_b_opt[0].squeeze().detach().cpu().numpy()
@@ -493,9 +493,9 @@ def main() -> None:
         signals_dict["After excitation"] = exc_after_opt
 
     # --- Coefficient comparison: in‑domain vs optimised ----------------------
-    _, l_b_id, exc_b_id = model_id.get_upsampled_parameters(f0=f0_id,
+    _, l_b_id, l_g, exc_b_id = model_id.get_upsampled_parameters(f0=f0_id,
                                                             num_samples=n_samp)
-    _, l_b_opt, exc_b_opt = model_opt.get_upsampled_parameters(f0=f0_frames_opt,
+    _, l_b_opt, l_g, exc_b_opt = model_opt.get_upsampled_parameters(f0=f0_frames_opt,
                                                                num_samples=n_samp)
 
     fig, ax = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
@@ -529,7 +529,7 @@ def main() -> None:
 
     # add reference coeffs if in‑domain ----------------------------------------
     if use_in_domain:
-        _, l_b_id, exc_b_id = model_id.get_upsampled_parameters(f0=f0_id,
+        _, l_b_id, l_g, exc_b_id = model_id.get_upsampled_parameters(f0=f0_id,
                                                                 num_samples=n_samp)
         if use_in_domain:  # add references when they exist
             coeffs_dict["Loop coeff(ref.)"] = l_b_id.squeeze().detach().cpu().numpy()

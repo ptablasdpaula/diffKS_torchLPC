@@ -78,17 +78,10 @@ def main():
 
     # Create optimizer
     optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
-
-    # Create multi-resolution spectral loss using auraloss
-    multi_resolution_stft_loss = auraloss.freq.MultiResolutionSTFTLoss(
-        fft_sizes=[2048, 1024, 512, 256, 128, 64],
-        hop_sizes=[512, 256, 128, 64, 32, 16],
-        win_lengths=[2048, 1024, 512, 256, 128, 64],
-        w_sc=0.5,  # Spectral convergence loss weight
-        w_log_mag=0.5,  # Log magnitude loss weight
-        w_lin_mag=0.5,  # Linear magnitude loss weight
-        w_phs=0.0  # Phase loss weight (disabled)
-    ).to(device)
+    multi_resolution_stft_loss = auraloss.freq.MultiResolutionSTFTLoss(scale_invariance=True,
+                        perceptual_weighting=True,
+                        sample_rate=config["sample_rate"],
+                        device=device,)
 
     # Training loop
     best_loss = float('inf')
