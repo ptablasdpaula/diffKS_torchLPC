@@ -381,12 +381,15 @@ class DiffKS(nn.Module):
         raw = exc_b if exc_b is not None else self.exc_coefficients  # [B,F,O+1]
 
         exc_g_raw = raw[..., :1]  # shape [B, samples, 1]  –– gain parameter
-        exc_a_raw = raw[..., 1:]  # shape [B, samples, exc_order]  –– AR coeffs
+        exc_b_raw = raw[..., 1:]  # shape [B, samples, exc_order]  –– AR coeffs
 
         exc_g = torch.sigmoid(exc_g_raw)  # (0‥1)
-        exc_a = torch.sigmoid(exc_a_raw) * exc_g  # (0‥exc_g)
 
-        return exc_a
+        exc_b = torch.sigmoid(exc_b_raw)  # (0‥exc_g)
+        sum_exc = exc_b.sum(dim=-1, keepdim=True)
+        exc_b = (exc_b / sum_exc)
+
+        return exc_b * exc_g
 
     def get_gain(self,
                  l_g : torch.Tensor): # [batches, samples, 1]
