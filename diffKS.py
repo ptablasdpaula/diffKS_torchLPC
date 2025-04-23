@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchlpc import sample_wise_lpc
 from torchcubicspline import natural_cubic_spline_coeffs, NaturalCubicSpline
-from utils import resize_tensor_dim, get_device
+from utils.helpers import resize_tensor_dim, get_device
 
 LAGRANGE_ORDER = 5
 
