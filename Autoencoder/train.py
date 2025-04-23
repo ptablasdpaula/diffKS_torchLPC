@@ -8,30 +8,30 @@ from model import AE_KarplusModel
 from preprocess import NsynthDataset
 import multiprocessing as mp
 
-from ddsp_pytorch.ddsp.core import mean_std_loudness
-from paths import NSYNTH_DIR
+from paths import NSYNTH_PREPROCESSED_DIR
 
 # Configuration
 config = {
-    "hidden_size":     512,
-    "loop_order":      10,
-    "loop_n_frames":   250,
-    "exc_order":       10,
-    "exc_n_frames":    100,
-    "sample_rate":     16000,
-    "batch_size":      1,
-    "learning_rate":   1e-3,
-    "num_epochs":      300,
-    "eval_interval":   50,
-    "save_dir":        "runs/ks_nsynth",
-    "num_samples":     1,
+    "hidden_size": 512,
+    "loop_order": 10,
+    "loop_n_frames": 250,
+    "exc_order": 10,
+    "exc_n_frames": 100,
+    "sample_rate": 16000,
+    "batch_size": 1,
+    "learning_rate": 1e-3,
+    "num_epochs": 300,
+    "eval_interval": 50,
+    "save_dir": "runs/ks_nsynth",
+    "num_samples": 1,
     # dataset options
-    "split":           "test",                 # train / valid / test
-    "families":        ["guitar"],
-    "sources":         ["acoustic"],
+    "split": "test",  # train / valid / test
+    "families": ["guitar"],
+    "sources": ["acoustic"],
 }
 
-n_samples = 4 * config["sample_rate"]          # 4‑second clips
+n_samples = 4 * config["sample_rate"]  # 4‑second clips
+
 
 def main():
     # ─── wandb init ───────────────────────────────────────────── #
@@ -44,44 +44,41 @@ def main():
     print(f"Using save directory: {full_save_path}")
 
     # ─── Data ─────────────────────────────────────────────────── #
+    # Updated dataset initialization to use the new implementation
     dataset = NsynthDataset(
-        root_dir    = NSYNTH_DIR,
-        split       = config["split"],
-        families    = set(config["families"]),
-        sources     = set(config["sources"]),
-        sample_rate = config["sample_rate"],
-        hop_size    = 256,
-        segment_length = n_samples,
-        max_size= config["num_samples"]
+        preprocessed_dir=NSYNTH_PREPROCESSED_DIR,
+        split=config["split"],
+        families=config["families"],  # No need to convert to set
+        sources=config["sources"],  # No need to convert to set
+        segment_length=n_samples,
+        max_items=config["num_samples"]
     )
 
     loader = DataLoader(dataset,
-                        batch_size  = config["batch_size"],
-                        shuffle     = True,
-                        drop_last   = True,
-                        pin_memory  = True,
-                        num_workers = 4)
-
-    # Calculate mean and std of loudness for normalization
-    mean_loudness, std_loudness = mean_std_loudness(dataset)
+                        batch_size=config["batch_size"],
+                        shuffle=True,
+                        drop_last=True,
+                        pin_memory=True,
+                        prefetch_factor=1,
+                        num_workers=4)
 
     # Create model
     model = AE_KarplusModel(
-        batch_size      = config["batch_size"],
-        hidden_size     = config["hidden_size"],
-        loop_order      = config["loop_order"],
-        loop_n_frames   = config["loop_n_frames"],
-        exc_order       = config["exc_order"],
-        exc_n_frames    = config["exc_n_frames"],
-        sample_rate     = config["sample_rate"],
+        batch_size=config["batch_size"],
+        hidden_size=config["hidden_size"],
+        loop_order=config["loop_order"],
+        loop_n_frames=config["loop_n_frames"],
+        exc_order=config["exc_order"],
+        exc_n_frames=config["exc_n_frames"],
+        sample_rate=config["sample_rate"],
     ).to(device)
 
     # Create optimizer
     optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
     multi_resolution_stft_loss = auraloss.freq.MultiResolutionSTFTLoss(scale_invariance=True,
-                        perceptual_weighting=True,
-                        sample_rate=config["sample_rate"],
-                        device=device,)
+                                                                       perceptual_weighting=True,
+                                                                       sample_rate=config["sample_rate"],
+                                                                       device=device, )
 
     # Training loop
     best_loss = float('inf')
@@ -103,7 +100,7 @@ def main():
             pitch = pitch.to(device)
             loudness = loudness.to(device)
 
-            loudness = (loudness - mean_loudness) / (std_loudness + 1e-6)
+            # No need to normalize loudness here - already done in preprocessing
 
             epochs_pbar.set_description(
                 f"Epoch {epoch + 1}/{config['num_epochs']} [Batch {batch_idx + 1}/{batch_count}, "
@@ -158,7 +155,7 @@ def main():
             with torch.no_grad():
                 eval_data = next(iter(loader))
                 eval_audio, eval_pitch, eval_loudness = [x.to(device) for x in eval_data]
-                eval_loudness = (eval_loudness - mean_loudness) / std_loudness
+                # No need to normalize loudness here - already done in preprocessing
 
                 hidden = model.get_hidden(eval_pitch, eval_loudness)
 
@@ -270,6 +267,7 @@ def main():
     # Finish wandb run
     wandb.finish()
     print("Training completed!")
+
 
 if __name__ == '__main__':
     mp.freeze_support()
