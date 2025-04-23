@@ -1,11 +1,12 @@
 from tqdm import tqdm
 import numpy as np
 import soundfile as sf
-import torch, torch.optim as optim, os, wandb, auraloss
+import torch, torch.optim as optim, os, wandb
+from auraloss.auraloss.freq import MultiResolutionSTFTLoss
 from torch.utils.data import DataLoader
-from utils import get_device
-from model import AE_KarplusModel
-from preprocess import NsynthDataset
+from utils.helpers import get_device
+from .model import AE_KarplusModel
+from .preprocess import NsynthDataset
 import multiprocessing as mp
 
 from paths import NSYNTH_PREPROCESSED_DIR
@@ -18,16 +19,16 @@ config = {
     "exc_order": 10,
     "exc_n_frames": 100,
     "sample_rate": 16000,
-    "batch_size": 1,
+    "batch_size": 8,
     "learning_rate": 1e-3,
-    "num_epochs": 300,
+    "num_epochs": 1,
     "eval_interval": 50,
     "save_dir": "runs/ks_nsynth",
-    "num_samples": 1,
-    # dataset options
+    "num_samples": None,
     "split": "test",  # train / valid / test
     "families": ["guitar"],
     "sources": ["acoustic"],
+    "num_workers": 2,
 }
 
 n_samples = 4 * config["sample_rate"]  # 4‑second clips
@@ -60,7 +61,7 @@ def main():
                         drop_last=True,
                         pin_memory=True,
                         prefetch_factor=1,
-                        num_workers=4)
+                        num_workers=config["num_workers"])
 
     # Create model
     model = AE_KarplusModel(
@@ -75,7 +76,7 @@ def main():
 
     # Create optimizer
     optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
-    multi_resolution_stft_loss = auraloss.freq.MultiResolutionSTFTLoss(scale_invariance=True,
+    multi_resolution_stft_loss = MultiResolutionSTFTLoss(scale_invariance=True,
                                                                        perceptual_weighting=True,
                                                                        sample_rate=config["sample_rate"],
                                                                        device=device, )
@@ -99,8 +100,6 @@ def main():
             audio = audio.to(device)
             pitch = pitch.to(device)
             loudness = loudness.to(device)
-
-            # No need to normalize loudness here - already done in preprocessing
 
             epochs_pbar.set_description(
                 f"Epoch {epoch + 1}/{config['num_epochs']} [Batch {batch_idx + 1}/{batch_count}, "
