@@ -1,49 +1,60 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+import random
 import os
-import json
-import librosa
-from preprocess import NsynthDataset, _extract_loudness, extract_pitch
-from paths import NSYNTH_DIR
+from preprocess import NsynthDataset
+from paths import NSYNTH_DIR, NSYNTH_PREPROCESSED_DIR
 
 
-def visualize_nsynth_dataset():
-    # Configuration - single sample, single batch
-    config = {
-        "sample_rate": 16000,
-        "hop_size": 256,
-        "segment_length": 16000 * 4,  # 4 seconds
-        "batch_size": 1,
-        "num_samples": 1,
-        "split": "test",
-        "families": ["guitar"],
-        "sources": ["acoustic"],
-    }
+def visualize_preprocessed_nsynth(preprocessed_dir, split="test", random_sample=True):
+    """
+    Visualize data from a preprocessed NSynth dataset
 
-    # Create dataset with only one sample
-    print("Creating NsynthDataset...")
+    Args:
+        preprocessed_dir: Directory containing preprocessed data
+        split: Split to visualize (train, valid, test)
+        random_sample: If True, pick a random sample, otherwise use the first one
+    """
+    # Create dataset
+    print(f"Loading NsynthDataset from {preprocessed_dir}...")
     dataset = NsynthDataset(
-        root_dir=NSYNTH_DIR,
-        split=config["split"],
-        families=config["families"],
-        sources=config["sources"],
-        sample_rate=config["sample_rate"],
-        hop_size=config["hop_size"],
-        segment_length=config["segment_length"],
-        max_size=config["num_samples"]
+        preprocessed_dir=preprocessed_dir,
+        split=split
     )
 
     # Print dataset properties
     print(f"\nDataset Properties:")
     print(f"Number of segments: {len(dataset)}")
-    print(f"First audio shape: {dataset.signals[0].shape}")
-    print(f"First pitch shape: {dataset.pitches[0].shape}")
-    print(f"First loudness shape: {dataset.loudness[0].shape}")
 
-    # Get the first sample directly
-    audio, pitch, loudness = dataset[0]
+    # Select a sample
+    if random_sample and len(dataset) > 1:
+        idx = random.randint(0, len(dataset) - 1)
+        print(f"Visualizing random sample at index {idx}")
+    else:
+        idx = 0
+        print("Visualizing first sample")
+
+    # Get the sample
+    audio, pitch, loudness = dataset[idx]
+
+    # Get metadata to show in the title
+    segment_info = dataset.segments[idx]
+    file_key = segment_info["key"]
+    segment_idx = segment_info["segment_idx"]
+
+    # Get original metadata if available
+    try:
+        instrument_name = dataset.metadata[split][file_key]["metadata"]["instrument_str"]
+        family_name = dataset.metadata[split][file_key]["metadata"]["instrument_family_str"]
+        source_type = dataset.metadata[split][file_key]["metadata"]["instrument_source_str"]
+        title_info = f"Instrument: {instrument_name} ({family_name}, {source_type})"
+    except (KeyError, TypeError):
+        title_info = f"File: {file_key}, Segment: {segment_idx}"
+
+    # Get sample rate and hop size from dataset
+    sample_rate = 16000
+    hop_size = dataset.hop_size
 
     # Convert to numpy for plotting
     audio = audio.numpy()
@@ -51,16 +62,19 @@ def visualize_nsynth_dataset():
     loudness = loudness.squeeze(-1).numpy()
 
     # Calculate time axes
-    time_audio = np.arange(len(audio)) / config["sample_rate"]
-    time_features = np.arange(len(pitch)) * config["hop_size"] / config["sample_rate"]
+    time_audio = np.arange(len(audio)) / sample_rate
+    time_features = np.arange(len(pitch)) * hop_size / sample_rate
 
     # Create figure with aligned subplots
     plt.figure(figsize=(15, 10))
 
+    # Main title with metadata
+    plt.suptitle(title_info, fontsize=16)
+
     # 1. Plot audio waveform
     plt.subplot(3, 1, 1)
     plt.plot(time_audio, audio)
-    plt.title(f"Audio Waveform (length: {len(audio)} samples, {len(audio) / config['sample_rate']:.2f}s)")
+    plt.title(f"Audio Waveform (length: {len(audio)} samples, {len(audio) / sample_rate:.2f}s)")
     plt.ylabel("Amplitude")
     plt.grid(True)
 
@@ -68,7 +82,7 @@ def visualize_nsynth_dataset():
     plt.subplot(3, 1, 2)
     plt.plot(time_features, pitch)
     plt.title(
-        f"Pitch (F0) (length: {len(pitch)} frames, {len(pitch) * config['hop_size'] / config['sample_rate']:.2f}s)")
+        f"Pitch (F0) (length: {len(pitch)} frames, {len(pitch) * hop_size / sample_rate:.2f}s)")
     plt.ylabel("Frequency (Hz)")
     plt.grid(True)
 
@@ -81,11 +95,12 @@ def visualize_nsynth_dataset():
     plt.grid(True)
 
     # Add vertical alignment lines every 0.5 seconds
+    duration = len(audio) / sample_rate
     for ax in plt.gcf().axes:
-        for t in np.arange(0, 4, 0.5):
+        for t in np.arange(0, duration, 0.5):
             ax.axvline(x=t, color='r', linestyle='--', alpha=0.3)
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.95])  # Leave room for suptitle
 
     # Print diagnostics
     print("\nData Diagnostics:")
@@ -98,8 +113,9 @@ def visualize_nsynth_dataset():
     print(f"Loudness min/max/mean: {loudness.min():.4f}/{loudness.max():.4f}/{loudness.mean():.4f}")
 
     # Check expected vs. actual frame count
-    frames_per_segment = config["segment_length"] // config["hop_size"]
-    print(f"Expected frames for {config['segment_length'] / config['sample_rate']:.2f}s: {frames_per_segment}")
+    segment_length = len(audio)
+    frames_per_segment = segment_length // hop_size
+    print(f"Expected frames for {segment_length / sample_rate:.2f}s: {frames_per_segment}")
     print(f"Actual frames in dataset: {len(pitch)}")
 
     plt.savefig("nsynth_visualization.png")
@@ -107,32 +123,32 @@ def visualize_nsynth_dataset():
 
     # Create a zoomed view of a small time window
     plt.figure(figsize=(15, 8))
-    window_start = 0.5  # seconds
-    window_end = 1.0  # seconds
+    window_start = duration * 0.125  # 1/8 through the sample
+    window_end = duration * 0.25  # 1/4 through the sample
 
     # Convert to indices
-    sample_start = int(window_start * config["sample_rate"])
-    sample_end = int(window_end * config["sample_rate"])
-    frame_start = int(window_start * config["sample_rate"] / config["hop_size"])
-    frame_end = int(window_end * config["sample_rate"] / config["hop_size"])
+    sample_start = int(window_start * sample_rate)
+    sample_end = int(window_end * sample_rate)
+    frame_start = int(window_start * sample_rate / hop_size)
+    frame_end = int(window_end * sample_rate / hop_size)
 
     # Plot zoomed audio
     plt.subplot(3, 1, 1)
     plt.plot(time_audio[sample_start:sample_end], audio[sample_start:sample_end])
-    plt.title(f"Zoomed Audio [{window_start}-{window_end}s]")
+    plt.title(f"Zoomed Audio [{window_start:.2f}-{window_end:.2f}s]")
     plt.ylabel("Amplitude")
     plt.grid(True)
 
     # Plot zoomed pitch and loudness
     plt.subplot(3, 1, 2)
     plt.plot(time_features[frame_start:frame_end], pitch[frame_start:frame_end])
-    plt.title(f"Zoomed Pitch [{window_start}-{window_end}s]")
+    plt.title(f"Zoomed Pitch [{window_start:.2f}-{window_end:.2f}s]")
     plt.ylabel("Frequency (Hz)")
     plt.grid(True)
 
     plt.subplot(3, 1, 3)
     plt.plot(time_features[frame_start:frame_end], loudness[frame_start:frame_end])
-    plt.title(f"Zoomed Loudness [{window_start}-{window_end}s]")
+    plt.title(f"Zoomed Loudness [{window_start:.2f}-{window_end:.2f}s]")
     plt.ylabel("dB")
     plt.xlabel("Time (s)")
     plt.grid(True)
@@ -143,4 +159,12 @@ def visualize_nsynth_dataset():
 
 
 if __name__ == "__main__":
-    visualize_nsynth_dataset()
+    # Path to your preprocessed directory
+    PREPROCESSED_DIR = NSYNTH_PREPROCESSED_DIR
+
+    # Visualize a random sample from the test split
+    visualize_preprocessed_nsynth(
+        preprocessed_dir=PREPROCESSED_DIR,
+        split="test",
+        random_sample=True
+    )
