@@ -1,0 +1,4 @@
+[submodule "third_party/auraloss"]
+	path = third_party/auraloss
+	url = https://github.com/ptablasdpaula/auraloss.git
+	branch = "Fixes_Issue#56-Scale-Invariance-Broken"

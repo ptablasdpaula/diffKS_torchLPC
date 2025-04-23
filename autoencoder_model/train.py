@@ -2,7 +2,7 @@ from tqdm import tqdm
 import numpy as np
 import soundfile as sf
 import torch, torch.optim as optim, os, wandb
-from auraloss.auraloss.freq import MultiResolutionSTFTLoss
+from third_party.auraloss.auraloss.freq import MultiResolutionSTFTLoss
 from torch.utils.data import DataLoader
 from utils.helpers import get_device
 from .model import AE_KarplusModel
