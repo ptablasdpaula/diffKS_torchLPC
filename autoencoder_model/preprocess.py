@@ -15,7 +15,7 @@ import pesto
 from third_party.auraloss.auraloss.perceptual import FIRFilter
 
 from utils.helpers import get_device
-from paths import NSYNTH_DIR, NSYNTH_PREPROCESSED_DIR, NSYNTH_TRAIN_DIR, NSYNTH_VALID_DIR, NSYNTH_TEST_DIR
+from paths import NSYNTH_DIR, NSYNTH_PREPROCESSED_DIR
 import argparse
 
 # --------------------------

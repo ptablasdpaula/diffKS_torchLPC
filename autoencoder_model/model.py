@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from ddsp_pytorch.ddsp.core import mlp, gru
+from third_party.ddsp_pytorch.ddsp.core import mlp, gru
 from diffKS import DiffKS
 
 class AE_KarplusModel(nn.Module):

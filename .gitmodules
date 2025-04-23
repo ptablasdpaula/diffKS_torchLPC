@@ -2,3 +2,6 @@
 	path = third_party/auraloss
 	url = https://github.com/ptablasdpaula/auraloss.git
 	branch = "Fixes_Issue#56-Scale-Invariance-Broken"
+[submodule "third_party/ddsp_pytorch"]
+	path = third_party/ddsp_pytorch
+	url = https://github.com/acids-ircam/ddsp_pytorch.git
