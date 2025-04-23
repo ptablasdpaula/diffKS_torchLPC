@@ -16,14 +16,14 @@ from auraloss.auraloss.perceptual import FIRFilter
 
 from utils.helpers import get_device
 from paths import NSYNTH_DIR, NSYNTH_PREPROCESSED_DIR, NSYNTH_TRAIN_DIR, NSYNTH_VALID_DIR, NSYNTH_TEST_DIR
-
+import argparse
 
 # --------------------------
 # Globals
 # --------------------------
 SAMPLE_RATE = 16_000
 HOP_SIZE = 256                      # 250 frames per 4‑s clip
-SEGMENT_LENGTH = SAMPLE_RATE * 4    # 64 000 samples
+SEGMENT_LENGTH = SAMPLE_RATE * 4    # 64000 samples
 MIN_F0_HZ = 27.5                    # A0 – longest KS delay we allow
 DEVICE = get_device()
 
@@ -174,15 +174,33 @@ class NsynthDataset(torch.utils.data.Dataset):
 
 # --------------------------
 if __name__ == "__main__":
-    # Just set your options here!
-    split = ["test"]        # or ["train", "valid", "test"]
-    batch_size = 8          # how many files per batch
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch_size", type=int,
+        default=int(os.getenv("BATCH_SIZE", 8)),
+    )
+    parser.add_argument(
+        "--split", type=str,
+        default=os.getenv("SPLIT", "test"),
+    )
+    parser.add_argument(
+        "--families", type=str,
+        default=os.getenv("FAMILIES", "guitar"),
+        help="comma-separated list, e.g. guitar,piano"
+    )
+    parser.add_argument(
+        "--sources", type=str,
+        default=os.getenv("SOURCES", "acoustic"),
+        help="comma-separated list, e.g. acoustic,electric"
+    )
+
+    cli_args, _ = parser.parse_known_args()
 
     preprocess_nsynth(
         nsynth_root=NSYNTH_DIR,
         out_dir=NSYNTH_PREPROCESSED_DIR,
-        families=["guitar"],
-        sources=["acoustic"],
-        splits=split,
-        batch_size=batch_size
+        families=[f.strip() for f in cli_args.families.split(",")],
+        sources=[s.strip() for s in cli_args.sources.split(",")],
+        splits=[s.strip() for s in cli_args.split.split(",")],
+        batch_size=cli_args.batch_size,
     )

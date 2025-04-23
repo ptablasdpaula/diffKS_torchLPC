@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader
 from utils.helpers import get_device
 from .model import AE_KarplusModel
 from .preprocess import NsynthDataset
+import argparse, os
 import multiprocessing as mp
 import psutil
 
@@ -14,23 +15,67 @@ import time
 
 from paths import NSYNTH_PREPROCESSED_DIR
 
-# Configuration
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--batch_size", type=int,
+    default=int(os.getenv("BATCH_SIZE", 8)),
+)
+parser.add_argument(
+    "--num_workers", type=int,
+    default=int(os.getenv("NUM_WORKERS", 2)),
+)
+parser.add_argument(
+    "--hidden_size", type=int,
+    default=int(os.getenv("HIDDEN_SIZE", 512)),
+)
+parser.add_argument(
+    "--l_order", type=int,
+    default=int(os.getenv("L_ORDER", 10)),
+)
+parser.add_argument(
+    "--l_n_frames", type=int,
+    default=int(os.getenv("L_N_FRAMES", 250)),
+)
+parser.add_argument(
+    "--exc_order", type=int,
+    default=int(os.getenv("EXC_ORDER", 10)),
+)
+parser.add_argument(
+    "--exc_n_frames", type=int,
+    default=int(os.getenv("EXC_N_FRAMES", 100)),
+)
+parser.add_argument(
+    "--split", type=str,
+    default=os.getenv("SPLIT", "test"),
+)
+parser.add_argument(
+    "--families", type=str,
+    default=os.getenv("FAMILIES", "guitar"),
+    help="comma-separated list, e.g. guitar,piano"
+)
+parser.add_argument(
+    "--sources", type=str,
+    default=os.getenv("SOURCES", "acoustic"),
+    help="comma-separated list, e.g. acoustic,electric"
+)
+cli_args, _ = parser.parse_known_args()
+
 config = {
-    "hidden_size": 512,
-    "loop_order": 10,
-    "loop_n_frames": 250,
-    "exc_order": 10,
-    "exc_n_frames": 100,
-    "sample_rate": 16000,
-    "batch_size": 8,
-    "learning_rate": 1e-3,
-    "num_epochs": 1,
-    "eval_interval": 1,
-    "save_dir": "runs/ks_nsynth",
-    "split": "test",  # train / valid / test
-    "families": ["guitar"],
-    "sources": ["acoustic"],
-    "num_workers": 2,
+    "hidden_size":      cli_args.hidden_size,
+    "loop_order":       cli_args.l_order,
+    "loop_n_frames":    cli_args.l_n_frames,
+    "exc_order":        cli_args.exc_order,
+    "exc_n_frames":     cli_args.exc_n_frames,
+    "sample_rate":      16000,
+    "batch_size":       cli_args.batch_size,
+    "learning_rate":    1e-3,
+    "num_epochs":       1000,
+    "eval_interval":    100,
+    "save_dir":         "runs/ks_nsynth",
+    "split":            cli_args.split,
+    "families":         [f.strip() for f in cli_args.families.split(",")],
+    "sources":          [s.strip() for s in cli_args.sources.split(",")],
+    "num_workers":      cli_args.num_workers,
 }
 
 n_samples = 4 * config["sample_rate"]  # 4‑second clips
