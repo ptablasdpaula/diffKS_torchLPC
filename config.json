@@ -1,7 +1,8 @@
 {
   "hyperparameters": {
+    "method": "gradient",
     "learning_rate": 0.03,
-    "max_epochs": 300,
+    "max_epochs": 500,
     "stft_weight": 100,
     "use_A_weighing": true,
     "min_action_weight": 10,
@@ -23,7 +24,8 @@
     "burst_length_s": 0.025,
     "use_double_precision": false,
     "normalize_burst": true,
-    "interp_type": "lagrange"
+    "interp_type": "lagrange",
+    "batch_size": 1
   },
   "in_domain_params": {
     "use_in_domain": false,

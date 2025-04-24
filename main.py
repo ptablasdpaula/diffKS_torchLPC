@@ -11,6 +11,7 @@ import torchaudio
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
+import pygad
 from auraloss.freq import MultiResolutionSTFTLoss as MultiSTFT
 
 from diffKS import DiffKS
@@ -50,6 +51,7 @@ def build_usual_ks(cfg_mp: Dict[str, Any], sr: int) -> Tuple[DiffKS, torch.Tenso
     exc_len_s: float = cfg_mp["exc_length_s"]
     loop_order = cfg_mp["loop_order"]
     exc_order = cfg_mp["exc_order"]
+    batch_size = cfg_mp["batch_size"]
 
     model = DiffKS(
         sample_rate=sr,
@@ -61,24 +63,25 @@ def build_usual_ks(cfg_mp: Dict[str, Any], sr: int) -> Tuple[DiffKS, torch.Tenso
         exc_length_s=exc_len_s,
         interp_type=cfg_mp["interp_type"],
         use_double_precision=cfg_mp["use_double_precision"],
+        batch_size=batch_size,
     )
 
     # --- Configure loop filter so it behaves like the classic KS averager -------
     loop_frames = cfg_mp["loop_n_frames"]
 
-    loop_coeffs = torch.full((1, loop_frames, loop_order + 1), 0.5)  # σ(0)=0.5 everywhere
+    loop_coeffs = torch.full((batch_size, loop_frames, loop_order + 1), 0.5)  # σ(0)=0.5 everywhere
     loop_coeffs[:, :, 0] = 0.2
     loop_coeffs[:, :, 1] = 0.8
     model.set_loop_coefficients(loop_coeffs)
 
     # overall feedback gain a whisker below 1.0  → very slow decay
-    model.set_loop_gain(torch.full((1, loop_frames, 1), 5.3))  # σ(5.3) ≈ 0.995
+    model.set_loop_gain(torch.full((batch_size, loop_frames, 1), 5.3))  # σ(5.3) ≈ 0.995
 
     # --- Excitation filter: gently varying small reflection coeffs ------------
     exc_frames = cfg_mp["exc_n_frames"]
     t = torch.linspace(0, 1, exc_frames).unsqueeze(-1)
     exc_coeffs = 0.2 * torch.sin(2 * math.pi * (1 + torch.arange(exc_order + 1)) * t)
-    exc_coeffs = exc_coeffs.expand(1, -1, -1)  # [1, exc_n_frames, exc_order + 1]
+    exc_coeffs = exc_coeffs.expand(batch_size, -1, -1)  # [batch_size, exc_n_frames, exc_order + 1]
     model.set_exc_coefficients(exc_coeffs)
 
     _, _, _, gs = load_config()
@@ -89,6 +92,7 @@ def build_usual_ks(cfg_mp: Dict[str, Any], sr: int) -> Tuple[DiffKS, torch.Tenso
         length_s=gs["length_audio_s"],
         burst_width_s=cfg_mp["burst_width_s"],
         normalize=cfg_mp["normalize_burst"],
+        batch_size=batch_size,
     )
 
     return model, burst
@@ -97,13 +101,16 @@ def build_usual_ks(cfg_mp: Dict[str, Any], sr: int) -> Tuple[DiffKS, torch.Tenso
 def run_usual_ks(model: DiffKS, burst: torch.Tensor, sr: int,
                  cfg_mp: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor,
                                                   torch.Tensor]:
-    """Propagate *burst* through *model* with base‑440 Hz plus vibrato."""
+    """Propagate *burst* through *model* with base‑440 Hz plus vibrato."""
     f0_start = cfg_mp['f0_1_Hz']
     f0_end = cfg_mp['f0_2_Hz']
     n_frames = cfg_mp['f0_n_frames']
 
+    batch_size = cfg_mp['batch_size']
+
     f0_hz = torch.linspace(f0_start, f0_end, n_frames)
-    f0_frames = (sr / f0_hz).unsqueeze(0)  # delay in *samples*
+    f0_frames = (sr / f0_hz).repeat(batch_size, 1)  # delay in *samples*
+
     audio = model(f0_frames=f0_frames.to(model.device),
                   input=burst.to(model.device),
                   direct=True)  # in‑domain generation
@@ -133,6 +140,7 @@ def build_random_model(cfg_mp: Dict[str, Any], sr: int,
     loop_n_frames = cfg_mp["loop_n_frames"]
     exc_order = cfg_mp["exc_order"]
     exc_n_frames = cfg_mp["exc_n_frames"]
+    batch_size = cfg_mp["batch_size"]
 
     model = DiffKS(
         sample_rate=sr,
@@ -144,11 +152,12 @@ def build_random_model(cfg_mp: Dict[str, Any], sr: int,
         exc_length_s=cfg_mp["exc_length_s"],
         interp_type=cfg_mp["interp_type"],
         use_double_precision=cfg_mp["use_double_precision"],
+        batch_size=batch_size,
     )
 
-    model.set_loop_coefficients(torch.rand(1, loop_n_frames, loop_order + 1))
-    model.set_loop_gain(torch.rand((1, loop_n_frames, 1),))
-    model.set_exc_coefficients(torch.rand(1, exc_n_frames, exc_order + 1) * 0.1)
+    model.set_loop_coefficients(torch.rand(batch_size, loop_n_frames, loop_order + 1))
+    model.set_loop_gain(torch.rand((batch_size, loop_n_frames, 1),))
+    model.set_exc_coefficients(torch.rand(batch_size, exc_n_frames, exc_order + 1) * 0.1)
 
     return model
 
@@ -214,7 +223,7 @@ def composite_plot(fig_path: str,
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
-# Training loop – works for BOTH in‑domain and out‑of‑domain cases
+# Training loop - works for BOTH in‑domain and out‑of‑domain cases
 # -----------------------------------------------------------------------------
 def optimise_model(model: DiffKS,
                    input_signal: torch.Tensor,    # what goes *into* the model
@@ -236,41 +245,158 @@ def optimise_model(model: DiffKS,
         (Karplus‑Strong); False ⇒ inverse‑filter path.
     hp : hyperparameter sub‑dict from config
     """
-    _, _, _, gs = load_config()
+    _, mp, _, gs = load_config()
 
-    # ---------- loss ---------------------------------------------------------
-    loss_fn = MultiSTFT(scale_invariance=True,
-                        perceptual_weighting=hp["use_A_weighing"],
-                        sample_rate=gs["sample_rate"])
+    method = hp.get('method', 'gradient')
 
-    optimiser = torch.optim.Adam(model.parameters(), lr=hp["learning_rate"])
+    loss_curve = []
 
-    loss_curve, bad_epochs = [], 0
-    pbar = tqdm(range(hp["max_epochs"]), desc="Training")
+    if method == 'gradient':
+        optimiser = torch.optim.Adam(model.parameters(), lr=hp["learning_rate"])
 
-    for epoch in pbar:
-        # forward -------------------------------------------------------------
-        out = model(f0_frames=f0_frames.to(model.device),
-                    input=input_signal.to(model.device),
-                    direct=direct)
+        loss_fn = MultiSTFT(scale_invariance=True,
+                            perceptual_weighting=hp["use_A_weighing"],
+                            sample_rate=gs["sample_rate"])
 
-        loss = loss_fn(out.unsqueeze(1),
-                       target.to(model.device).unsqueeze(1)) * hp["stft_weight"]
+        bad_epochs = 0
+        pbar = tqdm(range(hp["max_epochs"]), desc="Training")
 
-        # backward ------------------------------------------------------------
-        optimiser.zero_grad()
-        loss.backward(retain_graph=True)
-        optimiser.step()
+        for epoch in pbar:
+            # forward -------------------------------------------------------------
+            out = model(f0_frames=f0_frames.to(model.device),
+                        input=input_signal.to(model.device),
+                        direct=direct)
 
-        # bookkeeping ---------------------------------------------------------
-        l = loss.item()
-        loss_curve.append(l)
-        pbar.set_postfix(loss=f"{l:.4f}")
+            loss = loss_fn(out.unsqueeze(1),
+                           target.to(model.device).unsqueeze(1)) * hp["stft_weight"]
 
-        # early‑stopping ------------------------------------------------------
-        bad_epochs = bad_epochs + 1 if l < hp["patience_delta"] else 0
-        if bad_epochs >= hp["patience_epochs"]:
-            break
+            # backward ------------------------------------------------------------
+            optimiser.zero_grad()
+            loss.backward(retain_graph=True)
+            optimiser.step()
+
+            # bookkeeping ---------------------------------------------------------
+            l = loss.item()
+            loss_curve.append(l)
+            pbar.set_postfix(loss=f"{l:.4f}")
+
+            # early‑stopping ------------------------------------------------------
+            bad_epochs = bad_epochs + 1 if l < hp["patience_delta"] else 0
+            if bad_epochs >= hp["patience_epochs"]:
+                break
+
+    elif method == "genetic":
+        loop_n_frames = mp["loop_n_frames"]
+        exc_n_frames = mp["exc_n_frames"]
+
+        loop_order = mp["loop_order"]
+        exc_order = mp["exc_order"]
+
+        use_double_precision = mp["use_double_precision"]
+
+        total_loop_coeffs = loop_n_frames * (loop_order + 1)
+        total_exc_coeffs = exc_n_frames * (exc_order + 1)
+
+        num_generations = hp["max_epochs"]
+        num_parents_mating = 18
+        sol_per_pop = mp["batch_size"]
+
+        loss_fn = MultiSTFT(scale_invariance=True,
+                            perceptual_weighting=hp["use_A_weighing"],
+                            sample_rate=gs["sample_rate"])
+
+        def solution_to_coeffs(solution: np.ndarray):
+            num_sols = solution.shape[0]
+            start, end = 0, total_loop_coeffs
+            loop_coeffs = solution[:, start:end].reshape((num_sols, loop_n_frames, loop_order + 1))
+
+            start = end
+            end = start + 1
+            loop_gain = solution[:, start:end].reshape((num_sols, loop_n_frames, 1))
+
+            start = end
+            end = start + total_exc_coeffs
+            assert end == solution.shape[-1]
+            exc_coeffs = solution[:, start:end].reshape((num_sols, exc_n_frames, exc_order + 1))
+
+            return loop_coeffs, loop_gain, exc_coeffs
+
+        def fitness_func(ga_instance, solution, solution_idx):
+            with torch.no_grad():
+                loop_coeffs, loop_gain, exc_coeffs = solution_to_coeffs(solution)
+
+                out = model(f0_frames=f0_frames.to(model.device),
+                            input=input_signal.to(model.device),
+                            direct=direct,
+                            loop_coefficients=torch.from_numpy(loop_coeffs).to(model.device),
+                            loop_gain=torch.from_numpy(loop_gain).to(model.device),
+                            exc_coefficients=torch.from_numpy(exc_coeffs).to(model.device),
+                            )
+
+                tgt = target.to(model.device).unsqueeze(1)
+                stft_loss = []
+                for item in out:
+                    stft_loss.append(-loss_fn(
+                        item.view(1, 1, -1),
+                        tgt
+                    ).item())
+                return stft_loss
+
+        fitness_function = fitness_func
+
+        num_genes = total_loop_coeffs + 1 + total_exc_coeffs
+
+        init_range_low = -1
+        init_range_high = 1
+
+        parent_selection_type = "sss"
+        keep_parents = 0
+
+        crossover_type = "single_point"
+
+        mutation_type = "random"
+        mutation_percent_genes = 0.1
+
+        def on_gen(ga_instance):
+            print("Generation : ", ga_instance.generations_completed)
+
+            fitness = ga_instance.best_solution()[1]
+            loss_curve.append(fitness)
+            print("Fitness of the best solution :", fitness)
+
+        ga_instance = pygad.GA(
+            num_generations=num_generations,
+            num_parents_mating=num_parents_mating,
+            fitness_func=fitness_function,
+            sol_per_pop=sol_per_pop,
+            num_genes=num_genes,
+            init_range_low=init_range_low,
+            init_range_high=init_range_high,
+            parent_selection_type=parent_selection_type,
+            keep_parents=keep_parents,
+            keep_elitism=0,
+            crossover_type=crossover_type,
+            mutation_type=mutation_type,
+            # mutation_percent_genes=mutation_percent_genes,
+            random_mutation_min_val=-0.1,
+            random_mutation_max_val=0.1,
+            mutation_probability=0.5,
+            on_generation=on_gen,
+            gene_type=np.float64 if use_double_precision else np.float32,
+            fitness_batch_size=sol_per_pop,
+        )
+
+        ga_instance.run()
+
+        loop_coeffs, loop_gain, exc_coeffs = solution_to_coeffs(ga_instance.best_solution()[0][None, :])
+
+        loop_coeffs = torch.from_numpy(loop_coeffs).to(model.device).repeat(sol_per_pop, 1, 1)
+        loop_gain = torch.from_numpy(loop_gain).to(model.device).repeat(sol_per_pop, 1, 1)
+        exc_coeffs = torch.from_numpy(exc_coeffs).to(model.device).repeat(sol_per_pop, 1, 1)
+
+        model.set_exc_coefficients(exc_coeffs)
+        model.set_loop_coefficients(loop_coeffs)
+        model.set_loop_gain(loop_gain)
 
     # ---------- save loss curve ---------------------------------------------
     plt.figure(figsize=(8, 3))
@@ -309,6 +435,8 @@ def main() -> None:
     seed = gs.get("random_seed", 1234)
     model_opt = build_random_model(mp, sample_rate, seed)
 
+    batch_size = mp["batch_size"]
+
     # -------------------------------------------------------------------------
     # 5–6.  Forward / optimisation --------------------------------------------
     use_in_domain = idp["use_in_domain"]
@@ -318,6 +446,7 @@ def main() -> None:
         target_audio = in_domain_audio
     else:
         input_sig = guitar  # real audio → direct=False
+        input_sig = input_sig.repeat((batch_size, 1))
         direct_flag = False
         target_audio = guitar
 
@@ -332,7 +461,7 @@ def main() -> None:
 
     optim_audio = model_opt(f0_frames=f0_frames_opt.to(model_opt.device),
                             input=input_sig.to(model_opt.device),
-                            direct=direct_flag).cpu()
+                            direct=direct_flag).cpu()[0, ...]
 
     save_audio("audio/out/optimized_model.wav", optim_audio, sample_rate)
 
@@ -341,8 +470,8 @@ def main() -> None:
     n_samp = target_audio.shape[-1]
     _, l_b_opt, exc_b_opt = model_opt.get_upsampled_parameters(f0=f0_frames_opt,
                                                               num_samples=n_samp)
-    l_b_opt = l_b_opt.squeeze().detach().cpu().numpy()
-    exc_b_opt = exc_b_opt.squeeze().detach().cpu().numpy()
+    l_b_opt = l_b_opt[0].squeeze().detach().cpu().numpy()
+    exc_b_opt = exc_b_opt[0].squeeze().detach().cpu().numpy()
 
     coeffs_dict = {
         "Loop coeff (opt.)": l_b_opt,  # shape (time, 2)  → DC + z‑1
