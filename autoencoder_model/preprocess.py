@@ -11,9 +11,8 @@ from typing import List, Dict, Any
 import torch
 import torchaudio
 from tqdm import tqdm
-import pesto
 from third_party.auraloss.auraloss.perceptual import FIRFilter
-
+import penn
 from utils.helpers import get_device
 from paths import NSYNTH_DIR, NSYNTH_PREPROCESSED_DIR
 import argparse
@@ -34,11 +33,6 @@ a_weight = FIRFilter(filter_type="aw", fs=SAMPLE_RATE).to(DEVICE).eval()
 for p in a_weight.parameters():
     p.requires_grad_(False)
 
-PESTO_STEP_MS = (HOP_SIZE / SAMPLE_RATE) * 1000
-PESTO_MODEL = pesto.load_model("mir-1k_g7", PESTO_STEP_MS, sampling_rate=SAMPLE_RATE).to(DEVICE).eval()
-for p in PESTO_MODEL.parameters():
-    p.requires_grad_(False)
-
 # --------------------------
 # Helper functions
 # --------------------------
@@ -50,17 +44,39 @@ def a_weighted_loudness(x: torch.Tensor) -> torch.Tensor:
     return torch.log(frames + 1e-8)
 
 @torch.no_grad()
-def pesto_pitch(batch: torch.Tensor) -> torch.Tensor:
-    """Pitch in Hz, clamped to MIN_F0_HZ."""
-    _, f0, _, _ = pesto.predict(batch, SAMPLE_RATE,
-                                step_size=PESTO_STEP_MS,
-                                model_name="mir-1k_g7",
-                                reduction="alwa",
-                                convert_to_freq=True,
-                                num_chunks=1,
-                                inference_mode=True)
-    f0 = torch.clamp(f0, MIN_F0_HZ)  # ensure legal delay
-    return f0
+def fcnf0pp_pitch(batch: torch.Tensor,
+                  sr: int = SAMPLE_RATE,
+                  hop_s: float = HOP_SIZE / SAMPLE_RATE,
+                  fmin: float = MIN_F0_HZ,
+                  fmax: float = SAMPLE_RATE / 2,
+                  batch_frames: int = 256):
+    """
+    Args
+    ----
+    batch : (B, N) mono waveform, normalised to [-1,1]
+    Returns
+    -------
+    pitch : (B, F) frequency in Hz (float32)
+    """
+    # penn expects (B,1,N) and centre-zero audio
+    x = batch                  # (B,1,N)
+    x = (x - x.mean(dim=-1, keepdim=True)) / (x.std(dim=-1, keepdim=True)+1e-9)
+
+    # Feed the whole batch through FCNF0++
+    pitches = []
+    for clip in x:  # iterate over batch dimension
+        p, _ = penn.from_audio(
+            clip.unsqueeze(0), sr,  # shape (1,1,N)
+            hopsize=hop_s,
+            fmin=fmin, fmax=fmax,
+            batch_size=batch_frames,
+            decoder='viterbi',
+            center='half-hop',
+            gpu = get_device().index
+        )
+        pitches.append(p)  # (1, F)
+
+    return torch.cat(pitches, dim=0)  # (B, F)
 
 # --------------------------
 # Preprocessing routine
@@ -104,7 +120,7 @@ def preprocess_nsynth(nsynth_root: str,
             audio_batch = torch.stack(audio_list).to(DEVICE)
 
             # features
-            pitch = pesto_pitch(audio_batch)
+            pitch = fcnf0pp_pitch(audio_batch)
             loud = a_weighted_loudness(audio_batch)
             loud_all.append(loud.cpu())
 

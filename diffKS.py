@@ -224,12 +224,6 @@ class DiffKS(nn.Module):
 
         l_b = self.get_constrained_l_coefficients(l_b=l_b, l_g=l_g)
 
-        l_b_circle = l_b.abs().sum(dim=-1)          # → [B, T]
-        # --- debug block: checks Σ|A[b,t,:]| in one shot ----
-        max_gain, flat_idx = l_b_circle.view(-1).max(dim=0)
-        if max_gain >= 1.0:
-            print(f"⚠️ Σ|l_b| = {max_gain:.4f}")
-
         exc_b = self.get_constrained_exc_coefficients(exc_b=exc_b)
 
         A, x = self.compute_resonator_matrix(f0=f0,

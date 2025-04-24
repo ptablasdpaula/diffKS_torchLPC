@@ -17,7 +17,7 @@ from paths import NSYNTH_PREPROCESSED_DIR
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    env = os.environ.get  # shorthand
+    env = os.environ.get
 
     parser.add_argument("--batch_size",  type=int, default=int(env("BATCH_SIZE", 16)))
     parser.add_argument("--num_workers", type=int, default=int(env("NUM_WORKERS", 2)))
@@ -32,7 +32,7 @@ def parse_args():
     return parser.parse_args()
 
 def main():
-    args = parse_args()  # <── parsed *inside* main
+    args = parse_args()
     config = {
         "hidden_size": args.hidden_size,
         "loop_order": args.l_order,
