@@ -156,7 +156,7 @@ class NsynthDataset(torch.utils.data.Dataset):
     def __len__(self): return len(self.keys)
     def __getitem__(self, idx):
         k = self.keys[idx]
-        itm = torch.load(os.path.join(self.base, f"{k}.pt"))
+        itm = torch.load(os.path.join(self.base, f"{k}.pt"), weights_only=True)
 
         pitch = itm["pitch"].view(-1)  # (F_p,)
         loud = itm["loudness"].view(-1)  # (F_l,)
