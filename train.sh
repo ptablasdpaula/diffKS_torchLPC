@@ -13,6 +13,7 @@
 #$ -M acw794@qmul.ac.uk
 
 module load miniforge/24.7.1
+module load cuda/12.4 cudnn
 source activate audio-env
 
 export WANDB_API_KEY=8133cc8e7f7939b5b8bcd1ddff14eb7c3a8b27d3
