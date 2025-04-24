@@ -1,7 +1,7 @@
 from tqdm import tqdm
 import numpy as np
 import soundfile as sf
-import torch, torch.optim as optim, os, wandb
+import torch, torch.optim as optim, wandb
 from third_party.auraloss.auraloss.freq import MultiResolutionSTFTLoss
 from torch.utils.data import DataLoader
 from utils.helpers import get_device
@@ -15,78 +15,55 @@ import time
 
 from paths import NSYNTH_PREPROCESSED_DIR
 
-parser = argparse.ArgumentParser()
-parser.add_argument(
-    "--batch_size", type=int,
-    default=int(os.getenv("BATCH_SIZE", 8)),
-)
-parser.add_argument(
-    "--num_workers", type=int,
-    default=int(os.getenv("NUM_WORKERS", 2)),
-)
-parser.add_argument(
-    "--hidden_size", type=int,
-    default=int(os.getenv("HIDDEN_SIZE", 512)),
-)
-parser.add_argument(
-    "--l_order", type=int,
-    default=int(os.getenv("L_ORDER", 10)),
-)
-parser.add_argument(
-    "--l_n_frames", type=int,
-    default=int(os.getenv("L_N_FRAMES", 250)),
-)
-parser.add_argument(
-    "--exc_order", type=int,
-    default=int(os.getenv("EXC_ORDER", 10)),
-)
-parser.add_argument(
-    "--exc_n_frames", type=int,
-    default=int(os.getenv("EXC_N_FRAMES", 100)),
-)
-parser.add_argument(
-    "--split", type=str,
-    default=os.getenv("SPLIT", "test"),
-)
-parser.add_argument(
-    "--families", type=str,
-    default=os.getenv("FAMILIES", "guitar"),
-    help="comma-separated list, e.g. guitar,piano"
-)
-parser.add_argument(
-    "--sources", type=str,
-    default=os.getenv("SOURCES", "acoustic"),
-    help="comma-separated list, e.g. acoustic,electric"
-)
-cli_args, _ = parser.parse_known_args()
+def parse_args():
+    parser = argparse.ArgumentParser()
+    env = os.environ.get  # shorthand
 
-config = {
-    "hidden_size":      cli_args.hidden_size,
-    "loop_order":       cli_args.l_order,
-    "loop_n_frames":    cli_args.l_n_frames,
-    "exc_order":        cli_args.exc_order,
-    "exc_n_frames":     cli_args.exc_n_frames,
-    "sample_rate":      16000,
-    "batch_size":       cli_args.batch_size,
-    "learning_rate":    1e-3,
-    "num_epochs":       1000,
-    "eval_interval":    100,
-    "save_dir":         "runs/ks_nsynth",
-    "split":            cli_args.split,
-    "families":         [f.strip() for f in cli_args.families.split(",")],
-    "sources":          [s.strip() for s in cli_args.sources.split(",")],
-    "num_workers":      cli_args.num_workers,
-}
-
-n_samples = 4 * config["sample_rate"]  # 4‑second clips
-
+    parser.add_argument("--batch_size",  type=int, default=int(env("BATCH_SIZE", 16)))
+    parser.add_argument("--num_workers", type=int, default=int(env("NUM_WORKERS", 2)))
+    parser.add_argument("--hidden_size", type=int, default=int(env("HIDDEN_SIZE", 512)))
+    parser.add_argument("--l_order",     type=int, default=int(env("L_ORDER", 5)))
+    parser.add_argument("--l_n_frames",  type=int, default=int(env("L_N_FRAMES", 250)))
+    parser.add_argument("--exc_order",   type=int, default=int(env("EXC_ORDER", 10)))
+    parser.add_argument("--exc_n_frames",type=int, default=int(env("EXC_N_FRAMES", 100)))
+    parser.add_argument("--split",       type=str, default=env("SPLIT", "test"))
+    parser.add_argument("--families",    type=str, default=env("FAMILIES", "guitar"))
+    parser.add_argument("--sources",     type=str, default=env("SOURCES", "acoustic"))
+    return parser.parse_args()
 
 def main():
+    args = parse_args()  # <── parsed *inside* main
+    config = {
+        "hidden_size": args.hidden_size,
+        "loop_order": args.l_order,
+        "loop_n_frames": args.l_n_frames,
+        "exc_order": args.exc_order,
+        "exc_n_frames": args.exc_n_frames,
+        "sample_rate": 16000,
+        "batch_size": args.batch_size,
+        "learning_rate": 1e-3,
+        "num_epochs": 20,
+        "eval_interval": 4,
+        "save_dir": "runs/ks_nsynth",
+        "split": args.split,
+        "families": [f.strip() for f in args.families.split(",")],
+        "sources": [s.strip() for s in args.sources.split(",")],
+        "num_workers": args.num_workers,
+    }
+
+    n_samples = 4 * config["sample_rate"]  # 4‑second clips
+
+    print(f"[DEBUG] batch={config['batch_size']}  workers={config['num_workers']}")
+
     # ─── wandb init ───────────────────────────────────────────── #
     wandb.init(project="diffks-autoencoder", config=config)
     device = get_device()
 
     print(f"Using device: {device}")
+
+    # ─── overall timing setup ─────────────────────────────────── ❶
+    total_iters = 0
+    train_start_time = time.time()
 
     # ─── RAM check ────────────────────────────────────────────── #
     process = psutil.Process(os.getpid())
@@ -159,22 +136,20 @@ def main():
                 f"Epoch {epoch + 1}/{config['num_epochs']} [Batch {batch_idx + 1}/{batch_count}, "
                 f"Samples {samples_processed}/{total_samples}]")
 
-            start = time.time()
+            #start = time.time()
             output = model(pitch=pitch, loudness=loudness, input=audio)
-            print(f"[INFO] Memory after forward: {process.memory_info().rss / 1024 ** 3:.2f} GB")
-            print(f"[TIMER] Forward pass: {time.time() - start:.2f}s")
+            #print(f"[Forward] -> {process.memory_info().rss / 1024 ** 3:.2f}, {time.time() - start:.2f}s")
 
-            start = time.time()
+
+            #start = time.time()
             loss = multi_resolution_stft_loss(output.unsqueeze(1), audio.unsqueeze(1))
-            print(f"[INFO] Memory after loss: {process.memory_info().rss / 1024 ** 3:.2f} GB")
-            print(f"[TIMER] Backward pass: {time.time() - start:.2f}s")
+            #print(f"[Loss] -> {process.memory_info().rss / 1024 ** 3:.2f}, {time.time() - start:.2f}s")
 
             optimizer.zero_grad()
 
-            start = time.time()
+            #start = time.time()
             loss.backward()
-            print(f"[INFO] Memory after backward: {process.memory_info().rss / 1024 ** 3:.2f} GB")
-            print(f"[TIMER] Backward pass: {time.time() - start:.2f}s")
+            #print(f"[Backward] -> {process.memory_info().rss / 1024 ** 3:.2f}, {time.time() - start:.2f}s")
 
             optimizer.step()
 
@@ -185,6 +160,7 @@ def main():
             wandb.log({"loss": loss.item(), "batch": batch_idx, "step": step})
             epoch_loss += loss.item()
             step += 1
+            total_iters += 1
 
         avg_epoch_loss = epoch_loss / len(loader)
 
@@ -329,10 +305,17 @@ def main():
                         "step": step
                     })
 
+    # ─── wrap-up timing & wandb finish ──────────────────────────
+    total_time = time.time() - train_start_time
+    avg_iter_time = total_time / total_iters
+    print(f"\n[RESULT] Completed {total_iters} iterations in {total_time:.2f}s → "
+          f"avg {avg_iter_time:.3f}s/iter")
+
+    wandb.log({"avg_iter_time": avg_iter_time})
+
     # Finish wandb run
     wandb.finish()
     print("Training completed!")
-
 
 if __name__ == '__main__':
     mp.freeze_support()

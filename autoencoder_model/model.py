@@ -43,7 +43,7 @@ class AE_KarplusModel(nn.Module):
             exc_order = exc_order,
             exc_n_frames = exc_n_frames,
             interp_type = 'lagrange',
-            use_double_precision = True,
+            use_double_precision = False,
         )
 
         for p in self.decoder.parameters():

@@ -25,7 +25,7 @@ class InvertLPC(torch.autograd.Function):
         if zi is not None:
             initial = zi.flip(dims=[1])
         else:
-            initial = y.new_zeros(B, N)
+            initial = y.new_zeros(B, N, device=y.device)
 
         y_padded = torch.cat([initial, y], dim=1)
         x = y.clone()
@@ -278,8 +278,18 @@ class DiffKS(nn.Module):
         # Calculate phase adjustment
         omega = 2 * torch.pi / f0  # [batch_size, n_samples]
         coeff_range = torch.arange(self.loop_n_coefficients, device=self.device).view(1, 1, -1)
-        zs = torch.exp(1j * omega.view(batch_size, n_samples, 1)) ** -coeff_range
-        p_a = -torch.angle(torch.sum(b * zs, dim=-1)) / omega
+
+        if self.device == torch.device("mps"):
+            cos_k = torch.cos(omega.unsqueeze(-1) * coeff_range)
+            sin_k = torch.sin(omega.unsqueeze(-1) * coeff_range)
+            real_sum = (b * cos_k).sum(dim=-1)
+            imag_sum = -(b * sin_k).sum(dim=-1)
+            phase = torch.atan2(imag_sum, real_sum)
+            p_a = -phase / omega
+        else:
+            zs = torch.exp(1j * omega.view(batch_size, n_samples, 1)) ** -coeff_range
+            p_a = -torch.angle(torch.sum(b * zs, dim=-1)) / omega
+
         f0_corrected = f0 - (1 + p_a)
 
         z_l = torch.floor(f0_corrected).long()  # [batch_size, n_samples]
