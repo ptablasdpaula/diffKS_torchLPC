@@ -49,7 +49,7 @@ def fcnf0pp_pitch(batch: torch.Tensor,
                   hop_s: float = HOP_SIZE / SAMPLE_RATE,
                   fmin: float = MIN_F0_HZ,
                   fmax: float = SAMPLE_RATE / 2,
-                  batch_frames: int = 256):
+                  batch_frames: int = HOP_SIZE):
     """
     Args
     ----
@@ -78,6 +78,48 @@ def fcnf0pp_pitch(batch: torch.Tensor,
 
     return torch.cat(pitches, dim=0)  # (B, F)
 
+def centre_clip(x, clip_ratio=0.3):
+    thr = clip_ratio * x.abs().max(dim=-1, keepdim=True).values
+    return torch.where(x >  thr, x - thr,
+           torch.where(x < -thr, x + thr, torch.zeros_like(x)))
+
+@torch.no_grad()
+def autocorrelation_pitch(batch: torch.Tensor,
+              sr: int = SAMPLE_RATE,
+              hop: int = HOP_SIZE,
+              fmin: float = MIN_F0_HZ,
+              fmax: float = SAMPLE_RATE / 2) -> torch.Tensor:
+    """
+    Fast, vectorised autocorrelation-based F0 tracker.
+
+    batch: (B, N) float-tensor in -1…1
+    returns: (B, ⌊N/hop⌋) frequency in Hz
+    """
+    B, N = batch.shape
+    frames = batch.unfold(-1, hop*4, hop)                    # (B,F,4H)
+    F, L = frames.shape[1], frames.shape[-1]
+
+    frames = centre_clip(frames - frames.mean(-1, keepdim=True))
+
+    pad = 8*L
+    spec = torch.fft.rfft(frames, n=pad)                           # (B,F, pad//2+1)
+    acf  = torch.fft.irfft(spec * spec.conj(), n=pad)              # power spectrum trick
+    acf  = acf[..., :L]                                      # keep first L lags
+
+    min_lag = int(sr / fmax)
+    max_lag = int(sr / fmin)
+    valid = acf[..., min_lag:max_lag]                        # (B,F,lag)
+    peaks = valid.argmax(dim=-1) + min_lag                  # (B,F)
+    f0 = sr / peaks.float()                                 # Hz
+
+    f0[~torch.isfinite(f0)] = fmin
+    f0 = torch.clamp(f0, fmin, fmax)
+
+    return f0.to(batch)                                     # keep dtype / device
+
+def midi_to_hz(midi : torch.Tensor) -> torch.Tensor:
+    return 440 * 2 ** ((midi - 69) / 12)
+
 # --------------------------
 # Preprocessing routine
 # --------------------------
@@ -88,6 +130,7 @@ def preprocess_nsynth(nsynth_root: str,
                       families: List[str] | None = None,
                       sources: List[str] | None = None,
                       batch_size: int = 4,
+                      pitch_mode: str = "fcnf0",
                       max_files: int | None = None):
     os.makedirs(out_dir, exist_ok=True)
 
@@ -120,9 +163,21 @@ def preprocess_nsynth(nsynth_root: str,
             audio_batch = torch.stack(audio_list).to(DEVICE)
 
             # features
-            pitch = fcnf0pp_pitch(audio_batch)
             loud = a_weighted_loudness(audio_batch)
             loud_all.append(loud.cpu())
+
+            if pitch_mode == "fcnf0":
+                pitch = fcnf0pp_pitch(audio_batch)
+            elif pitch_mode == "autocorrelation":
+                #pitch = autocorrelation_pitch(audio_batch)
+                raise ValueError(f"{pitch_mode} not yet supported")
+            elif pitch_mode == "meta":
+                pitch = midi_to_hz(torch.tensor([[meta_json[k]["pitch"]] * (SEGMENT_LENGTH // HOP_SIZE)
+                                     for k in batch_keys],
+                                     dtype = torch.float32, device = DEVICE))
+            else:
+                raise ValueError(f"Unknown pitch_mode {pitch_mode}")
+
 
             # save per‑file
             for j,k in enumerate(batch_keys):
@@ -191,24 +246,18 @@ class NsynthDataset(torch.utils.data.Dataset):
 # --------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--batch_size", type=int,
-        default=int(os.getenv("BATCH_SIZE", 8)),
-    )
-    parser.add_argument(
-        "--split", type=str,
-        default=os.getenv("SPLIT", "test"),
-    )
-    parser.add_argument(
-        "--families", type=str,
-        default=os.getenv("FAMILIES", "guitar"),
-        help="comma-separated list, e.g. guitar,piano"
-    )
-    parser.add_argument(
-        "--sources", type=str,
-        default=os.getenv("SOURCES", "acoustic"),
-        help="comma-separated list, e.g. acoustic,electric"
-    )
+    env = os.environ.get
+
+    parser.add_argument("--batch_size", type=int, default=int(env("BATCH_SIZE", 8)))
+    parser.add_argument("--split", type=str, default=env("SPLIT", "test"))
+
+    parser.add_argument("--families", type=str, default=env("FAMILIES", "guitar"),
+                        help="comma-separated list, e.g. guitar,piano")
+    parser.add_argument("--sources", type=str, default=env("SOURCES", "acoustic"),
+                        help="comma-separated list, e.g. acoustic,electric")
+
+    parser.add_argument("--pitch_mode", type=str, default=env("PITCH_MODE", "fcnf0"),
+                        choices=["fcnf0", "autocorrelation", "meta"])
 
     cli_args, _ = parser.parse_known_args()
 
@@ -219,4 +268,5 @@ if __name__ == "__main__":
         sources=[s.strip() for s in cli_args.sources.split(",")],
         splits=[s.strip() for s in cli_args.split.split(",")],
         batch_size=cli_args.batch_size,
+        pitch_mode=cli_args.pitch_mode,
     )

@@ -89,7 +89,7 @@ def main():
                         batch_size=config["batch_size"],
                         shuffle=True,
                         drop_last=True,
-                        pin_memory=True,
+                        pin_memory=True if device is not torch.device("mps") else False,
                         num_workers=config["num_workers"])
 
     print(f"[INFO] Memory after dataloader: {process.memory_info().rss / 1024 ** 3:.2f} GB")
