@@ -261,6 +261,10 @@ if __name__ == "__main__":
 
     cli_args, _ = parser.parse_known_args()
 
+    print("\n▶Running with config:")
+    for k, v in vars(cli_args).items():
+        print(f"   {k:12}: {v}")
+
     preprocess_nsynth(
         nsynth_root=NSYNTH_DIR,
         out_dir=NSYNTH_PREPROCESSED_DIR,
