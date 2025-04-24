@@ -2,13 +2,13 @@
 #$ -cwd
 #$ -j y
 #$ -pe smp 8
-#$ -l h_rt=1:00:00
+#$ -l h_rt=0:30:00
 #$ -l gpu=1
 #$ -l rocky
 #$ -l h_vmem=11G
 #$ -o autoencoder_train.o$JOB_ID
 #$ -e autoencoder_train.e$JOB_ID
-#$ -N 8b_6w
+#$ -N diffKS
 #$ -m bea
 #$ -M acw794@qmul.ac.uk
 
