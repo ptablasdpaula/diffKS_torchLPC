@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+from utils.helpers import get_device
 from third_party.ddsp_pytorch.ddsp.core import mlp, gru
 from diffKS import DiffKS
 
@@ -36,14 +37,14 @@ class AE_KarplusModel(nn.Module):
 
         # ----------  differentiable KS decoder  ----------
         self.decoder = DiffKS(
-            batch_size = batch_size,  # will be expanded inside forward
+            batch_size = batch_size,
             sample_rate = sample_rate,
             loop_order = loop_order,
             loop_n_frames = loop_n_frames,
             exc_order = exc_order,
             exc_n_frames = exc_n_frames,
-            interp_type = 'lagrange',
-            use_double_precision = False,
+            interp_type = 'linear', # Only linear remains stable for NNs
+            use_double_precision = True if get_device() != torch.device('mps') else False,
         )
 
         for p in self.decoder.parameters():
