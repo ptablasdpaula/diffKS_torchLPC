@@ -19,6 +19,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     env = os.environ.get
 
+    parser.add_argument("--learning_rate", type=float, default=float(env(1e-3)))
     parser.add_argument("--batch_size",  type=int, default=int(env("BATCH_SIZE", 16)))
     parser.add_argument("--num_workers", type=int, default=int(env("NUM_WORKERS", 2)))
     parser.add_argument("--hidden_size", type=int, default=int(env("HIDDEN_SIZE", 512)))
