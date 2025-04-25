@@ -5,7 +5,7 @@ import torch, torch.optim as optim, wandb
 from third_party.auraloss.auraloss.freq import MultiResolutionSTFTLoss
 from torch.utils.data import DataLoader
 from utils.helpers import get_device
-from .model import AE_KarplusModel
+from .model import AE_KarplusModel, MfccTimeDistributedRnnEncoder
 from .preprocess import NsynthDataset
 import argparse, os
 import multiprocessing as mp
@@ -19,7 +19,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     env = os.environ.get
 
-    parser.add_argument("--learning_rate", type=float, default=float(env(1e-3)))
+    parser.add_argument("--learning_rate", type=float, default=float(env("LEARNING_RATE", 1e-4)))
     parser.add_argument("--batch_size",  type=int, default=int(env("BATCH_SIZE", 16)))
     parser.add_argument("--num_workers", type=int, default=int(env("NUM_WORKERS", 2)))
     parser.add_argument("--hidden_size", type=int, default=int(env("HIDDEN_SIZE", 512)))
@@ -45,7 +45,7 @@ def main():
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
         "num_epochs": 200,
-        "eval_interval": 10,
+        "eval_interval": 1,
         "save_dir": "runs/ks_nsynth",
         "split": args.split,
         "families": [f.strip() for f in args.families.split(",")],
@@ -111,6 +111,7 @@ def main():
         exc_n_frames=config["exc_n_frames"],
         sample_rate=config["sample_rate"],
         interpolation_type=config["interpolation_type"],
+        z_encoder=MfccTimeDistributedRnnEncoder(),
     ).to(device)
 
     # Create optimizer
@@ -145,7 +146,7 @@ def main():
                 f"Samples {samples_processed}/{total_samples}]")
 
             #start = time.time()
-            output = model(pitch=pitch, loudness=loudness, input=audio)
+            output = model(pitch=pitch, loudness=loudness, audio=audio)
             #print(f"[Forward] -> {process.memory_info().rss / 1024 ** 3:.2f}, {time.time() - start:.2f}s")
 
 
@@ -206,7 +207,7 @@ def main():
                 eval_audio, eval_pitch, eval_loudness = [x.to(device) for x in eval_data]
                 # No need to normalize loudness here - already done in preprocessing
 
-                hidden = model.get_hidden(eval_pitch, eval_loudness)
+                hidden = model.get_hidden(eval_pitch, eval_loudness, eval_audio)
 
                 loop_coeffs = model.loop_coeff_proj(hidden).reshape(
                     eval_audio.shape[0], config["loop_n_frames"], model.loop_order + 1)
@@ -284,7 +285,7 @@ def main():
                 epochs_pbar.write(f"Generating audio samples...")
 
                 # Generate audio
-                eval_output = model(eval_pitch, eval_loudness, input=eval_audio)
+                eval_output = model(eval_pitch, eval_loudness, audio=eval_audio)
 
                 # Save a few examples
                 for sample_idx in range(min(3, eval_audio.shape[0])):
