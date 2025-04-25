@@ -220,7 +220,6 @@ class NsynthDataset(torch.utils.data.Dataset):
         self.base = os.path.join(root, split)
         self.meta = json.load(open(os.path.join(self.base, "metadata.json")))
         stats = json.load(open(os.path.join(self.base, f"{split}_stats.json")))
-        self.mu, self.std = stats["mean"], stats["std"]
         self.keys = [k for k,m in self.meta.items()
                      if (not families or m["instrument_family_str"] in families) and
                         (not sources or m["instrument_source_str"] in sources)]
@@ -235,8 +234,6 @@ class NsynthDataset(torch.utils.data.Dataset):
         F = min(len(pitch), len(loud))
         pitch = pitch[:F]
         loud = loud[:F]
-
-        loud = (loud - self.mu) / self.std
 
         pitch = pitch.unsqueeze(-1)  # (F,1)
         loud = loud.unsqueeze(-1)  # (F,1)

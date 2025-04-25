@@ -30,6 +30,7 @@ def parse_args():
     parser.add_argument("--split",       type=str, default=env("SPLIT", "test"))
     parser.add_argument("--families",    type=str, default=env("FAMILIES", "guitar"))
     parser.add_argument("--sources",     type=str, default=env("SOURCES", "acoustic"))
+    parser.add_argument("--interpolation_type", type=str, default=env("INTERPOLATION_TYPE", "linear"))
     return parser.parse_args()
 
 def main():
@@ -42,15 +43,20 @@ def main():
         "exc_n_frames": args.exc_n_frames,
         "sample_rate": 16000,
         "batch_size": args.batch_size,
-        "learning_rate": 1e-3,
-        "num_epochs": 20,
-        "eval_interval": 4,
+        "learning_rate": args.learning_rate,
+        "num_epochs": 200,
+        "eval_interval": 10,
         "save_dir": "runs/ks_nsynth",
         "split": args.split,
         "families": [f.strip() for f in args.families.split(",")],
         "sources": [s.strip() for s in args.sources.split(",")],
         "num_workers": args.num_workers,
+        "interpolation_type": args.interpolation_type,
     }
+
+    print("\n▶Running with config:")
+    for k, v in vars(args).items():
+        print(f"   {k:12}: {v}")
 
     n_samples = 4 * config["sample_rate"]  # 4‑second clips
 
@@ -104,6 +110,7 @@ def main():
         exc_order=config["exc_order"],
         exc_n_frames=config["exc_n_frames"],
         sample_rate=config["sample_rate"],
+        interpolation_type=config["interpolation_type"],
     ).to(device)
 
     # Create optimizer

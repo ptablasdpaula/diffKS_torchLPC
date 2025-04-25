@@ -14,6 +14,7 @@ class AE_KarplusModel(nn.Module):
                  exc_order,
                  exc_n_frames,
                  sample_rate,
+                 interpolation_type,
                  ):
         super().__init__()
         self.sample_rate = sample_rate
@@ -43,7 +44,7 @@ class AE_KarplusModel(nn.Module):
             loop_n_frames = loop_n_frames,
             exc_order = exc_order,
             exc_n_frames = exc_n_frames,
-            interp_type = 'linear', # Only linear remains stable for NNs
+            interp_type = interpolation_type, # Only linear remains stable for NNs
             use_double_precision = True if get_device() != torch.device('mps') else False,
         )
 
