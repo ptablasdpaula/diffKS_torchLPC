@@ -24,6 +24,7 @@ SAMPLE_RATE = 16_000
 HOP_SIZE = 256                      # 250 frames per 4‑s clip
 SEGMENT_LENGTH = SAMPLE_RATE * 4    # 64000 samples
 MIN_F0_HZ = 27.5                    # A0 – longest KS delay we allow
+MAX_F0_IN_NSYNTH = 4186.01 + 500    # MIDI 108 - C8 plus some leeway
 DEVICE = get_device()
 
 # --------------------------
@@ -48,8 +49,8 @@ def fcnf0pp_pitch(batch: torch.Tensor,
                   sr: int = SAMPLE_RATE,
                   hop_s: float = HOP_SIZE / SAMPLE_RATE,
                   fmin: float = MIN_F0_HZ,
-                  fmax: float = SAMPLE_RATE / 2,
-                  batch_frames: int = HOP_SIZE):
+                  fmax: float = MAX_F0_IN_NSYNTH,
+                  interpolation_unvoiced: float = 0.065):
     """
     Args
     ----
@@ -62,6 +63,18 @@ def fcnf0pp_pitch(batch: torch.Tensor,
     x = batch                  # (B,1,N)
     x = (x - x.mean(dim=-1, keepdim=True)) / (x.std(dim=-1, keepdim=True)+1e-9)
 
+    device = x.device
+
+    if device.type == "cpu":
+        batch_size = 1024
+        gpu = None
+    elif device.type == "mps":
+        batch_size = 2048
+        gpu = None
+    else:
+        batch_size = 8192
+        gpu = device.index
+
     # Feed the whole batch through FCNF0++
     pitches = []
     for clip in x:  # iterate over batch dimension
@@ -69,10 +82,11 @@ def fcnf0pp_pitch(batch: torch.Tensor,
             clip.unsqueeze(0), sr,  # shape (1,1,N)
             hopsize=hop_s,
             fmin=fmin, fmax=fmax,
-            batch_size=batch_frames,
-            decoder='viterbi',
+            batch_size=batch_size,
+            decoder='argmax',
             center='half-hop',
-            gpu = get_device().index
+            gpu = gpu,
+            interp_unvoiced_at = interpolation_unvoiced,
         )
         pitches.append(p)  # (1, F)
 
@@ -131,6 +145,7 @@ def preprocess_nsynth(nsynth_root: str,
                       sources: List[str] | None = None,
                       batch_size: int = 4,
                       pitch_mode: str = "meta",
+                      interpolation_unvoiced: float = 0.065,
                       max_files: int | None = None):
     os.makedirs(out_dir, exist_ok=True)
 
@@ -167,7 +182,7 @@ def preprocess_nsynth(nsynth_root: str,
             loud_all.append(loud.cpu())
 
             if pitch_mode == "fcnf0":
-                pitch = fcnf0pp_pitch(audio_batch)
+                pitch = fcnf0pp_pitch(audio_batch, interpolation_unvoiced=interpolation_unvoiced)
             elif pitch_mode == "autocorrelation":
                 #pitch = autocorrelation_pitch(audio_batch)
                 raise ValueError(f"{pitch_mode} not yet supported")
@@ -256,6 +271,9 @@ if __name__ == "__main__":
 
     parser.add_argument("--pitch_mode", type=str, default=env("PITCH_MODE", "meta"),
                         choices=["fcnf0", "autocorrelation", "meta"])
+    parser.add_argument("--interpolation_unvoiced", type=float, default=env("INTERPOLATION_UNVOICED", 0.065),)
+
+    parser.add_argument("--max_files", type=int, default=env("MAX_FILES", None))
 
     cli_args, _ = parser.parse_known_args()
 
@@ -271,4 +289,6 @@ if __name__ == "__main__":
         splits=[s.strip() for s in cli_args.split.split(",")],
         batch_size=cli_args.batch_size,
         pitch_mode=cli_args.pitch_mode,
+        interpolation_unvoiced=cli_args.interpolation_unvoiced,
+        max_files=cli_args.max_files,
     )
