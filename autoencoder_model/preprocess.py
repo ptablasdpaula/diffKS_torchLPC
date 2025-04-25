@@ -130,7 +130,7 @@ def preprocess_nsynth(nsynth_root: str,
                       families: List[str] | None = None,
                       sources: List[str] | None = None,
                       batch_size: int = 4,
-                      pitch_mode: str = "fcnf0",
+                      pitch_mode: str = "meta",
                       max_files: int | None = None):
     os.makedirs(out_dir, exist_ok=True)
 
@@ -145,7 +145,7 @@ def preprocess_nsynth(nsynth_root: str,
                 and (not sources or m["instrument_source_str"] in sources)]
         if max_files: keys = keys[:max_files]
 
-        split_out = os.path.join(out_dir, split)
+        split_out = os.path.join(out_dir, split, pitch_mode)
         os.makedirs(split_out, exist_ok=True)
         meta_out: Dict[str,Any] = {}
         loud_all: List[torch.Tensor] = []
@@ -187,7 +187,7 @@ def preprocess_nsynth(nsynth_root: str,
                     "loudness": loud[j].cpu()
                 }, os.path.join(split_out, f"{k}.pt"))
                 meta_out[k] = {
-                    "path": os.path.join(split, f"{k}.pt"),
+                    "path": os.path.join(split, pitch_mode, f"{k}.pt"),
                     "num_samples": SEGMENT_LENGTH,
                     "num_frames": loud.size(1),
                     **{p: meta_json[k][p] for p in ("instrument_family_str","instrument_source_str")}
@@ -214,10 +214,11 @@ class NsynthDataset(torch.utils.data.Dataset):
             self,
             root:str,
             split:str="train",
+            pitch_mode:str="meta",
             families:List[str]|None=None,
             sources:List[str]|None=None
             ):
-        self.base = os.path.join(root, split)
+        self.base = os.path.join(root, split, pitch_mode)
         self.meta = json.load(open(os.path.join(self.base, "metadata.json")))
         stats = json.load(open(os.path.join(self.base, f"{split}_stats.json")))
         self.keys = [k for k,m in self.meta.items()
@@ -253,7 +254,7 @@ if __name__ == "__main__":
     parser.add_argument("--sources", type=str, default=env("SOURCES", "acoustic"),
                         help="comma-separated list, e.g. acoustic,electric")
 
-    parser.add_argument("--pitch_mode", type=str, default=env("PITCH_MODE", "fcnf0"),
+    parser.add_argument("--pitch_mode", type=str, default=env("PITCH_MODE", "meta"),
                         choices=["fcnf0", "autocorrelation", "meta"])
 
     cli_args, _ = parser.parse_known_args()
