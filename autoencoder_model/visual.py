@@ -10,12 +10,16 @@ HOP_SIZE = 256          # must match preprocess
 def visualize(
         pre_dir: str,
         split: str = "test",
+        pitch_mode: str = "meta",
         families=None,
         sources=None,
         random_sample: bool = True
 ):
-    ds = NsynthDataset(pre_dir, split=split,
-                       families=families, sources=sources)
+    ds = NsynthDataset(pre_dir,
+                       split=split,
+                       pitch_mode=pitch_mode,
+                       families=families,
+                       sources=sources)
     print(f"Dataset has {len(ds)} items")
 
     idx = random.randint(0, len(ds)-1) if random_sample else 0
@@ -42,6 +46,7 @@ def visualize(
 if __name__ == "__main__":
     visualize(NSYNTH_PREPROCESSED_DIR,
               split="test",
+              pitch_mode="meta", # options are meta, fcnf0, autocorrelation
               families=["guitar"],
               sources=["acoustic"],
               random_sample=True)

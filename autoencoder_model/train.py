@@ -31,6 +31,8 @@ def parse_args():
     parser.add_argument("--families",    type=str, default=env("FAMILIES", "guitar"))
     parser.add_argument("--sources",     type=str, default=env("SOURCES", "acoustic"))
     parser.add_argument("--interpolation_type", type=str, default=env("INTERPOLATION_TYPE", "linear"))
+    parser.add_argument("--pitch_mode", type=str, default=env("PITCH_MODE", "meta"))
+
     return parser.parse_args()
 
 def main():
@@ -52,6 +54,7 @@ def main():
         "sources": [s.strip() for s in args.sources.split(",")],
         "num_workers": args.num_workers,
         "interpolation_type": args.interpolation_type,
+        "pitch_mode": args.pitch_mode,
     }
 
     print("\n▶Running with config:")
@@ -86,6 +89,7 @@ def main():
     dataset = NsynthDataset(
         root=NSYNTH_PREPROCESSED_DIR,
         split=config["split"],
+        pitch_mode=config["pitch_mode"],
         families=config["families"],
         sources=config["sources"],
     )
