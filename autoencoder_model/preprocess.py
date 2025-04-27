@@ -16,6 +16,7 @@ import penn
 from utils.helpers import get_device
 from paths import NSYNTH_DIR, NSYNTH_PREPROCESSED_DIR
 import argparse
+import librosa
 
 # --------------------------
 # Globals
@@ -135,6 +136,29 @@ def midi_to_hz(midi : torch.Tensor) -> torch.Tensor:
     return 440 * 2 ** ((midi - 69) / 12)
 
 # --------------------------
+# Function to count number of onsets using librosa
+# --------------------------
+def count_onsets(
+        x: torch.Tensor,          # (N,)  –1…1,  **on CPU**
+        sr: int = SAMPLE_RATE,
+        hop: int = HOP_SIZE,
+) -> int:
+    """
+    Return the number of onsets in `x` using librosa.onset.onset_detect.
+    """
+    y = x.cpu().numpy()                   # 1-D float64
+    o_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+    onsets = librosa.onset.onset_detect(
+        onset_envelope=o_env,
+        sr=sr,
+        hop_length=hop,
+        backtrack=False,
+        units="frames",
+    )
+    return len(onsets)
+
+
+# --------------------------
 # Preprocessing routine
 # --------------------------
 @torch.no_grad()
@@ -159,6 +183,27 @@ def preprocess_nsynth(nsynth_root: str,
                 if (not families or m["instrument_family_str"] in families)
                 and (not sources or m["instrument_source_str"] in sources)]
         if max_files: keys = keys[:max_files]
+
+        # 2) keep only clips that have *exactly one* onset
+        print("▶ Onset-filtering…")
+        onset_ok_keys, onset_bad_keys = [], []
+        for k in tqdm(keys):
+            wav_path = os.path.join(split_in, "audio", f"{k}.wav")
+            wav_t, sr = torchaudio.load(wav_path)           # (1, N)
+            assert sr == SAMPLE_RATE
+            n_onsets = count_onsets(wav_t[0])
+            if n_onsets == 1:
+                onset_ok_keys.append(k)
+            else:
+                onset_bad_keys.append((k, n_onsets))
+
+        # report & proceed
+        if onset_bad_keys:
+            print(f"Filtered {len(onset_bad_keys)} clips (0 or >1 onsets):")
+            for k, n in onset_bad_keys:
+                print(f"   {k:20s}  →  {n} onsets")
+
+        keys = onset_ok_keys      # the list used in the rest of the function
 
         split_out = os.path.join(out_dir, split, pitch_mode)
         os.makedirs(split_out, exist_ok=True)
