@@ -6,14 +6,15 @@ from third_party.auraloss.auraloss.freq import MultiResolutionSTFTLoss
 from torch.utils.data import DataLoader
 from utils.helpers import get_device
 from .model import AE_KarplusModel, MfccTimeDistributedRnnEncoder
-from .preprocess import NsynthDataset
-import argparse, os
+from .preprocess import NsynthDataset, LoudnessDerivLoss, a_weighted_loudness
+import argparse, json, os
 import multiprocessing as mp
 import psutil
 
 import time
 
 from paths import NSYNTH_PREPROCESSED_DIR
+from autoencoder_model.train import load_loud_stats
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -30,6 +31,7 @@ def parse_args():
     parser.add_argument("--families",    type=str, default=env("FAMILIES", "guitar"))
     parser.add_argument("--sources",     type=str, default=env("SOURCES", "acoustic"))
     parser.add_argument("--interpolation_type", type=str, default=env("INTERPOLATION_TYPE", "linear"))
+    parser.add_argument("--loudness_loss_delta", type=float, default=float(env("LOUDNESS_LOSS_DELTA", 10)))
     parser.add_argument("--pitch_mode", type=str, default=env("PITCH_MODE", "meta"))
     parser.add_argument("--ks_sample_rate", type=int, default=env("KS_SAMPLE_RATE", 44100))
 
@@ -47,6 +49,7 @@ def main():
         "ks_sample_rate": args.ks_sample_rate,
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
+        "loudness_loss_delta": args.loudness_loss_delta,
         "num_epochs": 200,
         "eval_interval": 1,
         "save_dir": "runs/ks_nsynth",
@@ -63,8 +66,6 @@ def main():
     print("\n▶Running with config:")
     for k, v in vars(args).items():
         print(f"   {k:12}: {v}")
-
-    n_samples = 4 * config["sample_rate"]  # 4‑second clips
 
     print(f"[DEBUG] batch={config['batch_size']}  workers={config['num_workers']}")
 
@@ -103,6 +104,11 @@ def main():
                         pin_memory=True if device.type != "mps" else False,
                         num_workers=config["num_workers"])
 
+    mu, std = load_loud_stats(NSYNTH_PREPROCESSED_DIR,
+                              split="test",  # or "test"
+                              pitch_mode=config["pitch_mode"],
+                              device=device)
+
     print(f"[INFO] Memory after dataloader: {process.memory_info().rss / 1024 ** 3:.2f} GB")
 
     # Create model
@@ -121,9 +127,11 @@ def main():
     # Create optimizer
     optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
     multi_resolution_stft_loss = MultiResolutionSTFTLoss(scale_invariance=True,
-                                                                       perceptual_weighting=True,
-                                                                       sample_rate=config["sample_rate"],
-                                                                       device=device, )
+                                                         perceptual_weighting=True,
+                                                         sample_rate=config["sample_rate"],
+                                                         device=device, )
+
+    loudness_loss = LoudnessDerivLoss().to(device)
 
     # Training loop
     best_loss = float('inf')
@@ -149,12 +157,20 @@ def main():
                 f"Epoch {epoch + 1}/{config['num_epochs']} [Batch {batch_idx + 1}/{batch_count}, "
                 f"Samples {samples_processed}/{total_samples}]")
 
-            #start = time.time()
             output = model(pitch=pitch, loudness=loudness, audio=audio, audio_sr=config["sample_rate"])
-            #print(f"[Forward] -> {process.memory_info().rss / 1024 ** 3:.2f}, {time.time() - start:.2f}s")
 
-            #start = time.time()
-            loss = multi_resolution_stft_loss(output.unsqueeze(1), audio.unsqueeze(1))
+            spectral_loss = multi_resolution_stft_loss(output.unsqueeze(1), audio.unsqueeze(1))
+
+            loud_hat = a_weighted_loudness(output)
+            loud_hat = (loud_hat - mu) / std
+
+            temporal_loss = loudness_loss(loudness.squeeze(2),
+                                          loud_hat.squeeze(1)) * config["loudness_loss_delta"]
+
+            loss = spectral_loss + temporal_loss
+
+            print (f"spectral loss: {spectral_loss.item()}, temporal loss: {temporal_loss.item()}")
+
             #print(f"[Loss] -> {process.memory_info().rss / 1024 ** 3:.2f}, {time.time() - start:.2f}s")
 
             optimizer.zero_grad()

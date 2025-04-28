@@ -1,14 +1,9 @@
-"""
-Optimised NSynth preprocessing with:
-   - PESTO
-   - A‑weighting (with Auraloss' FIR filter)
-We aim to keep everything in pytorch, with no use of numpy and tensorflow and vectorization where possible.
-"""
 from __future__ import annotations
 import os, json
 from typing import List, Dict, Any
 
 import torch
+from torch import nn
 import torchaudio
 from tqdm import tqdm
 from third_party.auraloss.auraloss.perceptual import FIRFilter
@@ -40,7 +35,19 @@ for p in a_weight.parameters():
 # --------------------------
 # Helper functions
 # --------------------------
-@torch.no_grad()
+class LoudnessDerivLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self,
+                loud_hat: torch.Tensor, # [Batches, Frames]
+                loud_ref: torch.Tensor  # [Batches, Frames]
+                ) -> torch.Tensor:
+        d_hat = loud_hat[:, 1:] - loud_hat[:, :-1]  # (B, F-1)
+        d_ref = loud_ref[:, 1:] - loud_ref[:, :-1]  # (B, F-1)
+
+        return torch.mean(torch.abs(d_hat - d_ref))
+
 def a_weighted_loudness(x: torch.Tensor) -> torch.Tensor:
     """Return log‑power loudness per frame (B, F). x is (B, N)."""
     y = a_weight.fir(x.unsqueeze(1)).pow(2)                               # (B,1,N)
