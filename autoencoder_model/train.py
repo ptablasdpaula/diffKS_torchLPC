@@ -187,11 +187,23 @@ def main():
                 a, p, l = next(iter(val_loader))
                 a, p, l = a.to(device), p.to(device), l.to(device)
                 rec = model(pitch=p, loudness=l, audio=a)
-                sample = torch.cat([a[0], rec[0]]).cpu().numpy()
-                aud_path = os.path.join(config["save_dir"], f"sample_e{epoch}.wav")
-                sf.write(aud_path, sample, config["sample_rate"])
-                wandb.log({"audio_compare": wandb.Audio(sample, sample_rate=config["sample_rate"],
-                                                        caption=f"epoch {epoch} original+recon")})
+                # --- pick 5 unique indices from the batch (assumes batch_size ≥ 5) ---
+                rand_idx = np.random.choice(a.size(0), 5, replace=False)
+
+                for k, idx in enumerate(rand_idx):
+                    sample = torch.cat([a[idx], rec[idx]]).cpu().numpy()
+                    sf.write(
+                        os.path.join(config["save_dir"], f"sample_e{epoch}_{k}.wav"),
+                        sample, config["sample_rate"]
+                    )
+
+                    wandb.log({
+                        f"audio_compare_{k}": wandb.Audio(
+                            sample,
+                            sample_rate=config["sample_rate"],
+                            caption=f"epoch {epoch} | sample {k} | original + recon"
+                        )
+                    })
 
         print(f"[E{epoch}] train={t_loss:.4f} val={v_loss:.4f} best={best_val_loss:.4f}")
 
