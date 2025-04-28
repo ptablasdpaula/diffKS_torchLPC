@@ -55,6 +55,7 @@ def main():
         "exc_order": args.exc_order,
         "exc_n_frames": args.exc_n_frames,
         "sample_rate": 16000,
+        "ks_sample_rate": 41000,
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
         "num_epochs": 200,
@@ -118,7 +119,7 @@ def main():
     model = AE_KarplusModel(batch_size=config["batch_size"], hidden_size=config["hidden_size"],
                             loop_order=config["loop_order"], loop_n_frames=config["loop_n_frames"],
                             exc_order=config["exc_order"], exc_n_frames=config["exc_n_frames"],
-                            sample_rate=config["sample_rate"], interpolation_type=config["interpolation_type"],
+                            internal_sr=config["ks_sample_rate"], interpolation_type=config["interpolation_type"],
                             z_encoder=MfccTimeDistributedRnnEncoder(),).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
@@ -157,7 +158,8 @@ def main():
             with torch.no_grad():
                 for audio, pitch, loud in val_loader:
                     audio, pitch, loud = audio.to(device), pitch.to(device), loud.to(device)
-                    recon = model(pitch=pitch, loudness=loud, audio=audio)
+                    recon = model(pitch=pitch, loudness=loud, audio=audio, audio_sr=config["sample_rate"])
+
                     v_losses.append(mr_stft(recon.unsqueeze(1), audio.unsqueeze(1)).item())
             v_loss = float(np.mean(v_losses))
         else:
@@ -186,7 +188,9 @@ def main():
             with torch.no_grad():
                 a, p, l = next(iter(val_loader))
                 a, p, l = a.to(device), p.to(device), l.to(device)
-                rec = model(pitch=p, loudness=l, audio=a)
+
+                rec = model(pitch=p, loudness=l, audio=a, audio_sr=config["sample_rate"])
+
                 # --- pick 5 unique indices from the batch (assumes batch_size ≥ 5) ---
                 rand_idx = np.random.choice(a.size(0), 5, replace=False)
 

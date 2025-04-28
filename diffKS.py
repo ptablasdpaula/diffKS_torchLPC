@@ -3,10 +3,32 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchlpc import sample_wise_lpc
+import torchaudio.functional as TAF
 from torchcubicspline import natural_cubic_spline_coeffs, NaturalCubicSpline
 from utils.helpers import resize_tensor_dim, get_device
 
 LAGRANGE_ORDER = 5
+
+def kaiser_resample(x, sr_in: int, sr_out: int,
+                    width: int = 32, beta: float = 14.0,
+                    rolloff: float = 0.9475937167399596):
+    """
+    Linear-phase Kaiser-windowed sinc resampler, as used in DDSP (Engel., et al).
+
+    Args
+    ----
+    x        : (..., time) tensor
+    sr_in    : original sample-rate
+    sr_out   : target   sample-rate
+    width    : low-pass filter width (taps per phase)
+    beta     : Kaiser β; 14 ≈ >90 dB stop-band
+    rolloff  : pass-band edge / Nyquist (DDSP uses 0.94759371674)
+    """
+    return TAF.resample(x, sr_in, sr_out,
+                        lowpass_filter_width=width,
+                        rolloff=rolloff,
+                        resampling_method='sinc_interp_kaiser',
+                        beta=beta)
 
 def spline_upsample(x: torch.Tensor,  # shape [B, Frames, D]
                     num_samples) -> torch.Tensor:  # shape [B, Samples, D]
@@ -78,7 +100,7 @@ class DiffKS(nn.Module):
     def __init__(
         self,
         batch_size: int = 1,
-        sample_rate: int = 16000,
+        internal_sr: int = 44100,
         min_f0_hz: float = 27.5,
         loop_order: int = 1,
         loop_n_frames: int = 1,
@@ -94,7 +116,7 @@ class DiffKS(nn.Module):
 
         # ====== General ================================
         self.batch_size = batch_size
-        self.sample_rate = sample_rate
+        self.internal_sr = internal_sr
         self.device = device
         self._dtype = torch.float64 if use_double_precision else torch.float32
         self.min_f0_hz = min_f0_hz
@@ -103,7 +125,7 @@ class DiffKS(nn.Module):
         self.exc_n_frames = exc_n_frames
         self.exc_order = exc_order
         self.exc_n_coefficients = exc_order + 1 # To account for exc_g
-        self.exc_length_n = int (exc_length_s * sample_rate)
+        self.exc_length_n = int (exc_length_s * internal_sr)
         self.exc_coefficients = nn.Parameter(torch.rand(batch_size, self.exc_n_frames, self.exc_n_coefficients, dtype=self._dtype) * 1e-4)
 
         # ====== Loop Filter ============================
@@ -197,11 +219,12 @@ class DiffKS(nn.Module):
         elif value == "lagrange":
             self.num_active_indexes = self.loop_n_coefficients + LAGRANGE_ORDER
 
-        self.coeff_vector_size = int(self.sample_rate // self.min_f0_hz) + self.num_active_indexes
+        self.coeff_vector_size = int(self.internal_sr // self.min_f0_hz) + self.num_active_indexes
 
     def forward(self,
                 f0_frames: torch.Tensor,  # [batch_size, n_frames]
                 input: torch.Tensor,  # [batch_size, n_samples]
+                input_sr: int,
                 direct: bool = False,
                 loop_coefficients: Optional[torch.Tensor] = None,  # [batch_size, loop_n_frames, loop_n_coefficients]
                 loop_gain: Optional[torch.Tensor] = None,  # [batch_size, loop_n_frames, 1]
@@ -214,6 +237,9 @@ class DiffKS(nn.Module):
         l_b = self._prepare("loop_coefficients", loop_coefficients)
         l_g = self._prepare("loop_gain", loop_gain)
         exc_b = self._prepare("exc_coefficients", exc_coefficients)
+
+        if input_sr != self.internal_sr:
+            input = kaiser_resample(input, sr_in=input_sr, sr_out=self.internal_sr)
 
         n_samples = input.size(1)
 
@@ -243,7 +269,7 @@ class DiffKS(nn.Module):
         y_out = sample_wise_lpc(resize_tensor_dim(self.exc_filter_out, n_samples, 1),
                                 A)
 
-        return y_out.to(torch.float32)
+        return kaiser_resample(y_out, sr_in=self.internal_sr, sr_out=input_sr).to(torch.float32)
 
     def compute_resonator_matrix(
             self,

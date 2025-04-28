@@ -6,6 +6,8 @@ from utils.helpers import get_device
 from third_party.ddsp_pytorch.ddsp.core import mlp, gru
 from diffKS import DiffKS
 
+from autoencoder_model.preprocess import E2_HZ
+
 class ZEncoder(nn.Module):
     def __init__(self, input_keys=None):
         super().__init__()
@@ -128,12 +130,12 @@ class AE_KarplusModel(nn.Module):
                  loop_n_frames,
                  exc_order,
                  exc_n_frames,
-                 sample_rate,
+                 internal_sr,
                  interpolation_type,
                  z_encoder,
                  ):
         super().__init__()
-        self.sample_rate = sample_rate
+        self.internal_sr = internal_sr
         self.loop_order = loop_order
         self.loop_n_frames = loop_n_frames
         self.exc_order = exc_order
@@ -158,13 +160,14 @@ class AE_KarplusModel(nn.Module):
         # ----------  differentiable KS decoder  ----------
         self.decoder = DiffKS(
             batch_size = batch_size,
-            sample_rate = sample_rate,
+            internal_sr = internal_sr,
             loop_order = loop_order,
             loop_n_frames = loop_n_frames,
             exc_order = exc_order,
             exc_n_frames = exc_n_frames,
             interp_type = interpolation_type, # Only linear remains stable for NNs
             use_double_precision = True if get_device() != torch.device('mps') else False,
+            min_f0_hz= E2_HZ,
         )
 
         for p in self.decoder.parameters():
@@ -181,7 +184,7 @@ class AE_KarplusModel(nn.Module):
         hidden = self.out_mlp(hidden)
         return hidden.mean(dim=1, keepdim=True)  # Assuming you're using mean pooling
 
-    def forward(self, pitch, loudness, audio):
+    def forward(self, pitch, loudness, audio, audio_sr):
         """
         Forward pass of the neural Karplus-Strong model.
 
@@ -234,8 +237,9 @@ class AE_KarplusModel(nn.Module):
         outputs = []
 
         # Run DiffKS
-        out = self.decoder(f0_frames= self.sample_rate / pitch.squeeze(2),
+        out = self.decoder(f0_frames= self.internal_sr / pitch.squeeze(2),
                            input=audio,
+                           input_sr=audio_sr,
                            loop_coefficients=loop_coefficients,
                            loop_gain=loop_gain,
                            exc_coefficients=exc_coefficients,)
