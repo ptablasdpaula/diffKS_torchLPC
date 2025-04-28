@@ -20,7 +20,7 @@ def parse_args():
     env = os.environ.get
 
     parser.add_argument("--learning_rate", type=float, default=float(env("LEARNING_RATE", 1e-4)))
-    parser.add_argument("--batch_size",  type=int, default=int(env("BATCH_SIZE", 16)))
+    parser.add_argument("--batch_size",  type=int, default=int(env("BATCH_SIZE", 8)))
     parser.add_argument("--num_workers", type=int, default=int(env("NUM_WORKERS", 2)))
     parser.add_argument("--hidden_size", type=int, default=int(env("HIDDEN_SIZE", 512)))
     parser.add_argument("--l_order",     type=int, default=int(env("L_ORDER", 2)))
@@ -31,6 +31,7 @@ def parse_args():
     parser.add_argument("--sources",     type=str, default=env("SOURCES", "acoustic"))
     parser.add_argument("--interpolation_type", type=str, default=env("INTERPOLATION_TYPE", "linear"))
     parser.add_argument("--pitch_mode", type=str, default=env("PITCH_MODE", "meta"))
+    parser.add_argument("--ks_sample_rate", type=int, default=env("KS_SAMPLE_RATE", 44100))
 
     return parser.parse_args()
 
@@ -43,6 +44,7 @@ def main():
         "exc_order": args.exc_order,
         "exc_n_frames": args.exc_n_frames,
         "sample_rate": 16000,
+        "ks_sample_rate": args.ks_sample_rate,
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
         "num_epochs": 200,
@@ -55,6 +57,9 @@ def main():
         "pitch_mode": args.pitch_mode,
     }
 
+    device = get_device()
+    print(f"Using device: {device}")
+
     print("\n▶Running with config:")
     for k, v in vars(args).items():
         print(f"   {k:12}: {v}")
@@ -65,9 +70,6 @@ def main():
 
     # ─── wandb init ───────────────────────────────────────────── #
     wandb.init(project="diffks-autoencoder", config=config)
-    device = get_device()
-
-    print(f"Using device: {device}")
 
     # ─── overall timing setup ─────────────────────────────────── ❶
     total_iters = 0
@@ -111,7 +113,7 @@ def main():
         loop_n_frames=config["loop_n_frames"],
         exc_order=config["exc_order"],
         exc_n_frames=config["exc_n_frames"],
-        sample_rate=config["sample_rate"],
+        internal_sr=config["ks_sample_rate"],
         interpolation_type=config["interpolation_type"],
         z_encoder=MfccTimeDistributedRnnEncoder(),
     ).to(device)
@@ -148,9 +150,8 @@ def main():
                 f"Samples {samples_processed}/{total_samples}]")
 
             #start = time.time()
-            output = model(pitch=pitch, loudness=loudness, audio=audio)
+            output = model(pitch=pitch, loudness=loudness, audio=audio, audio_sr=config["sample_rate"])
             #print(f"[Forward] -> {process.memory_info().rss / 1024 ** 3:.2f}, {time.time() - start:.2f}s")
-
 
             #start = time.time()
             loss = multi_resolution_stft_loss(output.unsqueeze(1), audio.unsqueeze(1))
@@ -287,7 +288,7 @@ def main():
                 epochs_pbar.write(f"Generating audio samples...")
 
                 # Generate audio
-                eval_output = model(eval_pitch, eval_loudness, audio=eval_audio)
+                eval_output = model(eval_pitch, eval_loudness, audio=eval_audio, audio_sr=config["sample_rate"])
 
                 # Save a few examples
                 for sample_idx in range(min(3, eval_audio.shape[0])):
