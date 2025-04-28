@@ -24,8 +24,10 @@ import librosa
 SAMPLE_RATE = 16_000
 HOP_SIZE = 256                      # 250 frames per 4‑s clip
 SEGMENT_LENGTH = SAMPLE_RATE * 4    # 64000 samples
-MIN_F0_HZ = 27.5                    # A0 – longest KS delay we allow
-MAX_F0_IN_NSYNTH = 4186.01 + 500    # MIDI 108 - C8 plus some leeway
+
+E2_MIDI, E6_MIDI = 40, 88
+E2_HZ, E6_HZ = 82.41, 1318.51
+
 DEVICE = get_device()
 
 # --------------------------
@@ -49,8 +51,8 @@ def a_weighted_loudness(x: torch.Tensor) -> torch.Tensor:
 def fcnf0pp_pitch(batch: torch.Tensor,
                   sr: int = SAMPLE_RATE,
                   hop_s: float = HOP_SIZE / SAMPLE_RATE,
-                  fmin: float = MIN_F0_HZ,
-                  fmax: float = MAX_F0_IN_NSYNTH,
+                  fmin: float = E2_HZ,
+                  fmax: float = E6_HZ,
                   interpolation_unvoiced: float = 0.065):
     """
     Args
@@ -99,41 +101,8 @@ def centre_clip(x, clip_ratio=0.3):
            torch.where(x < -thr, x + thr, torch.zeros_like(x)))
 
 @torch.no_grad()
-def autocorrelation_pitch(batch: torch.Tensor,
-              sr: int = SAMPLE_RATE,
-              hop: int = HOP_SIZE,
-              fmin: float = MIN_F0_HZ,
-              fmax: float = SAMPLE_RATE / 2) -> torch.Tensor:
-    """
-    Fast, vectorised autocorrelation-based F0 tracker.
-
-    batch: (B, N) float-tensor in -1…1
-    returns: (B, ⌊N/hop⌋) frequency in Hz
-    """
-    B, N = batch.shape
-    frames = batch.unfold(-1, hop*4, hop)                    # (B,F,4H)
-    F, L = frames.shape[1], frames.shape[-1]
-
-    frames = centre_clip(frames - frames.mean(-1, keepdim=True))
-
-    pad = 8*L
-    spec = torch.fft.rfft(frames, n=pad)                           # (B,F, pad//2+1)
-    acf  = torch.fft.irfft(spec * spec.conj(), n=pad)              # power spectrum trick
-    acf  = acf[..., :L]                                      # keep first L lags
-
-    min_lag = int(sr / fmax)
-    max_lag = int(sr / fmin)
-    valid = acf[..., min_lag:max_lag]                        # (B,F,lag)
-    peaks = valid.argmax(dim=-1) + min_lag                  # (B,F)
-    f0 = sr / peaks.float()                                 # Hz
-
-    f0[~torch.isfinite(f0)] = fmin
-    f0 = torch.clamp(f0, fmin, fmax)
-
-    return f0.to(batch)                                     # keep dtype / device
-
-def midi_to_hz(midi : torch.Tensor) -> torch.Tensor:
-    return 440 * 2 ** ((midi - 69) / 12)
+def autocorrelation_pitch() -> torch.Tensor:
+    pass
 
 # --------------------------
 # Function to count number of onsets using librosa
@@ -157,6 +126,34 @@ def count_onsets(
     )
     return len(onsets)
 
+# --------------------------
+# Onset helpers
+# --------------------------
+def first_onset_offset(
+        x: torch.Tensor,          # (N,) –1…1  **on CPU**
+        sr: int = SAMPLE_RATE,
+        hop: int = HOP_SIZE,
+) -> int:
+    """
+    Return the sample index of the first onset in `x`.
+    If no onset is found, return 0.
+    """
+    y = x.cpu().numpy()
+    o_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+    onsets = librosa.onset.onset_detect(
+        onset_envelope=o_env,
+        sr=sr,
+        hop_length=hop,
+        backtrack=False,
+        units="frames",
+    )
+    if len(onsets) == 0:
+        return 0
+    first_frame = int(onsets[0])
+    return first_frame * hop   # samples
+
+def midi_to_hz(midi : torch.Tensor) -> torch.Tensor:
+    return 440 * 2 ** ((midi - 69) / 12)
 
 # --------------------------
 # Preprocessing routine
@@ -180,7 +177,8 @@ def preprocess_nsynth(nsynth_root: str,
             meta_json: Dict[str, Any] = json.load(f)
 
         keys = [k for k,m in meta_json.items()
-                if (not families or m["instrument_family_str"] in families)
+                if E2_MIDI <= m["pitch"] <= E6_MIDI
+                and (not families or m["instrument_family_str"] in families)
                 and (not sources or m["instrument_source_str"] in sources)]
         if max_files: keys = keys[:max_files]
 
@@ -191,6 +189,11 @@ def preprocess_nsynth(nsynth_root: str,
             wav_path = os.path.join(split_in, "audio", f"{k}.wav")
             wav_t, sr = torchaudio.load(wav_path)           # (1, N)
             assert sr == SAMPLE_RATE
+            offset = first_onset_offset(wav_t[0], sr=sr)
+            if offset > 0:
+                tail_len = SEGMENT_LENGTH - offset
+                wav_t = torch.cat([wav_t[:, offset:], torch.zeros(1, offset)], dim=-1)
+                wav_t = wav_t[:, :SEGMENT_LENGTH]  # in case original file was longer
             n_onsets = count_onsets(wav_t[0])
             if n_onsets == 1:
                 onset_ok_keys.append(k)
