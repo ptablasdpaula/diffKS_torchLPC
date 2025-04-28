@@ -34,9 +34,9 @@ def parse_args():
     p.add_argument("--hidden_size", type=int, default=int(env("HIDDEN_SIZE", 512)))
 
     p.add_argument("--l_order",     type=int, default=int(env("L_ORDER", 2)))
-    p.add_argument("--l_n_frames",  type=int, default=int(env("L_N_FRAMES", 250)))
-    p.add_argument("--exc_order",   type=int, default=int(env("EXC_ORDER", 10)))
-    p.add_argument("--exc_n_frames",type=int, default=int(env("EXC_N_FRAMES", 100)))
+    p.add_argument("--l_n_frames",  type=int, default=int(env("L_N_FRAMES", 16)))
+    p.add_argument("--exc_order",   type=int, default=int(env("EXC_ORDER", 5)))
+    p.add_argument("--exc_n_frames",type=int, default=int(env("EXC_N_FRAMES", 25)))
 
     p.add_argument("--families",    type=str, default=env("FAMILIES", "guitar"))
     p.add_argument("--sources",     type=str, default=env("SOURCES", "acoustic"))
