@@ -7,11 +7,21 @@ from torch.utils.data import DataLoader
 from utils.helpers import get_device
 from .model import AE_KarplusModel, MfccTimeDistributedRnnEncoder
 from .preprocess import NsynthDataset
-import argparse, os
+import argparse, os, json
 import multiprocessing as mp
 import psutil
 
 from paths import NSYNTH_PREPROCESSED_DIR
+
+from autoencoder_model.preprocess import a_weighted_loudness, LoudnessDerivLoss
+
+def load_loud_stats(ds_root, split="train", pitch_mode="meta", device="cpu"):
+    stats_path = os.path.join(ds_root, split, pitch_mode, f"{split}_stats.json")
+    with open(stats_path) as f:
+        stats = json.load(f)
+    # turn into tensors on the right device
+    return (torch.tensor(stats["mean"], device=device),
+            torch.tensor(stats["std"],  device=device))
 
 def str2bool(x: str) -> bool:
     return str(x).lower() in {"1", "true", "t", "yes", "y"}
@@ -28,8 +38,8 @@ def parse_args():
 
     p.add_argument("--learning_rate", type=float, default=float(env("LEARNING_RATE", 1e-4)))
 
-    p.add_argument("--batch_size",  type=int, default=int(env("BATCH_SIZE", 16)))
-    p.add_argument("--num_workers", type=int, default=int(env("NUM_WORKERS", 4)))
+    p.add_argument("--batch_size",  type=int, default=int(env("BATCH_SIZE", 8)))
+    p.add_argument("--num_workers", type=int, default=int(env("NUM_WORKERS", 2)))
 
     p.add_argument("--hidden_size", type=int, default=int(env("HIDDEN_SIZE", 512)))
 
@@ -43,6 +53,7 @@ def parse_args():
 
     p.add_argument("--interpolation_type", type=str, default=env("INTERPOLATION_TYPE", "linear"))
     p.add_argument("--pitch_mode", type=str, default=env("PITCH_MODE", "meta"))
+    p.add_argument("--loudness_loss_delta", type=float, default=float(env("LOUDNESS_LOUDNESS_DELTA", 10)))
 
     return p.parse_args()
 
@@ -66,6 +77,7 @@ def main():
         "num_workers": args.num_workers,
         "interpolation_type": args.interpolation_type,
         "pitch_mode": args.pitch_mode,
+        "loudness_loss_delta": args.loudness_loss_delta,
     }
 
     print("\n▶Running with config:")
@@ -115,6 +127,11 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False,
                             drop_last=True, pin_memory=True if device.type != "mps" else False, num_workers=config["num_workers"])
 
+    mu, std = load_loud_stats(NSYNTH_PREPROCESSED_DIR,
+                              split="train",
+                              pitch_mode=config["pitch_mode"],
+                              device=device)
+
     # ─── Start Model, optimizer & Loss ────────────────────────── #
     model = AE_KarplusModel(batch_size=config["batch_size"], hidden_size=config["hidden_size"],
                             loop_order=config["loop_order"], loop_n_frames=config["loop_n_frames"],
@@ -126,6 +143,8 @@ def main():
 
     mr_stft = MultiResolutionSTFTLoss(scale_invariance=True, perceptual_weighting=True,
                                       sample_rate=config["sample_rate"], device=device, )
+
+    loudness_loss = LoudnessDerivLoss().to(device)
 
     # ─── Resume from checkpoint if requested ──────────────────────────────
     start_epoch, best_val_loss = 0, float('inf')
@@ -143,8 +162,18 @@ def main():
         t_loss = 0
         for audio, pitch, loud in tqdm(train_loader, desc=f"[E{epoch:03d} train]"):
             audio, pitch, loud = audio.to(device), pitch.to(device), loud.to(device)
-            recon = model(pitch=pitch, loudness=loud, audio=audio)
-            loss = mr_stft(recon.unsqueeze(1), audio.unsqueeze(1))
+            recon = model(pitch=pitch, loudness=loud, audio=audio, audio_sr=config["sample_rate"])
+
+            spectral_loss = mr_stft(recon.unsqueeze(1), audio.unsqueeze(1))
+
+            loud_hat = a_weighted_loudness(recon)
+            loud_hat = (loud_hat - mu) / std
+
+            temporal_loss = loudness_loss(loud.squeeze(2),
+                                          loud_hat.squeeze(1)) * config["loudness_loss_delta"]
+
+            loss = spectral_loss + temporal_loss
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
