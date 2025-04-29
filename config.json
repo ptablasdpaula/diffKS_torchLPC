@@ -19,7 +19,6 @@
     "f0_n_frames": 2,
     "min_f0_hz": 27.5,
     "burst_width_s": 0.02,
-    "burst_length_s": 0.025,
     "use_double_precision": false,
     "normalize_burst": true,
     "interp_type": "lagrange",
