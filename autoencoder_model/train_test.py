@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument("--families",    type=str, default=env("FAMILIES", "guitar"))
     parser.add_argument("--sources",     type=str, default=env("SOURCES", "acoustic"))
     parser.add_argument("--interpolation_type", type=str, default=env("INTERPOLATION_TYPE", "linear"))
-    parser.add_argument("--loudness_loss_delta", type=float, default=float(env("LOUDNESS_LOSS_DELTA", 10)))
+    parser.add_argument("--loudness_loss_delta", type=float, default=float(env("LOUDNESS_LOSS_DELTA", 0)))
     parser.add_argument("--pitch_mode", type=str, default=env("PITCH_MODE", "meta"))
     parser.add_argument("--ks_sample_rate", type=int, default=env("KS_SAMPLE_RATE", 44100))
 
@@ -60,19 +60,18 @@ def main():
         "pitch_mode": args.pitch_mode,
     }
 
-    device = get_device()
-    print(f"Using device: {device}")
-
     print("\n▶Running with config:")
     for k, v in vars(args).items():
         print(f"   {k:12}: {v}")
 
-    print(f"[DEBUG] batch={config['batch_size']}  workers={config['num_workers']}")
+    # ─── device init ──────────────────────────────────────────── #
+    device = get_device()
+    print(f"Using device: {device}")
 
     # ─── wandb init ───────────────────────────────────────────── #
     wandb.init(project="diffks-autoencoder", config=config)
 
-    # ─── overall timing setup ─────────────────────────────────── ❶
+    # ─── overall timing setup ─────────────────────────────────── #
     total_iters = 0
     train_start_time = time.time()
 
@@ -80,13 +79,12 @@ def main():
     process = psutil.Process(os.getpid())
     print(f"[INFO] Memory at start: {process.memory_info().rss / 1024 ** 3:.2f} GB")
 
-    # ─── Create save directories ───────────────────────────────── #
+    # ─── Create save directories ──────────────────────────────── #
     full_save_path = os.path.abspath(config["save_dir"])
     os.makedirs(full_save_path, exist_ok=True)
     print(f"Using save directory: {full_save_path}")
 
     # ─── Data ─────────────────────────────────────────────────── #
-    # Updated dataset initialization to use the new implementation
     dataset = NsynthDataset(
         root=NSYNTH_PREPROCESSED_DIR,
         split="test",
@@ -95,8 +93,6 @@ def main():
         sources=config["sources"],
     )
 
-    print(f"[INFO] Memory after dataset: {process.memory_info().rss / 1024 ** 3:.2f} GB")
-
     loader = DataLoader(dataset,
                         batch_size=config["batch_size"],
                         shuffle=True,
@@ -104,14 +100,18 @@ def main():
                         pin_memory=True if device.type != "mps" else False,
                         num_workers=config["num_workers"])
 
-    mu, std = load_loud_stats(NSYNTH_PREPROCESSED_DIR,
-                              split="test",  # or "test"
-                              pitch_mode=config["pitch_mode"],
-                              device=device)
+    # ─── temporal loss ─────────────────────────────────────────────────────
+    use_temporal_loss = config["loudness_loss_delta"] != 0
 
-    print(f"[INFO] Memory after dataloader: {process.memory_info().rss / 1024 ** 3:.2f} GB")
+    if use_temporal_loss:
+        mu, std = load_loud_stats(NSYNTH_PREPROCESSED_DIR,
+                                  split="test",
+                                  pitch_mode=config["pitch_mode"],
+                                  device=device)
+    else:
+        mu = std = None
 
-    # Create model
+    # ─── model ─────────────────────────────────────────────────────────────
     model = AE_KarplusModel(
         batch_size=config["batch_size"],
         hidden_size=config["hidden_size"],
@@ -124,7 +124,7 @@ def main():
         z_encoder=MfccTimeDistributedRnnEncoder(),
     ).to(device)
 
-    # Create optimizer
+    # ─── optimizer ─────────────────────────────────────────────────────────
     optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
     multi_resolution_stft_loss = MultiResolutionSTFTLoss(scale_invariance=True,
                                                          perceptual_weighting=True,
@@ -133,7 +133,7 @@ def main():
 
     loudness_loss = LoudnessDerivLoss().to(device)
 
-    # Training loop
+    # ─── training ─────────────────────────────────────────────────────────
     best_loss = float('inf')
     step = 0
 
@@ -161,24 +161,22 @@ def main():
 
             spectral_loss = multi_resolution_stft_loss(output.unsqueeze(1), audio.unsqueeze(1))
 
-            loud_hat = a_weighted_loudness(output)
-            loud_hat = (loud_hat - mu) / std
+            if use_temporal_loss:
+                loud_hat = a_weighted_loudness(output)
+                loud_hat = (loud_hat - mu) / std
 
-            temporal_loss = loudness_loss(loudness.squeeze(2),
-                                          loud_hat.squeeze(1)) * config["loudness_loss_delta"]
+                temporal_loss = loudness_loss(loudness.squeeze(2),
+                                              loud_hat.squeeze(1)) * config["loudness_loss_delta"]
+            else:
+                temporal_loss = 0.0
 
             loss = spectral_loss + temporal_loss
 
-            print (f"spectral loss: {spectral_loss.item()}, temporal loss: {temporal_loss.item()}")
-
-            #print(f"[Loss] -> {process.memory_info().rss / 1024 ** 3:.2f}, {time.time() - start:.2f}s")
+            if use_temporal_loss:
+                print (f"spectral loss: {spectral_loss.item()}, temporal loss: {temporal_loss.item()}")
 
             optimizer.zero_grad()
-
-            #start = time.time()
             loss.backward()
-            #print(f"[Backward] -> {process.memory_info().rss / 1024 ** 3:.2f}, {time.time() - start:.2f}s")
-
             optimizer.step()
 
             # Update progress bar postfix with current loss
