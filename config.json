@@ -5,8 +5,6 @@
     "max_epochs": 500,
     "stft_weight": 100,
     "use_A_weighing": true,
-    "min_action_weight": 10,
-    "min_action_distance": "l2",
     "patience_epochs": 10,
     "patience_delta": 1
   },
@@ -35,7 +33,8 @@
     "b_end": 0.99
   },
   "global_settings": {
-    "sample_rate": 8000,
+    "audio_sr": 16000,
+    "internal_sr": 41000,
     "length_audio_s": 4
   }
 }
