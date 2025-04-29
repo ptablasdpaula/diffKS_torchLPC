@@ -17,6 +17,11 @@ from third_party.auraloss.auraloss.freq import MultiResolutionSTFTLoss as MultiS
 from diffKS import DiffKS
 from utils.helpers import (noise_burst, load_config, resize_tensor_dim,)
 
+_, _, _, gs = load_config()
+
+LENGTH_N = 4 * gs["audio_sr"]
+LENGTH_N_UPSAMPLED = 4 * gs["internal_sr"]
+
 # -----------------------------------------------------------------------------
 # Utility helpers
 # -----------------------------------------------------------------------------
@@ -34,17 +39,11 @@ def save_audio(path: str | Path, tensor: torch.Tensor, sr: int) -> None:
         tensor = tensor.unsqueeze(0)
     torchaudio.save(str(path), tensor, sr)
 
-
-def to_samples(f0_hz: float, sr: int) -> float:
-    """Convert fundamental (Hz) to delay in *samples* (non‑integer)."""
-    return sr / f0_hz
-
-
 # -----------------------------------------------------------------------------
 # Main experiment logic
 # -----------------------------------------------------------------------------
 
-def build_usual_ks(cfg_mp: Dict[str, Any], sr: int) -> Tuple[DiffKS, torch.Tensor]:
+def build_usual_ks(cfg_mp: Dict[str, Any]) -> Tuple[DiffKS, torch.Tensor]:
     """Return a *DiffKS* initialised to “usual” KS values plus an excitation
     burst long enough for *exc_length_s* from the config.
     """
@@ -53,8 +52,10 @@ def build_usual_ks(cfg_mp: Dict[str, Any], sr: int) -> Tuple[DiffKS, torch.Tenso
     exc_order = cfg_mp["exc_order"]
     batch_size = cfg_mp["batch_size"]
 
+    _, _, _, gs = load_config()
+
     model = DiffKS(
-        sample_rate=sr,
+        internal_sr=gs["internal_sr"],
         min_f0_hz=cfg_mp["min_f0_hz"],
         loop_order=loop_order,
         loop_n_frames=cfg_mp["loop_n_frames"],
@@ -84,11 +85,9 @@ def build_usual_ks(cfg_mp: Dict[str, Any], sr: int) -> Tuple[DiffKS, torch.Tenso
     exc_coeffs = exc_coeffs.expand(batch_size, -1, -1)  # [batch_size, exc_n_frames, exc_order + 1]
     model.set_exc_coefficients(exc_coeffs)
 
-    _, _, _, gs = load_config()
-
     # --- Generate noise burst -------------------------------------------------
     burst = noise_burst(
-        sample_rate=sr,
+        sample_rate=gs["audio_sr"],
         length_s=gs["length_audio_s"],
         burst_width_s=cfg_mp["burst_width_s"],
         normalize=cfg_mp["normalize_burst"],
@@ -98,7 +97,9 @@ def build_usual_ks(cfg_mp: Dict[str, Any], sr: int) -> Tuple[DiffKS, torch.Tenso
     return model, burst
 
 
-def run_usual_ks(model: DiffKS, burst: torch.Tensor, sr: int,
+def run_usual_ks(model: DiffKS,
+                 burst: torch.Tensor,
+                 audio_sr: int,
                  cfg_mp: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor,
                                                   torch.Tensor]:
     """Propagate *burst* through *model* with base‑440 Hz plus vibrato."""
@@ -109,10 +110,11 @@ def run_usual_ks(model: DiffKS, burst: torch.Tensor, sr: int,
     batch_size = cfg_mp['batch_size']
 
     f0_hz = torch.linspace(f0_start, f0_end, n_frames)
-    f0_frames = (sr / f0_hz).repeat(batch_size, 1)  # delay in *samples*
+    f0_frames = (gs["internal_sr"] / f0_hz).repeat(batch_size, 1)  # delay in *samples*
 
     audio = model(f0_frames=f0_frames.to(model.device),
                   input=burst.to(model.device),
+                  input_sr=audio_sr,
                   direct=True)  # in‑domain generation
 
     exc_out = model.exc_filter_out  # [1, exc_len_samples]
@@ -129,7 +131,7 @@ def load_guitar(path: str | Path, sr_tgt: int) -> torch.Tensor:
     return wav
 
 
-def build_random_model(cfg_mp: Dict[str, Any], sr: int,
+def build_random_model(cfg_mp: Dict[str, Any],
                        seed: int) -> DiffKS:
     """Create a *DiffKS* with random weights but fixed *seed*."""
     torch.manual_seed(seed)
@@ -142,8 +144,10 @@ def build_random_model(cfg_mp: Dict[str, Any], sr: int,
     exc_n_frames = cfg_mp["exc_n_frames"]
     batch_size = cfg_mp["batch_size"]
 
+    _, _, _, hp = load_config()
+
     model = DiffKS(
-        sample_rate=sr,
+        internal_sr=hp["internal_sr"],
         min_f0_hz=cfg_mp["min_f0_hz"],
         loop_order=loop_order,
         loop_n_frames=loop_n_frames,
@@ -256,7 +260,7 @@ def optimise_model(model: DiffKS,
 
         loss_fn = MultiSTFT(scale_invariance=True,
                             perceptual_weighting=hp["use_A_weighing"],
-                            sample_rate=gs["sample_rate"])
+                            sample_rate=gs["audio_sr"])
 
         bad_epochs = 0
         pbar = tqdm(range(hp["max_epochs"]), desc="Training")
@@ -265,6 +269,7 @@ def optimise_model(model: DiffKS,
             # forward -------------------------------------------------------------
             out = model(f0_frames=f0_frames.to(model.device),
                         input=input_signal.to(model.device),
+                        input_sr=gs["audio_sr"],
                         direct=direct)
 
             loss = loss_fn(out.unsqueeze(1),
@@ -414,26 +419,26 @@ def optimise_model(model: DiffKS,
 def main() -> None:
     ensure_dirs()
     hp, mp, idp, gs = load_config()
-    sample_rate: int = gs["sample_rate"]
+    audio_sr: int = gs["audio_sr"]
 
     # -------------------------------------------------------------------------
     # 1–2.  In‑domain synthetic reference using “usual” KS ---------------------
-    model_id, burst = build_usual_ks(mp, sample_rate)
-    in_domain_audio, exc_after, f0_id = run_usual_ks(model_id, burst, sample_rate, mp)
+    model_id, burst = build_usual_ks(mp)
+    in_domain_audio, exc_after, f0_id = run_usual_ks(model_id, burst, audio_sr, mp)
 
-    save_audio("audio/out/in_domain.wav", in_domain_audio, sample_rate)
-    save_audio("audio/out/burst.wav", burst, sample_rate)
-    save_audio("audio/out/burst_exc.wav", exc_after, sample_rate)
+    save_audio("audio/out/in_domain.wav", in_domain_audio, audio_sr)
+    save_audio("audio/out/burst.wav", burst, audio_sr)
+    save_audio("audio/out/burst_exc.wav", exc_after, audio_sr)
 
     # -------------------------------------------------------------------------
     # 3.  Load & prepare guitar -------------------------------------------------
-    guitar = load_guitar("audio/guitar.wav", sample_rate)
-    save_audio("audio/out/guitar_sr.wav", guitar, sample_rate)
+    guitar = load_guitar("audio/guitar.wav", audio_sr)
+    save_audio("audio/out/target.wav", guitar, audio_sr)
 
     # -------------------------------------------------------------------------
     # 4.  New random model ------------------------------------------------------
     seed = gs.get("random_seed", 1234)
-    model_opt = build_random_model(mp, sample_rate, seed)
+    model_opt = build_random_model(mp, seed)
 
     batch_size = mp["batch_size"]
 
@@ -461,15 +466,15 @@ def main() -> None:
 
     optim_audio = model_opt(f0_frames=f0_frames_opt.to(model_opt.device),
                             input=input_sig.to(model_opt.device),
+                            input_sr = audio_sr,
                             direct=direct_flag).cpu()[0, ...]
 
-    save_audio("audio/out/optimized_model.wav", optim_audio, sample_rate)
+    save_audio("audio/out/optimized_model.wav", optim_audio, audio_sr)
 
     # -------------------------------------------------------------------------
     # Upsampled coefficients for comparison ------------------------------------
-    n_samp = target_audio.shape[-1]
     _, l_b_opt, _, exc_b_opt = model_opt.get_upsampled_parameters(f0=f0_frames_opt,
-                                                              num_samples=n_samp)
+                                                              num_samples=LENGTH_N_UPSAMPLED)
     l_b_opt = l_b_opt[0].squeeze().detach().cpu().numpy()
     exc_b_opt = exc_b_opt[0].squeeze().detach().cpu().numpy()
 
@@ -494,11 +499,10 @@ def main() -> None:
 
     # -------------------------------------------------------------------------
     # Upsampled and constrained coefficients for comparison ---------------------
-    n_samp = target_audio.shape[-1]
     # First get upsampled parameters
     _, l_b_opt_up, l_g_opt_up, exc_b_opt_up = model_opt.get_upsampled_parameters(
         f0=f0_frames_opt,
-        num_samples=n_samp
+        num_samples=LENGTH_N_UPSAMPLED
     )
     # Then apply constraints to the upsampled parameters
     l_b_opt = model_opt.get_constrained_l_coefficients(l_b=l_b_opt_up, l_g=l_g_opt_up)
@@ -527,8 +531,8 @@ def main() -> None:
 
     # --- Coefficient comparison: in‑domain vs optimised ----------------------
     # Get upsampled parameters for both models
-    _, l_b_id_up, l_g_id_up, exc_b_id_up = model_id.get_upsampled_parameters(f0=f0_id, num_samples=n_samp)
-    _, l_b_opt_up, l_g_opt_up, exc_b_opt_up = model_opt.get_upsampled_parameters(f0=f0_frames_opt, num_samples=n_samp)
+    _, l_b_id_up, l_g_id_up, exc_b_id_up = model_id.get_upsampled_parameters(f0=f0_id, num_samples=LENGTH_N_UPSAMPLED)
+    _, l_b_opt_up, l_g_opt_up, exc_b_opt_up = model_opt.get_upsampled_parameters(f0=f0_frames_opt, num_samples=LENGTH_N_UPSAMPLED)
 
     # Apply constraints to get final parameters
     l_b_id = model_id.get_constrained_l_coefficients(l_b=l_b_id_up, l_g=l_g_id_up)
@@ -547,7 +551,7 @@ def main() -> None:
     ax[0].grid(True)
 
     # excitation coefficients (all 5 taps)
-    exc_len_samples = int(mp['exc_length_s'] * sample_rate)
+    exc_len_samples = int(mp['exc_length_s'] * audio_sr)
 
     ax[1].set_xlim(0, exc_len_samples)  # limit x‑axis
 
@@ -568,7 +572,7 @@ def main() -> None:
     # add reference coeffs if in‑domain ----------------------------------------
     if use_in_domain:
         # Get upsampled parameters
-        _, l_b_id_up, l_g_id_up, exc_b_id_up = model_id.get_upsampled_parameters(f0=f0_id, num_samples=n_samp)
+        _, l_b_id_up, l_g_id_up, exc_b_id_up = model_id.get_upsampled_parameters(f0=f0_id, num_samples=LENGTH_N_UPSAMPLED)
 
         # Apply constraints
         l_b_id = model_id.get_constrained_l_coefficients(l_b=l_b_id_up, l_g=l_g_id_up)
@@ -584,7 +588,7 @@ def main() -> None:
     # 6.  Extra diagnostics for the trained model ------------------------------
     if not use_in_domain:
         inv_signal = model_opt.get_inverse_filtered_signal().cpu()
-        save_audio("audio/out/inverse_filtered.wav", inv_sig, sample_rate)
+        save_audio("audio/out/inverse_filtered.wav", inv_sig, audio_sr)
         exc_after_opt = model_opt.exc_filter_out.cpu()
         plt.figure(figsize=(12, 4))
         plt.plot(inv_signal.squeeze().detach().cpu().numpy(), label="Inverse filtered")
