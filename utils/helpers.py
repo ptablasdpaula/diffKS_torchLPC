@@ -2,8 +2,12 @@ import json
 import torch
 
 def get_device():
-    r"""Output 'cuda' if gpu is available, 'cpu' otherwise"""
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    elif torch.cuda.is_available():
+        return torch.device("cuda")
+    else:
+        return torch.device("cpu")
 
 def load_config(config_path="config.json"):
     """
