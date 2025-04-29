@@ -53,7 +53,7 @@ def parse_args():
 
     p.add_argument("--interpolation_type", type=str, default=env("INTERPOLATION_TYPE", "linear"))
     p.add_argument("--pitch_mode", type=str, default=env("PITCH_MODE", "meta"))
-    p.add_argument("--loudness_loss_delta", type=float, default=float(env("LOUDNESS_LOUDNESS_DELTA", 10)))
+    p.add_argument("--loudness_loss_delta", type=float, default=float(env("LOUDNESS_LOSS_DELTA", 0)))
 
     return p.parse_args()
 
@@ -84,6 +84,7 @@ def main():
     for k, v in vars(args).items():
         print(f"   {k:12}: {v}")
 
+    # ─── device init ───────────────────────────────────────────────────────
     device = get_device()
     print(f"Using device: {device}")
 
@@ -127,10 +128,16 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False,
                             drop_last=True, pin_memory=True if device.type != "mps" else False, num_workers=config["num_workers"])
 
-    mu, std = load_loud_stats(NSYNTH_PREPROCESSED_DIR,
-                              split="train",
-                              pitch_mode=config["pitch_mode"],
-                              device=device)
+    # ─── temporal loss ─────────────────────────────────────────────────────
+    use_temporal_loss = config["loudness_loss_delta"] != 0
+
+    if use_temporal_loss:
+        mu, std = load_loud_stats(NSYNTH_PREPROCESSED_DIR,
+                                  split="train",
+                                  pitch_mode=config["pitch_mode"],
+                                  device=device)
+    else:
+        mu = std = None
 
     # ─── Start Model, optimizer & Loss ────────────────────────── #
     model = AE_KarplusModel(batch_size=config["batch_size"], hidden_size=config["hidden_size"],
@@ -166,11 +173,14 @@ def main():
 
             spectral_loss = mr_stft(recon.unsqueeze(1), audio.unsqueeze(1))
 
-            loud_hat = a_weighted_loudness(recon)
-            loud_hat = (loud_hat - mu) / std
+            if use_temporal_loss:
+                loud_hat = a_weighted_loudness(recon)
+                loud_hat = (loud_hat - mu) / std
 
-            temporal_loss = loudness_loss(loud.squeeze(2),
-                                          loud_hat.squeeze(1)) * config["loudness_loss_delta"]
+                temporal_loss = loudness_loss(loud.squeeze(2),
+                                              loud_hat.squeeze(1)) * config["loudness_loss_delta"]
+            else:
+                temporal_loss = 0.0
 
             loss = spectral_loss + temporal_loss
 
