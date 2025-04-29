@@ -3,10 +3,32 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchlpc import sample_wise_lpc
+import torchaudio.functional as TAF
 from torchcubicspline import natural_cubic_spline_coeffs, NaturalCubicSpline
-from utils import resize_tensor_dim, get_device
+from utils.helpers import resize_tensor_dim, get_device
 
 LAGRANGE_ORDER = 5
+
+def kaiser_resample(x, sr_in: int, sr_out: int,
+                    width: int = 32, beta: float = 14.0,
+                    rolloff: float = 0.9475937167399596):
+    """
+    Linear-phase Kaiser-windowed sinc resampler, as used in DDSP (Engel., et al).
+
+    Args
+    ----
+    x        : (..., time) tensor
+    sr_in    : original sample-rate
+    sr_out   : target   sample-rate
+    width    : low-pass filter width (taps per phase)
+    beta     : Kaiser β; 14 ≈ >90 dB stop-band
+    rolloff  : pass-band edge / Nyquist (DDSP uses 0.94759371674)
+    """
+    return TAF.resample(x, sr_in, sr_out,
+                        lowpass_filter_width=width,
+                        rolloff=rolloff,
+                        resampling_method='sinc_interp_kaiser',
+                        beta=beta)
 
 def spline_upsample(x: torch.Tensor,  # shape [B, Frames, D]
                     num_samples) -> torch.Tensor:  # shape [B, Samples, D]
@@ -25,7 +47,7 @@ class InvertLPC(torch.autograd.Function):
         if zi is not None:
             initial = zi.flip(dims=[1])
         else:
-            initial = y.new_zeros(B, N)
+            initial = y.new_zeros(B, N, device=y.device)
 
         y_padded = torch.cat([initial, y], dim=1)
         x = y.clone()
@@ -78,7 +100,7 @@ class DiffKS(nn.Module):
     def __init__(
         self,
         batch_size: int = 1,
-        sample_rate: int = 16000,
+        internal_sr: int = 44100,
         min_f0_hz: float = 27.5,
         loop_order: int = 1,
         loop_n_frames: int = 1,
@@ -94,7 +116,7 @@ class DiffKS(nn.Module):
 
         # ====== General ================================
         self.batch_size = batch_size
-        self.sample_rate = sample_rate
+        self.internal_sr = internal_sr
         self.device = device
         self._dtype = torch.float64 if use_double_precision else torch.float32
         self.min_f0_hz = min_f0_hz
@@ -103,7 +125,7 @@ class DiffKS(nn.Module):
         self.exc_n_frames = exc_n_frames
         self.exc_order = exc_order
         self.exc_n_coefficients = exc_order + 1 # To account for exc_g
-        self.exc_length_n = int (exc_length_s * sample_rate)
+        self.exc_length_n = int (exc_length_s * internal_sr)
         self.exc_coefficients = nn.Parameter(torch.rand(batch_size, self.exc_n_frames, self.exc_n_coefficients, dtype=self._dtype) * 1e-4)
 
         # ====== Loop Filter ============================
@@ -117,9 +139,12 @@ class DiffKS(nn.Module):
         # ====== Interpolation Settings ==================
         self.interp_type = interp_type
 
-        self.lagrange_denom = torch.arange(LAGRANGE_ORDER, -1, -1).view(-1, 1) - torch.arange(LAGRANGE_ORDER + 1).view(1, -1)
-        self.lagrange_mask = self.lagrange_denom != 0
-        self.lagrange_denom = torch.where(self.lagrange_mask, self.lagrange_denom, 1)
+        self.register_buffer("lagrange_denom",
+                             torch.arange(LAGRANGE_ORDER, -1, -1).view(-1, 1) -
+                             torch.arange(LAGRANGE_ORDER + 1).view(1, -1))
+        self.register_buffer("lagrange_mask", self.lagrange_denom != 0)
+        self.register_buffer("lagrange_denom_masked",
+                             torch.where(self.lagrange_mask, self.lagrange_denom, 1))
 
         # ====== Analysis Buffers =======================
         self.register_buffer("excitation_filter_out", torch.empty(batch_size, self.exc_length_n))
@@ -194,11 +219,12 @@ class DiffKS(nn.Module):
         elif value == "lagrange":
             self.num_active_indexes = self.loop_n_coefficients + LAGRANGE_ORDER
 
-        self.coeff_vector_size = int(self.sample_rate // self.min_f0_hz) + self.num_active_indexes
+        self.coeff_vector_size = int(self.internal_sr // self.min_f0_hz) + self.num_active_indexes
 
     def forward(self,
                 f0_frames: torch.Tensor,  # [batch_size, n_frames]
                 input: torch.Tensor,  # [batch_size, n_samples]
+                input_sr: int,
                 direct: bool = False,
                 loop_coefficients: Optional[torch.Tensor] = None,  # [batch_size, loop_n_frames, loop_n_coefficients]
                 loop_gain: Optional[torch.Tensor] = None,  # [batch_size, loop_n_frames, 1]
@@ -212,12 +238,17 @@ class DiffKS(nn.Module):
         l_g = self._prepare("loop_gain", loop_gain)
         exc_b = self._prepare("exc_coefficients", exc_coefficients)
 
+        if input_sr != self.internal_sr:
+            input = kaiser_resample(input, sr_in=input_sr, sr_out=self.internal_sr)
+
         n_samples = input.size(1)
 
-        l_b_constrained = self.get_constrained_l_coefficients(l_b=l_b, l_g=l_g)
-        f0, l_b, exc_b = self.get_upsampled_parameters(f0_frames, n_samples,
-                                                       l_b=l_b_constrained,
-                                                       exc_b=exc_b)
+        f0, l_b, l_g, exc_b = self.get_upsampled_parameters(
+            f0_frames, n_samples,
+            l_b=l_b, l_g=l_g, exc_b=exc_b
+        )
+
+        l_b = self.get_constrained_l_coefficients(l_b=l_b, l_g=l_g)
 
         exc_b = self.get_constrained_exc_coefficients(exc_b=exc_b)
 
@@ -238,7 +269,7 @@ class DiffKS(nn.Module):
         y_out = sample_wise_lpc(resize_tensor_dim(self.exc_filter_out, n_samples, 1),
                                 A)
 
-        return y_out.to(torch.float32)
+        return kaiser_resample(y_out, sr_in=self.internal_sr, sr_out=input_sr).to(torch.float32)
 
     def compute_resonator_matrix(
             self,
@@ -259,17 +290,7 @@ class DiffKS(nn.Module):
             A: Coefficient matrix [batch_size, n_samples, coeff_vector_size]
             x: Modified excitation signal [batch_size, n_samples]
         """
-        assert f0.dim() == 2, f"f0 must have 2 dimensions, got shape {f0.shape}"
-        assert loop_coefficients.dim() == 3, f"loop_coefficients must have 3 dimensions, got shape {loop_coefficients.shape}"
-
         batch_size, n_samples = f0.shape
-        assert loop_coefficients.size(
-            0) == batch_size, f"Batch size mismatch: f0 has {batch_size}, loop_coefficients has {loop_coefficients.size(0)}"
-        assert loop_coefficients.size(
-            1) == n_samples, f"Sample count mismatch: f0 has {n_samples}, loop_coefficients has {loop_coefficients.size(1)}"
-        assert loop_coefficients.size(
-            2) == self.loop_n_coefficients, f"Coefficient count mismatch: expected {self.loop_n_coefficients}, got {loop_coefficients.size(2)}"
-        assert input.size(1) == n_samples, f"Input sample count mismatch: expected {n_samples}, got {input.size(1)}"
 
         x = input
         b = loop_coefficients  # [batch_size, n_samples, loop_n_coefficients]
@@ -277,15 +298,31 @@ class DiffKS(nn.Module):
         # Calculate phase adjustment
         omega = 2 * torch.pi / f0  # [batch_size, n_samples]
         coeff_range = torch.arange(self.loop_n_coefficients, device=self.device).view(1, 1, -1)
-        zs = torch.exp(1j * omega.view(batch_size, n_samples, 1)) ** -coeff_range
-        p_a = -torch.angle(torch.sum(b * zs, dim=-1)) / omega
+
+        if self.device == torch.device("mps"):
+            cos_k = torch.cos(omega.unsqueeze(-1) * coeff_range)
+            sin_k = torch.sin(omega.unsqueeze(-1) * coeff_range)
+            real_sum = (b * cos_k).sum(dim=-1)
+            imag_sum = -(b * sin_k).sum(dim=-1)
+            phase = torch.atan2(imag_sum, real_sum)
+            p_a = -phase / omega
+        else:
+            zs = torch.exp(1j * omega.view(batch_size, n_samples, 1)) ** -coeff_range
+            p_a = -torch.angle(torch.sum(b * zs, dim=-1)) / omega
+
         f0_corrected = f0 - (1 + p_a)
 
-        z_l = torch.floor(f0_corrected).long()  # [batch_size, n_samples]
-        alfa = f0_corrected - z_l  # [batch_size, n_samples]
+        max_int_delay = self.coeff_vector_size - self.num_active_indexes
 
-        max_delay_idx = z_l + self.num_active_indexes - 1
-        assert torch.all(max_delay_idx < self.coeff_vector_size), "Delay index exceeds the buffer size"
+        needs_clamp = (f0_corrected < 0.0) | (f0_corrected > max_int_delay - 1e-6)
+        f0_corrected = f0_corrected.clamp_(min=0.0, max=max_int_delay - 1e-6)
+
+        if torch.any(needs_clamp):
+            print("[KS] some delays were clamped to the valid range "
+                  f"[0, {max_int_delay - 1e-6:g}]")
+
+        z_l = torch.floor(f0_corrected).to(dtype=torch.long)  # [B, N] int64
+        alfa = f0_corrected - z_l  # [B, N] 0 ≤ α < 1
 
         A = torch.zeros((batch_size, n_samples, self.coeff_vector_size), device=self.device, dtype=self._dtype)
 
@@ -357,8 +394,8 @@ class DiffKS(nn.Module):
 
     def get_constrained_exc_coefficients(
             self,
-            exc_b: Optional[torch.Tensor] = None  # [B, F, exc_order+1]
-    ) -> torch.Tensor:  # [B, F, exc_order]
+            exc_b: Optional[torch.Tensor] = None  # [B, samples, exc_order+1]
+    ) -> torch.Tensor:  # [B, samples, exc_order]
         """
         The first slot of *exc_b* is interpreted as a raw gain term (``exc_g``).
         After a sigmoid, that gain scales every AR coefficient, while the implicit
@@ -366,35 +403,41 @@ class DiffKS(nn.Module):
         """
         raw = exc_b if exc_b is not None else self.exc_coefficients  # [B,F,O+1]
 
-        exc_g_raw = raw[..., :1]  # shape [B, F, 1]  –– gain parameter
-        exc_a_raw = raw[..., 1:]  # shape [B, F, O]  –– AR coeffs
+        exc_g_raw = raw[..., :1]  # shape [B, samples, 1]  –– gain parameter
+        exc_b_raw = raw[..., 1:]  # shape [B, samples, exc_order]  –– AR coeffs
 
         exc_g = torch.sigmoid(exc_g_raw)  # (0‥1)
-        exc_a = torch.sigmoid(exc_a_raw) * exc_g  # (0‥exc_g)
 
-        return exc_a  # [B, F, exc_order]
+        exc_b = torch.sigmoid(exc_b_raw)  # (0‥exc_g)
+        sum_exc = exc_b.sum(dim=-1, keepdim=True)
+        exc_b = (exc_b / sum_exc)
+
+        return exc_b * exc_g
 
     def get_gain(self,
-                 l_g : torch.Tensor = None,): # [batches, loop_n_frames, 1]
-        return torch.sigmoid(l_g if l_g is not None else self.loop_gain)
+                 l_g : torch.Tensor): # [batches, samples, 1]
+        return torch.sigmoid(l_g)
 
     def get_constrained_l_coefficients(self,
-                                          l_b : Optional[torch.Tensor] = None,  # [batches, loop_n_frames, loop_n_coefficients]
-                                          l_g : Optional[torch.Tensor] = None,  # [batches, loop_n_frames, 1]
+                                          l_b : torch.Tensor,  # [batches, samples, loop_n_coefficients]
+                                          l_g : torch.Tensor,  # [batches, samples, 1]
                                           ) -> torch.Tensor:
-        sigmoid_b = torch.sigmoid(l_b if l_b is not None else self.loop_coefficients)
+        sigmoid_b = torch.sigmoid(l_b)
         sum_b = sigmoid_b.sum(dim=-1, keepdim=True)
-        return (sigmoid_b / sum_b) * (self.get_gain(l_g if l_g is not None else None))
+        result = (sigmoid_b / sum_b) * (self.get_gain(l_g))
+        return result.to(self.device)
 
     def get_upsampled_parameters(
             self,
             f0: torch.Tensor, # [batches, f_0_frames,]
             num_samples: int,
             l_b: Optional[torch.Tensor] = None, # [batches, loop_n_frames, loop_n_coefficients]
+            l_g: Optional[torch.Tensor] = None, # [batches, loop_n_frames, 1]
             exc_b: Optional[torch.Tensor] = None, # [batches, exc_n_frames, exc_order]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
         loop_b_frames_ = l_b if l_b is not None else self.loop_coefficients
+        loop_g_frames = l_g if l_g is not None else self.loop_gain
         exc_b_frames_ = exc_b if exc_b is not None else self.exc_coefficients
 
         batch_size = f0.size(0)
@@ -409,15 +452,17 @@ class DiffKS(nn.Module):
 
         if self.loop_n_frames == 1:
             loop_b_i = loop_b_frames_.repeat(1, num_samples, 1)
+            loop_g_i = loop_g_frames.repeat(1, num_samples, 1)
         else:
             loop_b_i = spline_upsample(loop_b_frames_.to(dtype=self._dtype), num_samples)
+            loop_g_i = spline_upsample(loop_g_frames.to(dtype=self._dtype), num_samples)
 
         if self.exc_n_frames == 1:
             exc_b_i = exc_b_frames_.repeat(1, exc_length_n, 1)
         else:
             exc_b_i = spline_upsample(exc_b_frames_.to(dtype=self._dtype), exc_length_n)
 
-        return f0_i, loop_b_i, exc_b_i
+        return f0_i.to(self.device), loop_b_i.to(self.device), loop_g_i.to(self.device), exc_b_i.to(self.device)
 
     def get_inverse_filtered_signal(self):
         return self.ks_inverse_signal
@@ -439,8 +484,15 @@ class DiffKS(nn.Module):
 
         # numerator / denominator,  mask the diagonals that would be “0/0”
         num = diff.unsqueeze(-2)  # (B,N,1,L+1)
+
+        mask = self.lagrange_mask.to(alfa.device)
         denom = self.lagrange_denom.to(alfa.device)  # (L+1,L+1)
-        kernel = torch.where(self.lagrange_mask, num, 1.) / denom  # (B,N,L+1,L+1)
+
+        safe_denom = torch.where(mask, denom, 1.) + 1e-6
+
+        kernel = torch.where(mask, num, 1.) / safe_denom  # (B,N,L+1,L+1)
 
         # Π over the last axis → per‑sample kernel length L+1
-        return kernel.prod(-1)  # (B,N,L+1)
+        kernel = kernel.prod(-1)  # (B,N,L+1)
+
+        return kernel
