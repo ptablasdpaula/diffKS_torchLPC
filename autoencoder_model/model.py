@@ -167,7 +167,7 @@ class AE_KarplusModel(nn.Module):
             exc_n_frames = exc_n_frames,
             interp_type = interpolation_type, # Only linear remains stable for NNs
             use_double_precision = True if get_device() != torch.device('mps') else False,
-            min_f0_hz= E2_HZ,
+            min_f0_hz= E2_HZ - 10,
         )
 
         for p in self.decoder.parameters():

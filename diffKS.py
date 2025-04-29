@@ -312,11 +312,17 @@ class DiffKS(nn.Module):
 
         f0_corrected = f0 - (1 + p_a)
 
-        z_l = torch.floor(f0_corrected).long()  # [batch_size, n_samples]
-        alfa = f0_corrected - z_l  # [batch_size, n_samples]
+        max_int_delay = self.coeff_vector_size - self.num_active_indexes
 
-        max_delay_idx = z_l + self.num_active_indexes - 1
-        assert torch.all(max_delay_idx < self.coeff_vector_size), "Delay index exceeds the buffer size"
+        needs_clamp = (f0_corrected < 0.0) | (f0_corrected > max_int_delay - 1e-6)
+        f0_corrected = f0_corrected.clamp_(min=0.0, max=max_int_delay - 1e-6)
+
+        if torch.any(needs_clamp):
+            print("[KS] some delays were clamped to the valid range "
+                  f"[0, {max_int_delay - 1e-6:g}]")
+
+        z_l = torch.floor(f0_corrected).to(dtype=torch.long)  # [B, N] int64
+        alfa = f0_corrected - z_l  # [B, N] 0 ≤ α < 1
 
         A = torch.zeros((batch_size, n_samples, self.coeff_vector_size), device=self.device, dtype=self._dtype)
 
