@@ -11,7 +11,6 @@ import penn
 from utils.helpers import get_device
 from paths import NSYNTH_DIR, NSYNTH_PREPROCESSED_DIR
 import argparse
-import librosa
 
 # --------------------------
 # Globals
@@ -102,62 +101,9 @@ def fcnf0pp_pitch(batch: torch.Tensor,
 
     return torch.cat(pitches, dim=0)  # (B, F)
 
-def centre_clip(x, clip_ratio=0.3):
-    thr = clip_ratio * x.abs().max(dim=-1, keepdim=True).values
-    return torch.where(x >  thr, x - thr,
-           torch.where(x < -thr, x + thr, torch.zeros_like(x)))
-
 @torch.no_grad()
 def autocorrelation_pitch() -> torch.Tensor:
     pass
-
-# --------------------------
-# Function to count number of onsets using librosa
-# --------------------------
-def count_onsets(
-        x: torch.Tensor,          # (N,)  –1…1,  **on CPU**
-        sr: int = SAMPLE_RATE,
-        hop: int = HOP_SIZE,
-) -> int:
-    """
-    Return the number of onsets in `x` using librosa.onset.onset_detect.
-    """
-    y = x.cpu().numpy()                   # 1-D float64
-    o_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
-    onsets = librosa.onset.onset_detect(
-        onset_envelope=o_env,
-        sr=sr,
-        hop_length=hop,
-        backtrack=False,
-        units="frames",
-    )
-    return len(onsets)
-
-# --------------------------
-# Onset helpers
-# --------------------------
-def first_onset_offset(
-        x: torch.Tensor,          # (N,) –1…1  **on CPU**
-        sr: int = SAMPLE_RATE,
-        hop: int = HOP_SIZE,
-) -> int:
-    """
-    Return the sample index of the first onset in `x`.
-    If no onset is found, return 0.
-    """
-    y = x.cpu().numpy()
-    o_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
-    onsets = librosa.onset.onset_detect(
-        onset_envelope=o_env,
-        sr=sr,
-        hop_length=hop,
-        backtrack=False,
-        units="frames",
-    )
-    if len(onsets) == 0:
-        return 0
-    first_frame = int(onsets[0])
-    return first_frame * hop   # samples
 
 def midi_to_hz(midi : torch.Tensor) -> torch.Tensor:
     return 440 * 2 ** ((midi - 69) / 12)
@@ -186,34 +132,10 @@ def preprocess_nsynth(nsynth_root: str,
         keys = [k for k,m in meta_json.items()
                 if E2_MIDI <= m["pitch"] <= E6_MIDI
                 and (not families or m["instrument_family_str"] in families)
-                and (not sources or m["instrument_source_str"] in sources)]
+                and (not sources or m["instrument_source_str"] in sources)
+                and m.get("qualities", [0]*10)[8] == 0  # Remove tempo-synced notes
+                and m.get("qualities", [0]*10)[9] == 0] # Remove notes with reverberation
         if max_files: keys = keys[:max_files]
-
-        # 2) keep only clips that have *exactly one* onset
-        print("▶ Onset-filtering…")
-        onset_ok_keys, onset_bad_keys = [], []
-        for k in tqdm(keys):
-            wav_path = os.path.join(split_in, "audio", f"{k}.wav")
-            wav_t, sr = torchaudio.load(wav_path)           # (1, N)
-            assert sr == SAMPLE_RATE
-            offset = first_onset_offset(wav_t[0], sr=sr)
-            if offset > 0:
-                tail_len = SEGMENT_LENGTH - offset
-                wav_t = torch.cat([wav_t[:, offset:], torch.zeros(1, offset)], dim=-1)
-                wav_t = wav_t[:, :SEGMENT_LENGTH]  # in case original file was longer
-            n_onsets = count_onsets(wav_t[0])
-            if n_onsets == 1:
-                onset_ok_keys.append(k)
-            else:
-                onset_bad_keys.append((k, n_onsets))
-
-        # report & proceed
-        if onset_bad_keys:
-            print(f"Filtered {len(onset_bad_keys)} clips (0 or >1 onsets):")
-            for k, n in onset_bad_keys:
-                print(f"   {k:20s}  →  {n} onsets")
-
-        keys = onset_ok_keys      # the list used in the rest of the function
 
         split_out = os.path.join(out_dir, split, pitch_mode)
         os.makedirs(split_out, exist_ok=True)
@@ -239,7 +161,6 @@ def preprocess_nsynth(nsynth_root: str,
             if pitch_mode == "fcnf0":
                 pitch = fcnf0pp_pitch(audio_batch, interpolation_unvoiced=interpolation_unvoiced)
             elif pitch_mode == "autocorrelation":
-                #pitch = autocorrelation_pitch(audio_batch)
                 raise ValueError(f"{pitch_mode} not yet supported")
             elif pitch_mode == "meta":
                 pitch = midi_to_hz(torch.tensor([[meta_json[k]["pitch"]] * (SEGMENT_LENGTH // HOP_SIZE)

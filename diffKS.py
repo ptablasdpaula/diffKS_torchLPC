@@ -258,16 +258,14 @@ class DiffKS(nn.Module):
 
         if not direct:
             loop_inv = invert_lpc(x, A)
-            ks_inv_signal = invert_lpc(resize_tensor_dim(loop_inv, self.exc_length_n, 1), exc_b)
-            self.ks_inverse_signal = ks_inv_signal
-            exc_input = ks_inv_signal
-        else:
-            exc_input = resize_tensor_dim(x, self.exc_length_n, 1)
+            ks_inv_signal = self._windowed_lpc(loop_inv, exc_b, 'inverse')
+            self.ks_inv_signal = ks_inv_signal
 
-        self.exc_filter_out = sample_wise_lpc(exc_input, exc_b)
+        exc_filter_out = self._windowed_lpc(ks_inv_signal if not direct else x,
+                                            exc_b, 'forward')
+        self.exc_filter_out = exc_filter_out
 
-        y_out = sample_wise_lpc(resize_tensor_dim(self.exc_filter_out, n_samples, 1),
-                                A)
+        y_out = sample_wise_lpc(exc_filter_out, A)
 
         return kaiser_resample(y_out, sr_in=self.internal_sr, sr_out=input_sr).to(torch.float32)
 
@@ -391,6 +389,30 @@ class DiffKS(nn.Module):
             raise NotImplementedError(f"Interpolation type {self.interp_type} not implemented")
 
         return A, x
+
+    def _windowed_lpc(self,
+                      x : torch.Tensor, # [B, N],
+                      exc_b : torch.Tensor, # [B, N, O]
+                      operation: str, # inverse (invertLPC) or forward (sample_wise_LPC)
+                      ):
+        n_samples = x.size(1)
+        out = torch.zeros_like(x)
+        start_positions = [0, int(3 * self.internal_sr)]
+
+        for start in start_positions:
+            end = min(start + self.exc_length_n, n_samples)
+            seg = x[:, start:end]
+
+            if operation == 'inverse':
+                proc = invert_lpc(seg, exc_b)
+            elif operation == 'forward':
+                proc = sample_wise_lpc(seg, exc_b)
+            else:
+                raise ValueError(f"Unknown operation {operation}, use 'inverse' or 'forward'.")
+
+            out[:, start:end] = proc
+
+        return out
 
     def get_constrained_exc_coefficients(
             self,
