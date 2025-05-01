@@ -15,7 +15,7 @@ import pygad
 from third_party.auraloss.auraloss.freq import MultiResolutionSTFTLoss as MultiSTFT
 
 from diffKS import DiffKS
-from utils.helpers import (noise_burst, load_config, resize_tensor_dim,)
+from utils import (noise_burst, load_config, resize_tensor_dim, )
 
 _, _, _, gs = load_config()
 

@@ -2,11 +2,22 @@ import torch
 import torch.nn as nn
 import torchaudio.transforms as T
 
-from utils.helpers import get_device
-from third_party.ddsp_pytorch.ddsp.core import mlp, gru
+from utils import get_device
 from diffKS import DiffKS
 
-from autoencoder_model.preprocess import E2_HZ
+from data.preprocess import E2_HZ
+
+def mlp(in_size, hidden_size, n_layers):
+    channels = [in_size] + (n_layers) * [hidden_size]
+    net = []
+    for i in range(n_layers):
+        net.append(nn.Linear(channels[i], channels[i + 1]))
+        net.append(nn.LayerNorm(channels[i + 1]))
+        net.append(nn.LeakyReLU())
+    return nn.Sequential(*net)
+
+def gru(n_input, hidden_size):
+    return nn.GRU(n_input * hidden_size, hidden_size, batch_first=True)
 
 class ZEncoder(nn.Module):
     def __init__(self, input_keys=None):

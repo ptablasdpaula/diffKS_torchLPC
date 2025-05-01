@@ -1,5 +1,6 @@
 import json
 import torch
+import os
 
 def get_device():
     if torch.backends.mps.is_available():
@@ -9,10 +10,16 @@ def get_device():
     else:
         return torch.device("cpu")
 
-def load_config(config_path="config.json"):
-    """
-    Load configuration from a JSON file.
-    """
+def str2bool(x: str) -> bool:
+    return str(x).lower() in {"1", "true", "t", "yes", "y"}
+
+def midi_to_hz(midi : torch.Tensor) -> torch.Tensor:
+    return 440 * 2 ** ((midi - 69) / 12)
+
+def load_config():
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(project_root, "config.json")
+
     with open(config_path, "r") as f:
         config = json.load(f)
 
