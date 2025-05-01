@@ -8,9 +8,10 @@ import torchaudio
 from tqdm import tqdm
 from third_party.auraloss.auraloss.perceptual import FIRFilter
 import penn
-from utils.helpers import get_device
 from paths import NSYNTH_DIR, NSYNTH_PREPROCESSED_DIR
 import argparse
+
+from utils import get_device, midi_to_hz
 
 # --------------------------
 # Globals
@@ -104,9 +105,6 @@ def fcnf0pp_pitch(batch: torch.Tensor,
 @torch.no_grad()
 def autocorrelation_pitch() -> torch.Tensor:
     pass
-
-def midi_to_hz(midi : torch.Tensor) -> torch.Tensor:
-    return 440 * 2 ** ((midi - 69) / 12)
 
 # --------------------------
 # Preprocessing routine

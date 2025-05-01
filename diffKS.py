@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torchlpc import sample_wise_lpc
 import torchaudio.functional as TAF
 from torchcubicspline import natural_cubic_spline_coeffs, NaturalCubicSpline
-from utils.helpers import resize_tensor_dim, get_device
+from utils import get_device
 
 LAGRANGE_ORDER = 5
 

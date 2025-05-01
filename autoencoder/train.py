@@ -4,27 +4,43 @@ import soundfile as sf
 import torch, torch.optim as optim, wandb
 from third_party.auraloss.auraloss.freq import MultiResolutionSTFTLoss
 from torch.utils.data import DataLoader
-from utils.helpers import get_device
 from .model import AE_KarplusModel, MfccTimeDistributedRnnEncoder
-from .preprocess import NsynthDataset
 import argparse, os, json
 import multiprocessing as mp
 import psutil
 
 from paths import NSYNTH_PREPROCESSED_DIR
+from data.preprocess import NsynthDataset, a_weighted_loudness
+from utils import get_device, str2bool
 
-from autoencoder_model.preprocess import a_weighted_loudness, LoudnessDerivLoss
+from torch import nn
+
+class DerivDiffLoss(nn.Module):
+    """Loss comparing derivative differences between sequential data.
+
+    Calculates mean absolute difference between derivatives of two sequences.
+    Useful for audio, motion tracking, time series, or any sequential data
+    where rate of change matters more than absolute values.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self,
+                pred: torch.Tensor,  # [Batches, Frames]
+                target: torch.Tensor  # [Batches, Frames]
+                ) -> torch.Tensor:
+        d_pred = pred[:, 1:] - pred[:, :-1]  # (B, F-1)
+        d_target = target[:, 1:] - target[:, :-1]  # (B, F-1)
+
+        return torch.mean(torch.abs(d_pred - d_target))
 
 def load_loud_stats(ds_root, split="train", pitch_mode="meta", device="cpu"):
     stats_path = os.path.join(ds_root, split, pitch_mode, f"{split}_stats.json")
     with open(stats_path) as f:
         stats = json.load(f)
-    # turn into tensors on the right device
     return (torch.tensor(stats["mean"], device=device),
             torch.tensor(stats["std"],  device=device))
-
-def str2bool(x: str) -> bool:
-    return str(x).lower() in {"1", "true", "t", "yes", "y"}
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -71,7 +87,7 @@ def main():
         "learning_rate": args.learning_rate,
         "num_epochs": 200,
         "eval_interval": 1,
-        "save_dir": f"runs/ks_nsynth/{args.name}",
+        "save_dir": f"autoencoder/runs/{args.name}",
         "families": [f.strip() for f in args.families.split(",")],
         "sources": [s.strip() for s in args.sources.split(",")],
         "num_workers": args.num_workers,
@@ -96,7 +112,8 @@ def main():
         wandb_id = tmp_ckpt.get("wandb_id", None)
         print(f"[INFO] Found checkpoint – will resume run id {wandb_id}")
 
-    wandb_run = wandb.init(project="diffks-autoencoder", name=args.name,
+    autoencoder_dir = os.path.dirname(os.path.abspath(__file__))
+    wandb_run = wandb.init(project="diffks-autoencoder", name=args.name, dir=autoencoder_dir,
                            id=wandb_id, resume="allow", config=config)
     if wandb_id is None:
         wandb_id = wandb_run.id  # store for fresh runs
@@ -151,7 +168,7 @@ def main():
     mr_stft = MultiResolutionSTFTLoss(scale_invariance=True, perceptual_weighting=True,
                                       sample_rate=config["sample_rate"], device=device, )
 
-    loudness_loss = LoudnessDerivLoss().to(device)
+    derivDiff = DerivDiffLoss().to(device)
 
     # ─── Resume from checkpoint if requested ──────────────────────────────
     start_epoch, best_val_loss = 0, float('inf')
@@ -177,8 +194,8 @@ def main():
                 loud_hat = a_weighted_loudness(recon)
                 loud_hat = (loud_hat - mu) / std
 
-                temporal_loss = loudness_loss(loud.squeeze(2),
-                                              loud_hat.squeeze(1)) * config["loudness_loss_delta"]
+                temporal_loss = derivDiff(loud.squeeze(2),
+                                          loud_hat.squeeze(1)) * config["loudness_loss_delta"]
             else:
                 temporal_loss = 0.0
 

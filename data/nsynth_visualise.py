@@ -7,7 +7,6 @@ from paths import NSYNTH_PREPROCESSED_DIR
 SAMPLE_RATE = 16_000
 HOP_SIZE = 256  # must match preprocess
 
-
 def visualize(
         pre_dir: str,
         split: str = "test",

@@ -1,20 +1,20 @@
-from tqdm import tqdm
+import torch, torch.optim as optim, wandb
+from torch.utils.data import DataLoader
 import numpy as np
 import soundfile as sf
-import torch, torch.optim as optim, wandb
-from third_party.auraloss.auraloss.freq import MultiResolutionSTFTLoss
-from torch.utils.data import DataLoader
-from utils.helpers import get_device
-from .model import AE_KarplusModel, MfccTimeDistributedRnnEncoder
-from .preprocess import NsynthDataset, LoudnessDerivLoss, a_weighted_loudness
+from tqdm import tqdm
 import argparse, os
 import multiprocessing as mp
 import psutil
-
 import time
 
+from third_party.auraloss.auraloss.freq import MultiResolutionSTFTLoss
+
 from paths import NSYNTH_PREPROCESSED_DIR
-from autoencoder_model.train import load_loud_stats
+from .model import AE_KarplusModel, MfccTimeDistributedRnnEncoder
+from autoencoder.train import load_loud_stats
+from data.preprocess import NsynthDataset, LoudnessDerivLoss, a_weighted_loudness
+from utils import get_device
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -50,9 +50,9 @@ def main():
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
         "loudness_loss_delta": args.loudness_loss_delta,
-        "num_epochs": 200,
+        "num_epochs": 1,
         "eval_interval": 1,
-        "save_dir": "runs/ks_nsynth",
+        "save_dir": "autoencoder/runs",
         "families": [f.strip() for f in args.families.split(",")],
         "sources": [s.strip() for s in args.sources.split(",")],
         "num_workers": args.num_workers,
@@ -69,7 +69,8 @@ def main():
     print(f"Using device: {device}")
 
     # ─── wandb init ───────────────────────────────────────────── #
-    wandb.init(project="diffks-autoencoder", config=config)
+    autoencoder_dir = os.path.dirname(os.path.abspath(__file__))
+    wandb.init(project="diffks-autoencoder", config=config, dir=autoencoder_dir)
 
     # ─── overall timing setup ─────────────────────────────────── #
     total_iters = 0
