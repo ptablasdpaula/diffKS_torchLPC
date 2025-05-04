@@ -24,11 +24,19 @@ def kaiser_resample(x, sr_in: int, sr_out: int,
     beta     : Kaiser β; 14 ≈ >90 dB stop-band
     rolloff  : pass-band edge / Nyquist (DDSP uses 0.94759371674)
     """
-    return TAF.resample(x, sr_in, sr_out,
-                        lowpass_filter_width=width,
-                        rolloff=rolloff,
-                        resampling_method='sinc_interp_kaiser',
-                        beta=beta)
+    orig_dev = x.device
+    # if on MPS, do the actual resampling on CPU
+    if orig_dev.type == "mps":
+        x = x.cpu()
+    y = TAF.resample(
+        x, sr_in, sr_out,
+        lowpass_filter_width=width,
+        rolloff=rolloff,
+        resampling_method="sinc_interp_kaiser",
+        beta=beta
+    )
+    # move back to the original device only if we fell back
+    return y.to(orig_dev) if orig_dev.type == "mps" else y
 
 def spline_upsample(x: torch.Tensor,  # shape [B, Frames, D]
                     num_samples) -> torch.Tensor:  # shape [B, Samples, D]
@@ -126,14 +134,14 @@ class DiffKS(nn.Module):
         self.exc_order = exc_order
         self.exc_n_coefficients = exc_order + 1 # To account for exc_g
         self.exc_length_n = int (exc_length_s * internal_sr)
-        self.exc_coefficients = nn.Parameter(torch.rand(batch_size, self.exc_n_frames, self.exc_n_coefficients, dtype=self._dtype) * 1e-4)
+        self.exc_coefficients = nn.Parameter(torch.rand(batch_size, self.exc_n_frames, self.exc_n_coefficients, dtype=self._dtype))
 
         # ====== Loop Filter ============================
         self.loop_n_frames = loop_n_frames
         self.loop_order = loop_order
         self.loop_n_coefficients = loop_order + 1  # To account for DC coefficient
-        self.loop_coefficients = torch.rand(batch_size, self.loop_n_frames, self.loop_n_coefficients,
-                                                 dtype=self._dtype).uniform_(-2, 0)
+        self.loop_coefficients = nn.Parameter(torch.rand(batch_size, self.loop_n_frames, self.loop_n_coefficients,
+                                                 dtype=self._dtype).uniform_(-2, 0))
         self.loop_gain = nn.Parameter(torch.rand(batch_size, loop_n_frames, 1, dtype=self._dtype))
 
         # ====== Interpolation Settings ==================
@@ -204,6 +212,14 @@ class DiffKS(nn.Module):
     def set_loop_gain(self, value: torch.Tensor) -> None:
         self._prepare("loop_gain", value, inplace=True)
 
+    @torch.no_grad()
+    def reinit(self) -> None:
+        """Reset learnable tensors to their constructor defaults.
+        """
+        self.loop_coefficients.uniform_(-2, 0)
+        self.loop_gain.uniform_(0, 1)
+        self.exc_coefficients.uniform_(0, 1)
+
     @property
     def interp_type(self):
         return self._interp_type
@@ -237,6 +253,8 @@ class DiffKS(nn.Module):
         l_b = self._prepare("loop_coefficients", loop_coefficients)
         l_g = self._prepare("loop_gain", loop_gain)
         exc_b = self._prepare("exc_coefficients", exc_coefficients)
+
+        f0_frames = self.internal_sr / f0_frames # Convert from Hz to samples
 
         if input_sr != self.internal_sr:
             input = kaiser_resample(input, sr_in=input_sr, sr_out=self.internal_sr)
