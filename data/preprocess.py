@@ -202,10 +202,10 @@ class NsynthDataset(torch.utils.data.Dataset):
     def __init__(
             self,
             root:str,
-            split:str="train",
+            split:str="test",
             pitch_mode:str="meta",
-            families:List[str]|None=None,
-            sources:List[str]|None=None
+            families:List[str]|None="guitar",
+            sources:List[str]|None="acoustic"
             ):
         self.base = os.path.join(root, split, pitch_mode)
         self.meta = json.load(open(os.path.join(self.base, "metadata.json")))
