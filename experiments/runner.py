@@ -95,13 +95,10 @@ def main() -> None:
         tgt_dir = run_dir / "nsynth" / "target"; tgt_dir.mkdir(parents=True, exist_ok=True)
         pred_dir = run_dir / "nsynth" / "pred"; pred_dir.mkdir(parents=True, exist_ok=True)
 
-        for idx, (audio, pitch, loud) in enumerate(ns_loader, 1):
+        for idx, (audio, pitch, loud) in enumerate(tqdm(ns_loader, desc=f"{method}-NSynth", position=0, leave=True), 1):
             audio, pitch, loud = audio.to(dev), pitch.to(dev), loud.to(dev)
 
             if is_neural:
-
-                print (f"audio: {audio.shape}, pitch: {pitch.shape}, loud: {loud.shape}")
-
                 res = optimiser.infer((audio, pitch, loud))
             else:
                 agent = DiffKS(**CFG_DIFFKS).to(dev)
