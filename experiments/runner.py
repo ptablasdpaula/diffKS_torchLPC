@@ -34,8 +34,8 @@ CFG_DIFFKS = dict(
 SR = 16_000
 
 OPT_CFG: Dict[str, Dict] = {
-    "gradient": { "lr": 0.035, "max_steps": 2 },
-    "genetic" : { "population": 32, "parents": 16, "max_steps": 1 },
+    "gradient": { "lr": 0.035, "max_steps": 300 },
+    "genetic" : { "population": 32, "parents": 16, "max_steps": 300 },
     "autoencoder": { "checkpoint": AUTOENCODER_MODEL },
 }
 

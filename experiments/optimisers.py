@@ -127,12 +127,23 @@ class GeneticAlgorithmOptimiser(Optimiser):
 
         pbar = tqdm(total=self.cfg.get("max_steps", 200),
                     desc="GA", leave=False) if self.verbose else None
-        ga = pygad.GA(num_generations=self.cfg.get("max_steps", 200),
-                      sol_per_pop=self.cfg.get("population", 32),
-                      num_parents_mating=self.cfg.get("parents", 20),
-                      num_genes=num_genes, fitness_func=fitness,
-                      gene_type=np.float32,
-                      on_generation=lambda g: pbar.update(1) if pbar else None)
+
+        ga = pygad.GA(
+            num_generations=self.cfg.get("max_steps", 200),
+            sol_per_pop=self.cfg.get("population", 32),
+            num_parents_mating=self.cfg.get("parents", 18),  # Original used 18
+            num_genes=num_genes,
+            fitness_func=fitness,
+            gene_type=np.float32,
+            init_range_low=-1,
+            init_range_high=1,
+            keep_elitism=0,
+            random_mutation_min_val=-0.1,
+            random_mutation_max_val=0.1,
+            mutation_probability=0.5,
+            on_generation=lambda g: pbar.update(1) if pbar else None
+        )
+
         ga.run(); pbar.close() if pbar else None
 
         best_sol = ga.best_solution()[0]
@@ -143,6 +154,10 @@ class GeneticAlgorithmOptimiser(Optimiser):
                                input_sr=self.sample_rate, direct=self.direct,
                                loop_coefficients=loop_b, loop_gain=loop_g,
                                exc_coefficients=exc_b)
+
+            agent.loop_coefficients.data = loop_b
+            agent.loop_gain.data = loop_g
+            agent.exc_coefficients.data = exc_b
 
         losses = _compute_losses(self.metrics,
                                  final_pred.unsqueeze(1),
@@ -192,12 +207,10 @@ class AutoencoderInference(NeuralInference):
         super().__init__(cfg, device, metrics)
         self.sample_rate = cfg.get("sample_rate", 16_000)
 
-        # 1) load checkpoint on CPU
         ckpt_path = Path(cfg["checkpoint"]).expanduser()
         raw = torch.load(ckpt_path, map_location="cpu")
         state = raw.get("model_state_dict", raw)
 
-        # 3) build model with the correct batch_size
         from experiments.autoencoder.model import AE_KarplusModel, MfccTimeDistributedRnnEncoder
         defaults = dict(
             hidden_size        = 512,
