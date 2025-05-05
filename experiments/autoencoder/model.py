@@ -195,12 +195,12 @@ class AE_KarplusModel(nn.Module):
         hidden = self.out_mlp(hidden)
         return hidden.mean(dim=1, keepdim=True)  # Assuming you're using mean pooling
 
-    def forward(self, pitch, loudness, audio, audio_sr):
+    def forward(self, pitch, loudness, audio, audio_sr, return_parameters=False):
         """
         Forward pass of the neural Karplus-Strong model.
 
         Args:
-            pitch: Tensor of shape [batch_size, frames, 1] - MIDI pitch values
+            pitch: Tensor of shape [batch_size, frames, 1] - pitch values (f0)
             loudness: Tensor of shape [batch_size, frames, 1] - Loudness values
 
         Returns:
@@ -243,6 +243,9 @@ class AE_KarplusModel(nn.Module):
             self.loop_n_frames,
             1
         )
+
+        if return_parameters:
+            return self.decoder.get_constrained_l_coefficients(loop_coefficients, loop_gain), self.decoder.get_constrained_exc_coefficients(exc_coefficients)
 
         # Handle batch dimension for DiffKS
         outputs = []

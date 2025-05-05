@@ -245,14 +245,21 @@ class DiffKS(nn.Module):
                 loop_coefficients: Optional[torch.Tensor] = None,  # [batch_size, loop_n_frames, loop_n_coefficients]
                 loop_gain: Optional[torch.Tensor] = None,  # [batch_size, loop_n_frames, 1]
                 exc_coefficients: Optional[torch.Tensor] = None,  # [batch_size, exc_n_frames, exc_order]
+                constrain_coefficients: bool = True,
                 ) -> torch.Tensor:  # [batch_size, n_samples]
 
         assert f0_frames.dim() == 2, f"f0_frames must have 2 dimensions, got shape {f0_frames.shape}"
         assert input.dim() == 2, f"target must have 2 dimensions (batch, samples), got shape {input.shape}"
 
-        l_b = self._prepare("loop_coefficients", loop_coefficients)
-        l_g = self._prepare("loop_gain", loop_gain)
-        exc_b = self._prepare("exc_coefficients", exc_coefficients)
+
+        if constrain_coefficients:
+            l_b = self._prepare("loop_coefficients", loop_coefficients)
+            l_g = self._prepare("loop_gain", loop_gain)
+            exc_b = self._prepare("exc_coefficients", exc_coefficients)
+        else:
+            l_b = loop_coefficients
+            l_g = loop_gain
+            exc_b = exc_coefficients
 
         f0_frames = self.internal_sr / f0_frames # Convert from Hz to samples
 
@@ -266,9 +273,18 @@ class DiffKS(nn.Module):
             l_b=l_b, l_g=l_g, exc_b=exc_b
         )
 
-        l_b = self.get_constrained_l_coefficients(l_b=l_b, l_g=l_g)
+        if constrain_coefficients:
+            l_b = self.get_constrained_l_coefficients(l_b=l_b, l_g=l_g)
 
-        exc_b = self.get_constrained_exc_coefficients(exc_b=exc_b)
+            exc_b = self.get_constrained_exc_coefficients(exc_b=exc_b)
+        else:
+            # make sure interpolation didn't produce out of range values
+            l_b = l_b.clamp(min=0.0, max=1.0)
+            l_g = l_g.clamp(min=0.0, max=1.0)
+            exc_b = exc_b.clamp(min=0.0, max=1.0)
+
+            # Apply gain to the loop coefficients
+            l_b = l_b * l_g
 
         A, x = self.compute_resonator_matrix(f0=f0,
                                              loop_coefficients=l_b,

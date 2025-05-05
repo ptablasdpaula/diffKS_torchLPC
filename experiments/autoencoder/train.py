@@ -4,13 +4,14 @@ import soundfile as sf
 import torch, torch.optim as optim, wandb
 from third_party.auraloss.auraloss.freq import MultiResolutionSTFTLoss
 from torch.utils.data import DataLoader
-from .model import AE_KarplusModel, MfccTimeDistributedRnnEncoder
+from model import AE_KarplusModel, MfccTimeDistributedRnnEncoder
 import argparse, os, json
 import multiprocessing as mp
 import psutil
 
 from paths import NSYNTH_PREPROCESSED_DIR
 from data.preprocess import NsynthDataset, a_weighted_loudness
+from data.synthetic_generate import random_param_batch
 from utils import get_device, str2bool
 
 from torch import nn
@@ -71,6 +72,9 @@ def parse_args():
     p.add_argument("--pitch_mode", type=str, default=env("PITCH_MODE", "meta"))
     p.add_argument("--loudness_loss_delta", type=float, default=float(env("LOUDNESS_LOSS_DELTA", 0)))
 
+    p.add_argument("--parameter_loss", action="store_true",)
+    p.add_argument("--batches_per_epoch", type=int, default=int(env("BATCHES_PER_EPOCH", 100)))
+
     return p.parse_args()
 
 def main():
@@ -94,6 +98,8 @@ def main():
         "interpolation_type": args.interpolation_type,
         "pitch_mode": args.pitch_mode,
         "loudness_loss_delta": args.loudness_loss_delta,
+        "parameter_loss": args.parameter_loss,
+        "batches_per_epoch": args.batches_per_epoch,
     }
 
     print("\n▶Running with config:")
@@ -128,20 +134,30 @@ def main():
     print(f"Using save directory: {full_save_path}")
 
     # ─── Data ─────────────────────────────────────────────────────────────
-    dataset = NsynthDataset(root=NSYNTH_PREPROCESSED_DIR,
-                            split="train",
-                            pitch_mode=config["pitch_mode"],
-                            families=config["families"],
-                            sources=config["sources"], )
-
-    val_dataset = NsynthDataset(root=NSYNTH_PREPROCESSED_DIR,
-                                split="valid",
+    if not config["parameter_loss"]:
+        dataset = NsynthDataset(root=NSYNTH_PREPROCESSED_DIR,
+                                split="train",
                                 pitch_mode=config["pitch_mode"],
                                 families=config["families"],
                                 sources=config["sources"], )
 
-    train_loader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=True,
-                              drop_last=True, pin_memory=True if device.type != "mps" else False, num_workers=config["num_workers"])
+        train_loader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=True,
+                                  drop_last=True, pin_memory=True if device.type != "mps" else False,
+                                  num_workers=config["num_workers"])
+
+        train_gen = None
+    else:
+        dataset = None
+        train_loader = None
+        train_gen = torch.Generator(device=device).manual_seed(42)
+
+
+    val_dataset = NsynthDataset(root=NSYNTH_PREPROCESSED_DIR,
+                                split="test",
+                                pitch_mode=config["pitch_mode"],
+                                families=config["families"],
+                                sources=config["sources"], )
+
     val_loader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False,
                             drop_last=True, pin_memory=True if device.type != "mps" else False, num_workers=config["num_workers"])
 
@@ -180,32 +196,56 @@ def main():
         best_val_loss = ckpt.get("best_val_loss", best_val_loss)
         print(f"[RESUME] Starting at epoch {start_epoch} (best so far {best_val_loss:.4f})")
 
+
+    bpe = config["batches_per_epoch"] if config["parameter_loss"] else len(train_loader)
     # ───────────────────────── training epochs ───────────────────────────
     for epoch in range(start_epoch, config["num_epochs"]):
         model.train()
         t_loss = 0
-        for audio, pitch, loud in tqdm(train_loader, desc=f"[E{epoch:03d} train]"):
-            audio, pitch, loud = audio.to(device), pitch.to(device), loud.to(device)
-            recon = model(pitch=pitch, loudness=loud, audio=audio, audio_sr=config["sample_rate"])
+        if config["parameter_loss"]:
+            for _ in tqdm(range(bpe), desc=f"[E{epoch:03d} train]"):
+                # Generate random parameters
+                audio, pitch, loud, loop_coeffs, exc_coeffs = random_param_batch(
+                    model.decoder, config["batch_size"], generator=train_gen,
+                )
+                # Generate random audio
+                pred_loop_coeffs, pred_exc_coeffs = model(
+                    pitch=pitch, loudness=loud,
+                    audio=audio, audio_sr=config["sample_rate"],
+                    return_parameters=True
+                )
 
-            spectral_loss = mr_stft(recon.unsqueeze(1), audio.unsqueeze(1))
+                loss = torch.nn.functional.l1_loss(pred_loop_coeffs, loop_coeffs)
+                loss += torch.nn.functional.l1_loss(pred_exc_coeffs, exc_coeffs)
 
-            if use_temporal_loss:
-                loud_hat = a_weighted_loudness(recon)
-                loud_hat = (loud_hat - mu) / std
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                wandb.log({"train/loss": loss.item()})
+                t_loss += loss.item()
+        else:
+            for audio, pitch, loud in tqdm(train_loader, desc=f"[E{epoch:03d} train]"):
+                audio, pitch, loud = audio.to(device), pitch.to(device), loud.to(device)
+                recon = model(pitch=pitch, loudness=loud, audio=audio, audio_sr=config["sample_rate"])
 
-                temporal_loss = derivDiff(loud.squeeze(2),
-                                          loud_hat.squeeze(1)) * config["loudness_loss_delta"]
-            else:
-                temporal_loss = 0.0
+                spectral_loss = mr_stft(recon.unsqueeze(1), audio.unsqueeze(1))
 
-            loss = spectral_loss + temporal_loss
+                if use_temporal_loss:
+                    loud_hat = a_weighted_loudness(recon)
+                    loud_hat = (loud_hat - mu) / std
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            t_loss += loss.item()
-        t_loss /= len(train_loader)
+                    temporal_loss = derivDiff(loud.squeeze(2),
+                                              loud_hat.squeeze(1)) * config["loudness_loss_delta"]
+                else:
+                    temporal_loss = 0.0
+
+                loss = spectral_loss + temporal_loss
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                t_loss += loss.item()
+        t_loss /= bpe
 
         # ░░ VALID ░░ (every eval_interval)
         if epoch % config["eval_interval"] == 0:
