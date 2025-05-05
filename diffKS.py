@@ -277,7 +277,7 @@ class DiffKS(nn.Module):
         if not direct:
             loop_inv = invert_lpc(x, A)
             ks_inv_signal = self._windowed_lpc(loop_inv, exc_b, 'inverse')
-            self.ks_inv_signal = ks_inv_signal
+            self.ks_inverse_signal = ks_inv_signal.detach().clone()
 
         exc_filter_out = self._windowed_lpc(ks_inv_signal if not direct else x,
                                             exc_b, 'forward')
