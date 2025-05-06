@@ -73,7 +73,13 @@ def parse_args():
     p.add_argument("--pitch_mode", type=str, default=env("PITCH_MODE", "meta"))
     p.add_argument("--loudness_loss_delta", type=float, default=float(env("LOUDNESS_LOSS_DELTA", 0)))
 
-    p.add_argument("--parameter_loss", action="store_true",)
+    p.add_argument(
+        "--parameter_loss",
+        action="store_true",
+        default=str2bool(env("PARAMETER_LOSS", "false")),
+        help="Use parameter-loss training (overrides default if PARAMETER_LOSS env is set)"
+    )
+
     p.add_argument("--batches_per_epoch", type=int, default=int(env("BATCHES_PER_EPOCH", 100)))
 
     return p.parse_args()
@@ -195,10 +201,19 @@ def main():
     start_epoch, best_val_loss = 0, float('inf')
     if args.continue_from_checkpoint and os.path.exists(latest_ckpt):
         ckpt = torch.load(latest_ckpt, map_location=device)
+
+        # strip out the two analysis buffers so their old shapes don't conflict
+        sd = ckpt["model_state_dict"]
+        for key in list(sd):
+            if "ks_inverse_signal" in key or "excitation_filter_out" in key:
+                sd.pop(key)
+
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt.get("best_val_loss", best_val_loss)
+
         print(f"[RESUME] Starting at epoch {start_epoch} (best so far {best_val_loss:.4f})")
 
     bpe = config["batches_per_epoch"] if config["parameter_loss"] else len(train_loader)
@@ -214,6 +229,11 @@ def main():
                 audio, pitch, loud, loop_coeffs, exc_coeffs = random_param_batch(
                     model.decoder, config["batch_size"], generator=train_gen,
                 )
+
+                audio = audio.to(dtype=torch.float32, device=device)
+                pitch = pitch.to(dtype=torch.float32, device=device)
+                loud = loud.to(dtype=torch.float32, device=device)
+
                 # Generate random audio
                 pred_loop_coeffs, pred_exc_coeffs = model(
                     pitch=pitch, loudness=loud,
@@ -276,6 +296,10 @@ def main():
                         audio, pitch, loud, loop_c, exc_c = random_param_batch(
                             model.decoder, config["batch_size"], generator=train_gen,
                         )
+
+                        audio = audio.to(dtype=torch.float32, device=device)
+                        pitch = pitch.to(dtype=torch.float32, device=device)
+                        loud = loud.to(dtype=torch.float32, device=device)
 
                         pred_loop, pred_exc = model(pitch=pitch,
                                                     loudness=loud,
@@ -340,6 +364,11 @@ def main():
                         config["batch_size"],
                         generator=train_gen,
                     )
+
+                    audio = audio.to(dtype=torch.float32, device=device)
+                    pitch = pitch.to(dtype=torch.float32, device=device)
+                    loud = loud.to(dtype=torch.float32, device=device)
+
                     # get model reconstruction
                     rec = model(
                         pitch=pitch,

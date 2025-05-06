@@ -4,8 +4,6 @@ import torch
 from diffKS import DiffKS
 from data.preprocess import E2_HZ
 from utils import get_device, noise_burst, midi_to_hz
-from torch.utils.data import Dataset
-from paths import SYNTHETIC_DIR
 
 # ───────────────────────── configuration ──────────────────────────────────
 KS_CFG = dict(
@@ -80,7 +78,12 @@ def random_param_batch(agent: DiffKS, batch_size: int, generator: torch.Generato
 
         xs = torch.arange(n_points, device=agent.device)[None, :, None]
 
-        curves = torch.zeros((batch_size, n_points, n_coeffs), device=agent.device)
+        curves = torch.zeros(
+            (batch_size, n_points, n_coeffs),
+            device=agent.device,
+        dtype=start.dtype,
+        )
+
         left_idxs = xs < mid_x
         right_idxs = xs >= mid_x
 

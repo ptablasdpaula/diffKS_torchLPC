@@ -155,8 +155,8 @@ class DiffKS(nn.Module):
                              torch.where(self.lagrange_mask, self.lagrange_denom, 1))
 
         # ====== Analysis Buffers =======================
-        self.register_buffer("excitation_filter_out", torch.empty(batch_size, self.exc_length_n))
-        self.register_buffer("ks_inverse_signal", torch.zeros(batch_size, self.exc_length_n))
+        self.register_buffer("excitation_filter_out", torch.empty(batch_size, self.exc_length_n), persistent=False)
+        self.register_buffer("ks_inverse_signal", torch.zeros(batch_size, self.exc_length_n), persistent=False)
 
         # ====== METADATA table for inner shapes (no batch)
         self._param_meta: dict[str, Tuple[Tuple[int, ...], str]] = {
