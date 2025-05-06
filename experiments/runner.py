@@ -1,10 +1,10 @@
 # experiments/runner.py
 from __future__ import annotations
 import argparse, json
-import random
+import random, time
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -14,39 +14,40 @@ from tqdm import tqdm
 
 from data.synthetic_generate import random_param_batch
 from data.preprocess import NsynthDataset, E2_HZ, fcnf0pp_pitch
-from diffKS          import DiffKS
-from experiments.losses     import STFTLoss, parameter_loss_from_meta
+from diffKS import DiffKS
+from experiments.losses import STFTLoss
 from experiments.optimisers import OPTIMISER_REGISTRY, NeuralInference
-from paths           import NSYNTH_PREPROCESSED_DIR, DDSP_METAF0, DDSP_FCNF0
-from utils           import get_device
+from paths import NSYNTH_PREPROCESSED_DIR, DDSP_METAF0, DDSP_FCNF0
+from utils import get_device
 
 # ───────────────────────────── config ────────────────────────────
 CFG_DIFFKS = dict(
-    batch_size     = 1,
-    internal_sr    = 41_000,
-    min_f0_hz      = E2_HZ,
-    loop_order     = 2,
-    loop_n_frames  = 16,
-    exc_order      = 5,
-    exc_n_frames   = 25,
-    exc_length_s   = 0.025,
-    interp_type    = "linear",
+    batch_size=1,
+    internal_sr=41_000,
+    min_f0_hz=E2_HZ,
+    loop_order=2,
+    loop_n_frames=16,
+    exc_order=5,
+    exc_n_frames=25,
+    exc_length_s=0.025,
+    interp_type="linear",
 )
 SR = 16_000
 
 OPT_CFG: Dict[str, Dict] = {
-    "gradient": { "lr": 0.5, "max_steps": 1 },
-    "genetic" : { "population": 32, "parents": 16, "max_steps": 1, "seed": 42 },
-    "ae_meta": { "checkpoint": DDSP_METAF0 },
-    "ae_fcn": {"checkpoint": DDSP_FCNF0 },
-    "ae_sup": {"checkpoint": DDSP_METAF0 }, #TODO should be substituted with path for supervised checkpoint
+    "gradient": {"lr": 0.5, "max_steps": 1},
+    "genetic": {"population": 32, "parents": 16, "max_steps": 1, "seed": 42},
+    "ae_meta": {"checkpoint": DDSP_METAF0},
+    "ae_fcn": {"checkpoint": DDSP_FCNF0},
+    "ae_sup": {"checkpoint": DDSP_METAF0},  # TODO should be substituted with path for supervised checkpoint
 }
+
 
 # ───────────────────────────── main ──────────────────────────────
 def main() -> None:
     cli = argparse.ArgumentParser()
 
-    cli.add_argument("--device",  default=get_device(), choices=["cuda","cpu","mps"])
+    cli.add_argument("--device", default=get_device(), choices=["cuda", "cpu", "mps"])
     cli.add_argument("--methods", nargs="+", default=["gradient", "genetic", "ae_meta", "ae_fcn", "ae_sup"])
     cli.add_argument("--seed", type=int, default=42, help="global RNG seed")
     cli.add_argument("--demo", action="store_true")
@@ -54,9 +55,10 @@ def main() -> None:
     args = cli.parse_args()
 
     # ── Init globals ---------------------------------------------------
-    dev      = torch.device(args.device)
-    methods  = tuple(args.methods)
-    out_root = Path("experiments/results"); out_root.mkdir(parents=True, exist_ok=True)
+    dev = torch.device(args.device)
+    methods = tuple(args.methods)
+    out_root = Path("experiments/results")
+    out_root.mkdir(parents=True, exist_ok=True)
 
     # ── Init Random Seeds ----------------------------------------------
     random.seed(args.seed)
@@ -70,13 +72,13 @@ def main() -> None:
 
     # ── metrics --------------------------------------------------------
     stft = STFTLoss(SR).to(dev)
-    metrics = {"stft": lambda p,t: stft(p,t)}
+    metrics = {"stft": lambda p, t: stft(p, t)}
 
     # ----- DataLoaders -------------------------------------------------
     bs_infer = 8  # for AE
     bs_opt = 1  # for GD / GA
 
-    ns_meta_full  = NsynthDataset(root=NSYNTH_PREPROCESSED_DIR, pitch_mode="meta")
+    ns_meta_full = NsynthDataset(root=NSYNTH_PREPROCESSED_DIR, pitch_mode="meta")
     ns_fcn_full = NsynthDataset(root=NSYNTH_PREPROCESSED_DIR, pitch_mode="fcnf0")
 
     if args.demo:
@@ -108,7 +110,7 @@ def main() -> None:
                 audio, pitch, loud, true_loop, true_exc = random_param_batch(
                     self.diffks,
                     self.batch_size,
-                    generator = self.rand_gen,
+                    generator=self.rand_gen,
                 )
 
                 if self.requires_fcnf0:
@@ -124,11 +126,11 @@ def main() -> None:
 
     raw_syn_inf = lambda fcn: DataLoader(
         OnTheFlySynth(N_SYN_ITEMS, bs_infer, synth_agent_inf, requires_fcnf0=fcn),
-        batch_size = None
+        batch_size=None
     )
     raw_syn_opt = lambda fcn: DataLoader(
         OnTheFlySynth(N_SYN_ITEMS, bs_opt, synth_agent_opt, requires_fcnf0=fcn),
-        batch_size = None
+        batch_size=None
     )
 
     # wrap them in a dict keyed by pitch_mode
@@ -141,7 +143,8 @@ def main() -> None:
     for method in methods:
         print(f"\n=== {method.upper()} ===")
         optimiser = OPTIMISER_REGISTRY[method](OPT_CFG[method], dev, metrics)
-        run_dir   = out_root / method; run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = out_root / method
+        run_dir.mkdir(parents=True, exist_ok=True)
 
         is_neural = isinstance(optimiser, NeuralInference)
         requires_fcn = ("fcn" in method.lower())
@@ -154,10 +157,16 @@ def main() -> None:
             syn_loader = syn_opt["meta"]  # synthetic set with meta‑pitch
 
         bucket: Dict[str, List[float]] = defaultdict(list)
+        all_iteration_times = []
+        total_iterations = 0
+
+        method_start_time = time.time()
 
         # ───── 1. Nsynth reconstruction ─────────────────────
-        tgt_dir = run_dir / "nsynth" / "target"; tgt_dir.mkdir(parents=True, exist_ok=True)
-        pred_dir = run_dir / "nsynth" / "pred"; pred_dir.mkdir(parents=True, exist_ok=True)
+        tgt_dir = run_dir / "nsynth" / "target"
+        tgt_dir.mkdir(parents=True, exist_ok=True)
+        pred_dir = run_dir / "nsynth" / "pred"
+        pred_dir.mkdir(parents=True, exist_ok=True)
 
         for idx, (audio, pitch, loud) in enumerate(tqdm(ns_loader, desc=f"{method}-NSynth", position=0, leave=True), 1):
             audio, pitch, loud = audio.to(dev), pitch.to(dev), loud.to(dev)
@@ -168,6 +177,16 @@ def main() -> None:
                 agent = DiffKS(**CFG_DIFFKS).to(dev)
                 agent.reinit()
                 res = optimiser.optimise(agent, (audio, pitch.squeeze(-1)))
+
+                # Collect timing statistics from non-neural optimizers
+                if "total_time" in res:
+                    bucket["total_time"].append(res["total_time"])
+                if "avg_iteration_time" in res:
+                    bucket["avg_iteration_time"].append(res["avg_iteration_time"])
+                if "total_iterations" in res:
+                    total_iterations += res.get("total_iterations", 0)
+                if "iteration_times" in res:
+                    all_iteration_times.extend(res["iteration_times"])
 
             bucket["stft"].append(res["stft"])
 
@@ -184,9 +203,9 @@ def main() -> None:
                 )
 
         # ───── 2. parameter-loss benchmark ──────────────────
-        tgt_p = run_dir / "param" / "target";
+        tgt_p = run_dir / "param" / "target"
         tgt_p.mkdir(parents=True, exist_ok=True)
-        pred_p = run_dir / "param" / "pred";
+        pred_p = run_dir / "param" / "pred"
         pred_p.mkdir(parents=True, exist_ok=True)
 
         for idx, batch in enumerate(tqdm(syn_loader, desc=method + "-PARAM"), 1):
@@ -216,6 +235,17 @@ def main() -> None:
                 agent = DiffKS(**CFG_DIFFKS).to(dev)
                 agent.reinit()
                 out = optimiser.optimise(agent, (audio, pitch.squeeze(-1)))
+
+                # Collect timing statistics from non-neural optimizers
+                if "total_time" in out:
+                    bucket["total_time"].append(out["total_time"])
+                if "avg_iteration_time" in out:
+                    bucket["avg_iteration_time"].append(out["avg_iteration_time"])
+                if "total_iterations" in out:
+                    total_iterations += out.get("total_iterations", 0)
+                if "iteration_times" in out:
+                    all_iteration_times.extend(out["iteration_times"])
+
                 pred_loop = agent.get_constrained_l_coefficients(
                     agent.loop_coefficients,
                     agent.loop_gain
@@ -237,18 +267,57 @@ def main() -> None:
                 torchaudio.save((pred_p / f"{idx:05d}_{b}.wav").as_posix(),
                                 res["pred"][b].detach().unsqueeze(0).cpu(), SR)
 
-        # ───── 3. summary CSV ─────────────────────────────
+        # ───── 3. summary CSV ───────────────────────────── (FIXED INDENTATION)
         run_dir.mkdir(parents=True, exist_ok=True)
+
+        # Calculate total method time
+        method_total_time = time.time() - method_start_time
+        bucket["method_total_time"] = [method_total_time]
+
+        # For non-neural methods, store and print timing statistics
+        if not is_neural:
+            # Store average iteration time in the bucket
+            avg_iteration_time = np.mean(all_iteration_times) if all_iteration_times else 0
+            bucket["avg_iteration_time_overall"] = [avg_iteration_time]
+            bucket["total_iterations"] = [total_iterations]
+
+            # Calculate average optimization time
+            avg_total_time = np.mean(bucket["total_time"]) if bucket["total_time"] else 0
+
+            print(f"\n--- {method.upper()} Timing Stats ---")
+            print(f"Method total time: {method_total_time:.4f} seconds")
+            print(f"Average optimization time: {avg_total_time:.4f} seconds")
+            print(f"Average time per iteration: {avg_iteration_time:.6f} seconds")
+            print(f"Total iterations: {total_iterations}")
+
         df = pd.DataFrame([{"metric": k,
                             "mean": float(np.mean(v)),
                             "std": float(np.std(v))}
                            for k, v in bucket.items()])
         df.to_csv(run_dir / "summary.csv", index=False)
+
+        # Add timing data to JSON summary
+        summary_data = {k: {"mean": np.mean(v), "std": np.std(v)}
+                        for k, v in bucket.items()}
+
+        # Add method total time and detailed timing for non-neural methods
+        summary_data["method_execution"] = {
+            "total_time": method_total_time
+        }
+
+        if not is_neural:
+            summary_data["method_execution"].update({
+                "avg_iteration_time": avg_iteration_time,
+                "total_iterations": total_iterations,
+                "avg_optimization_time": avg_total_time
+            })
+
         with open(run_dir / "summary.json", "w") as f:
-            json.dump({k: {"mean": np.mean(v), "std": np.std(v)}
-                       for k, v in bucket.items()}, f, indent=2)
+            json.dump(summary_data, f, indent=2)
+
         print("✔ summary saved to", run_dir / "summary.csv")
     # ╰─────────────────────────────────────────────────────╯
+
 
 if __name__ == "__main__":
     main()

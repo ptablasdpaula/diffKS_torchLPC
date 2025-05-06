@@ -36,10 +36,41 @@ class Optimiser(ABC):
     def __init__(self, cfg, device, metrics):
         self.cfg, self.device, self.metrics = cfg, device, metrics
         self.verbose = cfg.get("verbose", True)
+        self.iteration_times = []
 
-    @abstractmethod
     def optimise(self, agent: nn.Module,
                  batch: Tuple[torch.Tensor, ...]) -> Dict[str, Any]:
+        """
+        Wrapper that adds timing measurements around the actual optimization.
+        The actual algorithm implementation should be in _optimise.
+        """
+        # Record total optimization time
+        total_start_time = time.time()
+
+        # Clear previous timing data
+        self.iteration_times = []
+
+        # Call the concrete implementation
+        result = self._optimise(agent, batch)
+
+        # Calculate total time
+        total_time = time.time() - total_start_time
+
+        # Add timing information to results
+        result["total_time"] = total_time
+        result["avg_iteration_time"] = np.mean(self.iteration_times) if self.iteration_times else 0
+        result["total_iterations"] = len(self.iteration_times)
+        result["iteration_times"] = self.iteration_times
+
+        return result
+
+    @abstractmethod
+    def _optimise(self, agent: nn.Module,
+                 batch: Tuple[torch.Tensor, ...]) -> Dict[str, Any]:
+        """
+        Concrete implementations should override this method.
+        This is where the actual optimization algorithm goes.
+        """
         ...
 
 class NeuralInference(ABC):
@@ -62,7 +93,7 @@ class GradientDescentOptimiser(Optimiser):
         self.direct      = cfg.get("direct", False)
         self.loss_fn     = metrics["stft"]
 
-    def optimise(self, agent, batch):
+    def _optimise(self, agent, batch):
         target, pitch = (t.to(self.device) for t in batch)
 
         opt = torch.optim.Adam(agent.parameters(), lr=self.cfg.get("lr", 0.035))
@@ -72,10 +103,15 @@ class GradientDescentOptimiser(Optimiser):
                                desc="GD", leave=False)) if self.verbose else range(self.cfg.get("max_steps", 500))
 
         for _ in iterator:
+            iter_start_time = time.time()
+
             pred = agent(f0_frames=pitch, input=target,
                          input_sr=self.sample_rate, direct=self.direct)
             loss = self.loss_fn(pred.unsqueeze(1), target.unsqueeze(1))
             opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
+
+            self.iteration_times.append(time.time() - iter_start_time)
+
             if loss.item() < best_loss:
                 best_loss, best_pred = loss.item(), pred.detach()
             if self.verbose:
@@ -109,7 +145,7 @@ class GeneticAlgorithmOptimiser(Optimiser):
             parts.append(arr); idx += size
         return tuple(parts)
 
-    def optimise(self, agent, batch):
+    def _optimise(self, agent, batch):
         target, pitch = (t.to(self.device) for t in batch)
 
         shapes = (agent.loop_coefficients.shape,
@@ -125,6 +161,25 @@ class GeneticAlgorithmOptimiser(Optimiser):
                              loop_coefficients=loop_b, loop_gain=loop_g,
                              exc_coefficients=exc_b)
                 return -float(self.loss_fn(pred.unsqueeze(1), target.unsqueeze(1)))
+
+        # Create a callback to track generation timing
+        def on_generation_callback(ga_instance):
+            # Time each generation/iteration
+            iter_end_time = time.time()
+
+            # Only record the time for generations after the first one
+            if hasattr(self, '_last_gen_time'):
+                self.iteration_times.append(iter_end_time - self._last_gen_time)
+
+            # Update the start time for the next generation
+            self._last_gen_time = iter_end_time
+
+            # Update progress bar if verbose
+            if pbar:
+                pbar.update(1)
+
+        # Set initial generation time
+        self._last_gen_time = time.time()
 
         pbar = tqdm(total=self.cfg.get("max_steps", 200),
                     desc="GA", leave=False) if self.verbose else None
@@ -142,11 +197,13 @@ class GeneticAlgorithmOptimiser(Optimiser):
             random_mutation_min_val=-0.1,
             random_mutation_max_val=0.1,
             mutation_probability=0.5,
-            on_generation=lambda g: pbar.update(1) if pbar else None,
-            random_seed = self.seed
+            on_generation=on_generation_callback,
+            random_seed=self.seed
         )
 
-        ga.run(); pbar.close() if pbar else None
+        ga.run()
+        if pbar:
+            pbar.close()
 
         best_sol = ga.best_solution()[0]
         loop_b, loop_g, exc_b = self._split(best_sol, shapes, self.device)
