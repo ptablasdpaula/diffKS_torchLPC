@@ -314,31 +314,11 @@ class AutoencoderInference(NeuralInference):
                               target.unsqueeze(1))
         }
 
-
-
-# ╭───────────────── 4. CNN Inference (placeholder) ───────────────╮
-class CNNInference(NeuralInference):
-    def __init__(self, cfg, device, metrics):
-        super().__init__(cfg, device, metrics)
-        self.net = cfg["model"]                      # supply from runner
-        self.net.to(device).eval()
-        self.device = device
-
-    def infer(self, batch):
-        target, pitch = (t.to(self.device) for t in batch)
-        with torch.no_grad():
-            pred = self.net(audio=target, pitch=pitch)
-        return {
-            "pred": pred.cpu(),
-            **_compute_losses(self.metrics,
-                              pred.unsqueeze(1),
-                              target.unsqueeze(1))
-        }
-
 # ───────────────────────── registry ──────────────────────────────
 OPTIMISER_REGISTRY = {
     "gradient"    : GradientDescentOptimiser,
     "genetic"     : GeneticAlgorithmOptimiser,
-    "autoencoder" : AutoencoderInference,
-    "cnn"         : CNNInference,
+    "ae_meta"     : AutoencoderInference,
+    "ae_fcn"      : AutoencoderInference,
+    "ae_sup"      : AutoencoderInference,
 }

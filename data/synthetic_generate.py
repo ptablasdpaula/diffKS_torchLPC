@@ -139,7 +139,7 @@ def random_param_batch(agent: DiffKS, batch_size: int, generator: torch.Generato
             constrain_coefficients=False,
         )
         # audio = torchaudio.functional.resample(audio, KS_CFG['internal_sr'], SR_OUT)
-        loud = a_weighted_loudness(audio).squeeze()
+        loud = a_weighted_loudness(audio).squeeze(1)
 
     pitch = pitch.expand(-1, loud.shape[1])
 
