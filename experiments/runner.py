@@ -17,7 +17,7 @@ from data.preprocess import NsynthDataset, E2_HZ, fcnf0pp_pitch
 from diffKS import DiffKS
 from experiments.losses import STFTLoss
 from experiments.optimisers import OPTIMISER_REGISTRY, NeuralInference
-from paths import NSYNTH_PREPROCESSED_DIR, DDSP_METAF0, DDSP_FCNF0
+from paths import NSYNTH_PREPROCESSED_DIR, DDSP_METAF0, DDSP_FCNF0, SUPERVISED
 from utils import get_device
 
 # ───────────────────────────── config ────────────────────────────
@@ -35,11 +35,11 @@ CFG_DIFFKS = dict(
 SR = 16_000
 
 OPT_CFG: Dict[str, Dict] = {
-    "gradient": {"lr": 0.5, "max_steps": 1},
-    "genetic": {"population": 32, "parents": 16, "max_steps": 1, "seed": 42},
+    "gradient": {"lr": 0.5, "max_steps": 600},
+    "genetic": {"population": 32, "parents": 16, "max_steps": 600, "seed": 42},
     "ae_meta": {"checkpoint": DDSP_METAF0},
     "ae_fcn": {"checkpoint": DDSP_FCNF0},
-    "ae_sup": {"checkpoint": DDSP_METAF0},  # TODO should be substituted with path for supervised checkpoint
+    "ae_sup": {"checkpoint": SUPERVISED},
 }
 
 
