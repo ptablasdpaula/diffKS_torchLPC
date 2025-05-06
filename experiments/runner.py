@@ -1,6 +1,7 @@
 # experiments/runner.py
 from __future__ import annotations
 import argparse, json
+import random
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -34,8 +35,8 @@ CFG_DIFFKS = dict(
 SR = 16_000
 
 OPT_CFG: Dict[str, Dict] = {
-    "gradient": { "lr": 0.035, "max_steps": 300 },
-    "genetic" : { "population": 32, "parents": 16, "max_steps": 300 },
+    "gradient": { "lr": 0.5, "max_steps": 600 },
+    "genetic" : { "population": 32, "parents": 16, "max_steps": 600, "seed": 42 },
     "autoencoder": { "checkpoint": AUTOENCODER_MODEL },
 }
 
@@ -53,15 +54,27 @@ def main() -> None:
 
     cli.add_argument("--device",  default=get_device(), choices=["cuda","cpu","mps"])
     cli.add_argument("--methods", nargs="+", default=["gradient", "genetic", "autoencoder"]) # Work out how CNN will look
+    cli.add_argument("--seed", type=int, default=42, help="global RNG seed")
     cli.add_argument("--demo", action="store_true")
 
     args = cli.parse_args()
 
+    # ── Init globals ---------------------------------------------------
     dev      = torch.device(args.device)
     methods  = tuple(args.methods)
     out_root = Path("experiments/results"); out_root.mkdir(parents=True, exist_ok=True)
 
-    # ── metrics ---------------------------------------------------
+    # ── Init Random Seeds ----------------------------------------------
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.benchmark = False
+
+    # ── metrics --------------------------------------------------------
     stft = STFTLoss(SR).to(dev)
     metrics = {"stft": lambda p,t: stft(p,t)}
 

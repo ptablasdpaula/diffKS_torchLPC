@@ -98,6 +98,7 @@ class GeneticAlgorithmOptimiser(Optimiser):
         self.sample_rate = cfg.get("sample_rate", 16_000)
         self.direct      = cfg.get("direct", False)
         self.loss_fn     = metrics["stft"]
+        self.seed        = cfg.get("seed", 42)
 
     @staticmethod
     def _split(sol: np.ndarray, shapes: List[Tuple[int, ...]], device) -> Tuple[torch.Tensor, ...]:
@@ -141,7 +142,8 @@ class GeneticAlgorithmOptimiser(Optimiser):
             random_mutation_min_val=-0.1,
             random_mutation_max_val=0.1,
             mutation_probability=0.5,
-            on_generation=lambda g: pbar.update(1) if pbar else None
+            on_generation=lambda g: pbar.update(1) if pbar else None,
+            random_seed = self.seed
         )
 
         ga.run(); pbar.close() if pbar else None
