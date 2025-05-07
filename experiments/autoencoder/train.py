@@ -96,7 +96,7 @@ def main():
         "ks_sample_rate": 41000,
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
-        "num_epochs": 200,
+        "num_epochs": 2000,
         "eval_interval": 1,
         "save_dir": f"autoencoder/runs/{args.name}",
         "families": [f.strip() for f in args.families.split(",")],

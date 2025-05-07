@@ -18,7 +18,7 @@ from utils import (noise_burst, resize_tensor_dim, )
 
 hp = {
     "learning_rate": 0.05,
-    "max_epochs": 5,
+    "max_epochs": 500,
     "use_A_weighing": True
 }
 

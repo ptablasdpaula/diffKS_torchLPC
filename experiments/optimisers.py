@@ -16,6 +16,37 @@ from torch import nn
 from tqdm import tqdm
 import pygad
 
+import cProfile
+import pstats
+from pstats import SortKey
+import functools
+import os
+
+# Add a decorator for optional profiling
+def profile_if_enabled(func):
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        if getattr(self, 'enable_profiling', False):
+            profiler = cProfile.Profile()
+            profiler.enable()
+            result = func(self, *args, **kwargs)
+            profiler.disable()
+
+            # Create directory if it doesn't exist
+            os.makedirs('profiling', exist_ok=True)
+            # Save profiling data
+            stats = pstats.Stats(profiler)
+            stats.sort_stats(SortKey.CUMULATIVE)
+            profiler_output = f"profiling/{self.__class__.__name__}_{id(self)}.prof"
+            stats.dump_stats(profiler_output)
+            print(f"Saved detailed profiling to {profiler_output}")
+
+            return result
+        else:
+            return func(self, *args, **kwargs)
+
+    return wrapper
+
 # ───────────────────────── loss utility ─────────────────────────
 def _compute_losses(metrics: Dict[str, Callable],
                     pred: torch.Tensor, target: torch.Tensor,
@@ -23,13 +54,14 @@ def _compute_losses(metrics: Dict[str, Callable],
     out = {}
     for name, fn in metrics.items():
         if name == "param":
-            out[name] = float(fn(agent).cpu())
+            out[name] = fn(agent)
         else:
-            out[name] = float(fn(pred, target).mean().cpu())
+            out[name] = fn(pred, target)
     return out
 
 
 # ╭──────────────── base classes – different signatures ──────────╮
+# Enhance the Optimiser base class
 class Optimiser(ABC):
     """Search‑type strategies (gradient, genetic…)."""
 
@@ -37,7 +69,18 @@ class Optimiser(ABC):
         self.cfg, self.device, self.metrics = cfg, device, metrics
         self.verbose = cfg.get("verbose", True)
         self.iteration_times = []
+        self.enable_profiling = cfg.get("profile", True)
 
+        # Detailed operation timing
+        self.operation_timings = {
+            "forward_pass": [],
+            "loss_computation": [],
+            "backward_pass": [],
+            "parameter_update": [],
+            "other": []
+        }
+
+    @profile_if_enabled
     def optimise(self, agent: nn.Module,
                  batch: Tuple[torch.Tensor, ...]) -> Dict[str, Any]:
         """
@@ -49,6 +92,8 @@ class Optimiser(ABC):
 
         # Clear previous timing data
         self.iteration_times = []
+        for key in self.operation_timings:
+            self.operation_timings[key] = []
 
         # Call the concrete implementation
         result = self._optimise(agent, batch)
@@ -62,11 +107,25 @@ class Optimiser(ABC):
         result["total_iterations"] = len(self.iteration_times)
         result["iteration_times"] = self.iteration_times
 
+        # Add detailed operation timing
+        if any(self.operation_timings.values()):
+            result["operation_timings"] = {
+                op: {
+                    "total": sum(times),
+                    "mean": np.mean(times) if times else 0,
+                    "percent": (sum(times) / total_time) * 100 if times else 0,
+                    "max": max(times) if times else 0,
+                    "min": min(times) if times else 0
+                }
+                for op, times in self.operation_timings.items()
+                if times
+            }
+
         return result
 
     @abstractmethod
     def _optimise(self, agent: nn.Module,
-                 batch: Tuple[torch.Tensor, ...]) -> Dict[str, Any]:
+                  batch: Tuple[torch.Tensor, ...]) -> Dict[str, Any]:
         """
         Concrete implementations should override this method.
         This is where the actual optimization algorithm goes.
@@ -85,13 +144,12 @@ class NeuralInference(ABC):
 # ╰───────────────────────────────────────────────────────────────╯
 
 
-# ╭───────────────── 1. Gradient Descent ─────────────────────────╮
 class GradientDescentOptimiser(Optimiser):
     def __init__(self, cfg, device, metrics):
         super().__init__(cfg, device, metrics)
         self.sample_rate = cfg.get("sample_rate", 16_000)
-        self.direct      = cfg.get("direct", False)
-        self.loss_fn     = metrics["stft"]
+        self.direct = cfg.get("direct", False)
+        self.loss_fn = metrics["stft"]
 
     def _optimise(self, agent, batch):
         target, pitch = (t.to(self.device) for t in batch)
@@ -105,21 +163,53 @@ class GradientDescentOptimiser(Optimiser):
         for _ in iterator:
             iter_start_time = time.time()
 
+            # Time forward pass
+            t0 = time.time()
             pred = agent(f0_frames=pitch, input=target,
                          input_sr=self.sample_rate, direct=self.direct)
+            t1 = time.time()
+            self.operation_timings["forward_pass"].append(t1 - t0)
+
+            # Time loss computation
+            t0 = t1
             loss = self.loss_fn(pred.unsqueeze(1), target.unsqueeze(1))
-            opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
+            t1 = time.time()
+            self.operation_timings["loss_computation"].append(t1 - t0)
 
-            self.iteration_times.append(time.time() - iter_start_time)
+            # Time backward pass
+            t0 = t1
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            t1 = time.time()
+            self.operation_timings["backward_pass"].append(t1 - t0)
 
-            if loss.item() < best_loss:
-                best_loss, best_pred = loss.item(), pred.detach()
+            # Time parameter update
+            t0 = t1
+            opt.step()
+            t1 = time.time()
+            self.operation_timings["parameter_update"].append(t1 - t0)
+
+            # Calculate other time
+            iter_time = time.time() - iter_start_time
+            self.iteration_times.append(iter_time)
+
+            # Calculate "other" time (difference between total and sum of parts)
+            parts_time = sum([
+                self.operation_timings["forward_pass"][-1],
+                self.operation_timings["loss_computation"][-1],
+                self.operation_timings["backward_pass"][-1],
+                self.operation_timings["parameter_update"][-1]
+            ])
+            self.operation_timings["other"].append(iter_time - parts_time)
+
+            if loss < best_loss or best_loss == math.inf:
+                best_loss, best_pred = loss, pred.detach()
             if self.verbose:
                 tq.set_postfix(loss=f"{best_loss:.4f}")
 
         final_pred = best_pred if best_pred is not None else pred.detach()
         return {
-            "pred": final_pred.cpu(),
+            "pred": final_pred,
             **_compute_losses(self.metrics,
                               final_pred.unsqueeze(1),
                               target.unsqueeze(1),
@@ -222,7 +312,7 @@ class GeneticAlgorithmOptimiser(Optimiser):
                                  final_pred.unsqueeze(1),
                                  target.unsqueeze(1))
         losses["stft"] = -ga.best_solution()[1]
-        return {"pred": final_pred.cpu(), **losses}
+        return {"pred": final_pred, **losses}
 
 def inspect_checkpoint(path):
     ckpt = torch.load(path, map_location="cpu")

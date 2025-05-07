@@ -18,7 +18,8 @@ from diffKS import DiffKS
 from experiments.losses import STFTLoss
 from experiments.optimisers import OPTIMISER_REGISTRY, NeuralInference
 from paths import NSYNTH_PREPROCESSED_DIR, DDSP_METAF0, DDSP_FCNF0, SUPERVISED
-from utils import get_device
+from utils import get_device, str2bool
+import os
 
 # ───────────────────────────── config ────────────────────────────
 CFG_DIFFKS = dict(
@@ -30,12 +31,13 @@ CFG_DIFFKS = dict(
     exc_order=5,
     exc_n_frames=25,
     exc_length_s=0.025,
+    use_double_precision=False,
     interp_type="linear",
 )
 SR = 16_000
 
 OPT_CFG: Dict[str, Dict] = {
-    "gradient": {"lr": 0.5, "max_steps": 600},
+    "gradient": {"lr": 0.5, "max_steps": 1},
     "genetic": {"population": 32, "parents": 16, "max_steps": 600, "seed": 42},
     "ae_meta": {"checkpoint": DDSP_METAF0},
     "ae_fcn": {"checkpoint": DDSP_FCNF0},
@@ -46,19 +48,31 @@ OPT_CFG: Dict[str, Dict] = {
 # ───────────────────────────── main ──────────────────────────────
 def main() -> None:
     cli = argparse.ArgumentParser()
+    env = os.environ.get
 
-    cli.add_argument("--device", default=get_device(), choices=["cuda", "cpu", "mps"])
-    cli.add_argument("--methods", nargs="+", default=["gradient", "genetic", "ae_meta", "ae_fcn", "ae_sup"])
-    cli.add_argument("--seed", type=int, default=42, help="global RNG seed")
-    cli.add_argument("--demo", action="store_true")
+    # Get methods from environment or use default
+    methods_env = env("METHODS", "gradient,genetic,ae_meta,ae_fcn,ae_sup")
+    default_methods = methods_env.split(",") if methods_env else ["gradient", "genetic", "ae_meta", "ae_fcn", "ae_sup"]
+
+    cli.add_argument("--device", default=env("DEVICE", get_device()),
+                     choices=["cuda", "cpu", "mps"])
+    cli.add_argument("--methods", nargs="+", default=default_methods)
+    cli.add_argument("--seed", type=int, default=int(env("SEED", "42")),
+                     help="global RNG seed")
+    cli.add_argument("--demo", action="store_true",
+                     default=str2bool(env("DEMO", "false")))
 
     args = cli.parse_args()
+
+    print("✔ Chosen CLI arguments:", args)
 
     # ── Init globals ---------------------------------------------------
     dev = torch.device(args.device)
     methods = tuple(args.methods)
     out_root = Path("experiments/results")
     out_root.mkdir(parents=True, exist_ok=True)
+
+    print(f"✔ Using device: {dev}")
 
     # ── Init Random Seeds ----------------------------------------------
     random.seed(args.seed)
@@ -89,8 +103,8 @@ def main() -> None:
         ns_meta_ds = ns_meta_full
         ns_fcn_ds = ns_fcn_full
 
-    meta_inf = DataLoader(ns_meta_ds, batch_size=bs_infer, shuffle=False)
-    fcn_inf = DataLoader(ns_fcn_ds, batch_size=bs_infer, shuffle=False)
+    meta_inf = DataLoader(ns_meta_ds, batch_size=bs_infer, shuffle=False, drop_last=True)
+    fcn_inf = DataLoader(ns_fcn_ds, batch_size=bs_infer, shuffle=False, drop_last=True)
     meta_opt = DataLoader(ns_meta_ds, batch_size=bs_opt, shuffle=False)
 
     class OnTheFlySynth(torch.utils.data.IterableDataset):
@@ -162,6 +176,8 @@ def main() -> None:
 
         method_start_time = time.time()
 
+        audio_save_queue = []
+
         # ───── 1. Nsynth reconstruction ─────────────────────
         tgt_dir = run_dir / "nsynth" / "target"
         tgt_dir.mkdir(parents=True, exist_ok=True)
@@ -188,19 +204,20 @@ def main() -> None:
                 if "iteration_times" in res:
                     all_iteration_times.extend(res["iteration_times"])
 
-            bucket["stft"].append(res["stft"])
+            if isinstance(res["stft"], torch.Tensor):
+                bucket["stft"].append(res["stft"].detach().cpu().item())
+            else:
+                bucket["stft"].append(res["stft"])
 
             for b in range(audio.size(0)):
-                torchaudio.save(
+                audio_save_queue.append((
                     (tgt_dir / f"{idx:05d}_{b}.wav").as_posix(),
-                    audio[b].unsqueeze(0).cpu(),  # (1, N)
-                    SR
-                )
-                torchaudio.save(
+                    audio[b].unsqueeze(0)
+                ))
+                audio_save_queue.append((
                     (pred_dir / f"{idx:05d}_{b}.wav").as_posix(),
-                    res["pred"][b].unsqueeze(0),  # (1, N)
-                    SR
-                )
+                    res["pred"][b].unsqueeze(0)
+                ))
 
         # ───── 2. parameter-loss benchmark ──────────────────
         tgt_p = run_dir / "param" / "target"
@@ -258,17 +275,31 @@ def main() -> None:
             # compute simple L1 parameter loss
             pl_loop = torch.nn.functional.l1_loss(pred_loop, true_loop)
             pl_exc = torch.nn.functional.l1_loss(pred_exc, true_exc)
-            bucket["param"].append((pl_loop + pl_exc).item())
 
-            # save target + predicted audio
+            # Where you collect parameter loss (around line 254):
+            param_loss = (pl_loop + pl_exc)
+
+            if isinstance(param_loss, torch.Tensor):
+                bucket["param"].append(param_loss.detach().cpu().item())
+            else:
+                bucket["param"].append(param_loss)
+
             for b in range(audio.size(0)):
-                torchaudio.save((tgt_p / f"{idx:05d}_{b}.wav").as_posix(),
-                                audio[b].unsqueeze(0).cpu(), SR)
-                torchaudio.save((pred_p / f"{idx:05d}_{b}.wav").as_posix(),
-                                res["pred"][b].detach().unsqueeze(0).cpu(), SR)
+                audio_save_queue.append((
+                    (tgt_dir / f"{idx:05d}_{b}.wav").as_posix(),
+                    audio[b].unsqueeze(0)
+                ))
+                audio_save_queue.append((
+                    (pred_dir / f"{idx:05d}_{b}.wav").as_posix(),
+                    res["pred"][b].unsqueeze(0)
+                ))
 
         # ───── 3. summary CSV ───────────────────────────── (FIXED INDENTATION)
         run_dir.mkdir(parents=True, exist_ok=True)
+
+        print("Saving audio files...")
+        for path, tensor in tqdm(audio_save_queue, desc="Saving audio"):
+            torchaudio.save(path, tensor.cpu(), SR)
 
         # Calculate total method time
         method_total_time = time.time() - method_start_time
