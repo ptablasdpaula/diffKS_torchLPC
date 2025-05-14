@@ -17,18 +17,18 @@ from diffKS import DiffKS
 from utils import (noise_burst, resize_tensor_dim, )
 
 hp = {
-    "learning_rate": 0.05,
-    "max_epochs": 5,
+    "learning_rate": 0.1,
+    "max_epochs": 200,
     "use_A_weighing": True
 }
 
 mp = {
     "exc_order": 5,
     "exc_n_frames": 25,
-    "exc_length_s": 0.035,
+    "exc_length_s": 0.025,
     "loop_order": 2,
     "loop_n_frames": 16,
-    "f0_hz": 138.59,
+    "f0_hz": 311.13,
     "min_f0_hz": 82.41,  # MIDI E2 in Hz
     "burst_width_s": 0.03,
     "use_double_precision": False,
@@ -37,7 +37,7 @@ mp = {
 }
 
 idp = {
-    "use_in_domain": True,
+    "use_in_domain": False,
     "gain": 1
 }
 
@@ -207,10 +207,36 @@ def composite_plot(fig_path: str,
     row = 0
     for name, wav in signals.items():
         ax = axs[row * 2]
-        ax.plot(wav.squeeze().detach().cpu().numpy())
+        wav_np = wav.squeeze().detach().cpu().numpy()
+
+        # Choose color based on signal name
+        if name in ["Target", "Optimised", "Inverse filtered"]:
+            color = 'orange'
+        else:
+            color = None  # Use default color
+
+        # Apply time scaling based on signal type
+        if name == "Inverse filtered":
+            # Inverse filtered: 0 to 0.025s
+            wav_samples = len(wav_np)
+            t = np.linspace(0, mp['exc_length_s'], wav_samples)
+            ax.plot(t, wav_np, color=color)
+            ax.set_xlabel("seconds")
+            ax.set_xlim(0, mp['exc_length_s'])
+        elif name in ["Target", "Optimised"]:
+            # Target and Optimised: 0 to 4 seconds
+            wav_samples = len(wav_np)
+            t = np.linspace(0, gs['length_audio_s'], wav_samples)
+            ax.plot(t, wav_np, color=color)
+            ax.set_xlabel("seconds")
+            ax.set_xlim(0, gs['length_audio_s'])
+        else:
+            # Other signals: keep sample index
+            ax.plot(wav_np, color=color)
+            ax.set_xlabel("samples")
+
         ax.set_title(name)
-        ax.set_xlabel("samples")
-        ax.grid(True)
+        ax.grid(False)
         row += 1
 
     # --------------------------------------------------------------------- #
@@ -229,14 +255,14 @@ def composite_plot(fig_path: str,
                 ax.plot(traj_np[:, k], label=f"{name}-b{k}")
         ax.set_title(name)
         ax.set_xlabel("samples")
-        ax.grid(True)
+        ax.grid(False)
         ax.legend(loc="upper right")
         row += 1
 
     plt.tight_layout()
     plt.savefig(fig_path)
-    plt.close(fig)
-
+    # Keep plot window open
+    plt.show()
 
 # -----------------------------------------------------------------------------
 # Training loop - Simplified version
@@ -413,7 +439,7 @@ def main() -> None:
         exc_after_opt = model_opt.exc_filter_out.cpu()
 
         # Only take the first exc_length_s of each signal
-        signals_dict["Inverse filtered"] = inv_sig[:, :exc_len_samples]
+        signals_dict["Inverse filtered"] = inv_sig[:, 225:exc_len_samples + 225]
         signals_dict["After excitation"] = exc_after_opt[:, :exc_len_samples]
 
     # --- Coefficient comparison: in‑domain vs optimised ----------------------
@@ -455,7 +481,6 @@ def main() -> None:
 
     plt.tight_layout()
     plt.savefig('analysis/in_domain_vs_excitation.png')
-    plt.close(fig)
 
     # add reference coeffs if in‑domain ----------------------------------------
     if use_in_domain:

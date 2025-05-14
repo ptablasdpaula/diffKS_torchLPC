@@ -20,6 +20,8 @@ from experiments.optimisers import OPTIMISER_REGISTRY, NeuralInference
 from paths import NSYNTH_PREPROCESSED_DIR, DDSP_METAF0, DDSP_FCNF0, SUPERVISED
 from utils import get_device
 
+import os
+
 # ───────────────────────────── config ────────────────────────────
 CFG_DIFFKS = dict(
     batch_size=1,
@@ -35,8 +37,8 @@ CFG_DIFFKS = dict(
 SR = 16_000
 
 OPT_CFG: Dict[str, Dict] = {
-    "gradient": {"lr": 0.5, "max_steps": 600},
-    "genetic": {"population": 32, "parents": 16, "max_steps": 600, "seed": 42},
+    "gradient": {"lr": 0.5, "max_steps": 250},
+    "genetic": {"population": 20, "parents": 10, "max_steps": 250, "seed": 42},
     "ae_meta": {"checkpoint": DDSP_METAF0},
     "ae_fcn": {"checkpoint": DDSP_FCNF0},
     "ae_sup": {"checkpoint": SUPERVISED},
@@ -46,11 +48,17 @@ OPT_CFG: Dict[str, Dict] = {
 # ───────────────────────────── main ──────────────────────────────
 def main() -> None:
     cli = argparse.ArgumentParser()
+    env = os.environ.get  # Shorthand for environment variable access
 
     cli.add_argument("--device", default=get_device(), choices=["cuda", "cpu", "mps"])
-    cli.add_argument("--methods", nargs="+", default=["gradient", "genetic", "ae_meta", "ae_fcn", "ae_sup"])
-    cli.add_argument("--seed", type=int, default=42, help="global RNG seed")
+    cli.add_argument("--methods", nargs="+",
+                     default=env("METHODS", "gradient,genetic,ae_meta,ae_fcn,ae_sup").split(","))
+    cli.add_argument("--seed", type=int, default=int(env("SEED", "42")), help="global RNG seed")
     cli.add_argument("--demo", action="store_true")
+    cli.add_argument("--dataset", default=env("DATASET", "both"), choices=["nsynth", "synthetic", "both"],
+                     help="Select which dataset(s) to use for training")
+    cli.add_argument("--file_index", type=int, default=int(env("FILE_INDEX", "-1")) if env("FILE_INDEX") else None,
+                     help="Index (0-5) of the specific file to use from the selected 6 files, or None to use all 6")
 
     args = cli.parse_args()
 
@@ -81,17 +89,82 @@ def main() -> None:
     ns_meta_full = NsynthDataset(root=NSYNTH_PREPROCESSED_DIR, pitch_mode="meta")
     ns_fcn_full = NsynthDataset(root=NSYNTH_PREPROCESSED_DIR, pitch_mode="fcnf0")
 
+    def get_specific_files_indices(dataset, filenames):
+        """
+        Get indices of specific files in the dataset.
+
+        Args:
+            dataset: The dataset to search through
+            filenames: List of specific filenames to find
+
+        Returns:
+            List of indices corresponding to the requested files
+        """
+        indices = []
+
+        for i in range(len(dataset)):
+            current_filename = dataset.get_filename(i)
+
+            # Check if this is one of our target files
+            if current_filename in filenames:
+                indices.append(i)
+                print(f"Found file: {current_filename} at index {i}")
+
+        print(f"Found {len(indices)}/{len(filenames)} specified files")
+
+        # If we couldn't find all files, use some default indices
+        if len(indices) < len(filenames):
+            missing = len(filenames) - len(indices)
+            print(f"Adding {missing} default indices to complete the set")
+
+            # Add some evenly spaced indices that we haven't already selected
+            all_indices = set(range(len(dataset)))
+            available = list(all_indices - set(indices))
+            step = max(1, len(available) // (missing + 1))
+            extra_indices = [available[i * step] for i in range(missing)]
+
+            indices.extend(extra_indices)
+
+        return indices
+
+
     if args.demo:
-        idxs = list(range(8))
+        idxs = list(range(17))
         ns_meta_ds = Subset(ns_meta_full, idxs)
         ns_fcn_ds = Subset(ns_fcn_full, idxs)
     else:
         ns_meta_ds = ns_meta_full
         ns_fcn_ds = ns_fcn_full
 
-    meta_inf = DataLoader(ns_meta_ds, batch_size=bs_infer, shuffle=False)
-    fcn_inf = DataLoader(ns_fcn_ds, batch_size=bs_infer, shuffle=False)
-    meta_opt = DataLoader(ns_meta_ds, batch_size=bs_opt, shuffle=False)
+    # Define your list of specific files (without .pt extension)
+    specific_files = [
+        "guitar_acoustic_010-047-100",
+        "guitar_acoustic_010-055-075",
+        "guitar_acoustic_010-063-025",
+        "guitar_acoustic_010-070-127",
+        "guitar_acoustic_021-087-100",
+        "guitar_acoustic_021-067-025"
+    ]
+
+    # Call the function with your dataset and file list
+    specific_indices = get_specific_files_indices(ns_meta_full, specific_files)
+
+    # Then, after getting specific_indices:
+    if args.file_index is not None:
+        if 0 <= args.file_index < len(specific_indices):
+            print(
+                f"Using only file at index {args.file_index} ({ns_meta_full.get_filename(specific_indices[args.file_index])})")
+            specific_indices = [specific_indices[args.file_index]]
+        else:
+            print(
+                f"Warning: file_index {args.file_index} out of range (0-{len(specific_indices) - 1}). Using all files.")
+
+    # Create a subset with those indices
+    ns_meta_unique_ds = Subset(ns_meta_full, specific_indices)
+
+    meta_inf = DataLoader(ns_meta_ds, batch_size=bs_infer, shuffle=False, drop_last=True)
+    fcn_inf = DataLoader(ns_fcn_ds, batch_size=bs_infer, shuffle=False, drop_last=True)
+    meta_opt = DataLoader(ns_meta_unique_ds, batch_size=bs_opt, shuffle=False, drop_last=True)
 
     class OnTheFlySynth(torch.utils.data.IterableDataset):
         def __init__(self,
@@ -118,18 +191,27 @@ def main() -> None:
 
                 yield audio, pitch, loud, true_loop, true_exc
 
-    N_SYN_ITEMS = len(ns_meta_ds)  # same count as Nsynth subset
+    # Modify the synthetic dataset size based on the method
+    N_SYN_ITEMS_FULL = len(ns_meta_ds)  # same count as Nsynth subset
+    N_SYN_ITEMS_SMALL = len(ns_meta_unique_ds)  # quarter size with unique pitches
+
+    print (f"N_SYN_ITEMS_SMALL contains {N_SYN_ITEMS_SMALL} items")
 
     # instead of one synth_agent with batch_size=1, make two:
     synth_agent_inf = DiffKS(**{**CFG_DIFFKS, "batch_size": bs_infer}).to(dev)
     synth_agent_opt = DiffKS(**{**CFG_DIFFKS, "batch_size": bs_opt}).to(dev)
 
+    # Calculate the number of batches needed to match NSynth dataset size
+    N_SYN_BATCHES_FULL = len(ns_meta_ds) // bs_infer  # Divide by batch size
+    N_SYN_BATCHES_SMALL = len(ns_meta_unique_ds) // bs_opt  # Divide by batch size
+
+    # Then, update the DataLoader creation for synthetic data
     raw_syn_inf = lambda fcn: DataLoader(
-        OnTheFlySynth(N_SYN_ITEMS, bs_infer, synth_agent_inf, requires_fcnf0=fcn),
+        OnTheFlySynth(N_SYN_BATCHES_FULL, bs_infer, synth_agent_inf, requires_fcnf0=fcn),
         batch_size=None
     )
     raw_syn_opt = lambda fcn: DataLoader(
-        OnTheFlySynth(N_SYN_ITEMS, bs_opt, synth_agent_opt, requires_fcnf0=fcn),
+        OnTheFlySynth(N_SYN_BATCHES_SMALL, bs_opt, synth_agent_opt, requires_fcnf0=fcn),
         batch_size=None
     )
 
@@ -163,109 +245,113 @@ def main() -> None:
         method_start_time = time.time()
 
         # ───── 1. Nsynth reconstruction ─────────────────────
-        tgt_dir = run_dir / "nsynth" / "target"
-        tgt_dir.mkdir(parents=True, exist_ok=True)
-        pred_dir = run_dir / "nsynth" / "pred"
-        pred_dir.mkdir(parents=True, exist_ok=True)
+        if args.dataset in ["nsynth", "both"]:
+            tgt_dir = run_dir / "nsynth" / "target"
+            tgt_dir.mkdir(parents=True, exist_ok=True)
+            pred_dir = run_dir / "nsynth" / "pred"
+            pred_dir.mkdir(parents=True, exist_ok=True)
 
-        for idx, (audio, pitch, loud) in enumerate(tqdm(ns_loader, desc=f"{method}-NSynth", position=0, leave=True), 1):
-            audio, pitch, loud = audio.to(dev), pitch.to(dev), loud.to(dev)
+            for idx, (audio, pitch, loud) in enumerate(tqdm(ns_loader, desc=f"{method}-NSynth", position=0, leave=True), 1):
+                audio, pitch, loud = audio.to(dev), pitch.to(dev), loud.to(dev)
 
-            if is_neural:
-                res = optimiser.infer((audio, pitch, loud))
-            else:
-                agent = DiffKS(**CFG_DIFFKS).to(dev)
-                agent.reinit()
-                res = optimiser.optimise(agent, (audio, pitch.squeeze(-1)))
+                if is_neural:
+                    res = optimiser.infer((audio, pitch, loud))
+                else:
+                    agent = DiffKS(**CFG_DIFFKS).to(dev)
+                    agent.reinit()
+                    res = optimiser.optimise(agent, (audio, pitch.squeeze(-1)))
 
-                # Collect timing statistics from non-neural optimizers
-                if "total_time" in res:
-                    bucket["total_time"].append(res["total_time"])
-                if "avg_iteration_time" in res:
-                    bucket["avg_iteration_time"].append(res["avg_iteration_time"])
-                if "total_iterations" in res:
-                    total_iterations += res.get("total_iterations", 0)
-                if "iteration_times" in res:
-                    all_iteration_times.extend(res["iteration_times"])
+                    # Collect timing statistics from non-neural optimizers
+                    if "total_time" in res:
+                        bucket["total_time"].append(res["total_time"])
+                    if "avg_iteration_time" in res:
+                        bucket["avg_iteration_time"].append(res["avg_iteration_time"])
+                    if "total_iterations" in res:
+                        total_iterations += res.get("total_iterations", 0)
+                    if "iteration_times" in res:
+                        all_iteration_times.extend(res["iteration_times"])
 
-            bucket["stft"].append(res["stft"])
+                bucket["stft"].append(float(res["stft"]) if isinstance(res["stft"], torch.Tensor) else res["stft"])
 
-            for b in range(audio.size(0)):
-                torchaudio.save(
-                    (tgt_dir / f"{idx:05d}_{b}.wav").as_posix(),
-                    audio[b].unsqueeze(0).cpu(),  # (1, N)
-                    SR
-                )
-                torchaudio.save(
-                    (pred_dir / f"{idx:05d}_{b}.wav").as_posix(),
-                    res["pred"][b].unsqueeze(0),  # (1, N)
-                    SR
-                )
+                file_prefix = f"file{args.file_index}_" if args.file_index is not None else ""
+                for b in range(audio.size(0)):
+                    torchaudio.save(
+                        (tgt_dir / f"{file_prefix}{idx:05d}_{b}.wav").as_posix(),
+                        audio[b].unsqueeze(0).cpu(),  # (1, N)
+                        SR
+                    )
+                    torchaudio.save(
+                        (pred_dir / f"{file_prefix}{idx:05d}_{b}.wav").as_posix(),
+                        res["pred"][b].unsqueeze(0),  # (1, N)
+                        SR
+                    )
 
         # ───── 2. parameter-loss benchmark ──────────────────
-        tgt_p = run_dir / "param" / "target"
-        tgt_p.mkdir(parents=True, exist_ok=True)
-        pred_p = run_dir / "param" / "pred"
-        pred_p.mkdir(parents=True, exist_ok=True)
+        if args.dataset in ["synthetic", "both"]:
+            tgt_p = run_dir / "param" / "target"
+            tgt_p.mkdir(parents=True, exist_ok=True)
+            pred_p = run_dir / "param" / "pred"
+            pred_p.mkdir(parents=True, exist_ok=True)
 
-        for idx, batch in enumerate(tqdm(syn_loader, desc=method + "-PARAM"), 1):
-            # OnTheFlySynth yields five items:
-            audio, pitch, loud, true_loop, true_exc = batch
-            audio, pitch, loud = audio.to(dev), pitch.to(dev), loud.to(dev)
-            true_loop = true_loop.to(dev)  # [B, loop_n_frames, order+1]
-            true_exc = true_exc.to(dev)  # [B, exc_n_frames, order+1]
+            for idx, batch in enumerate(tqdm(syn_loader, desc=method + "-PARAM"), 1):
+                # OnTheFlySynth yields five items:
+                audio, pitch, loud, true_loop, true_exc = batch
+                audio, pitch, loud = audio.to(dev), pitch.to(dev), loud.to(dev)
+                true_loop = true_loop.to(dev)  # [B, loop_n_frames, order+1]
+                true_exc = true_exc.to(dev)  # [B, exc_n_frames, order+1]
 
-            if is_neural:
-                net = optimiser.net
+                if is_neural:
+                    net = optimiser.net
 
-                pred_loop, pred_exc = net(
-                    pitch=pitch, loudness=loud,
-                    audio=audio, audio_sr=SR,
-                    return_parameters=True
-                )
+                    pred_loop, pred_exc = net(
+                        pitch=pitch, loudness=loud,
+                        audio=audio, audio_sr=SR,
+                        return_parameters=True
+                    )
 
-                pred_audio = net(
-                    pitch=pitch, loudness=loud,
-                    audio=audio, audio_sr=SR,
-                )
+                    pred_audio = net(
+                        pitch=pitch, loudness=loud,
+                        audio=audio, audio_sr=SR,
+                    )
 
-                res = {"pred": pred_audio.cpu()}
-            else:
-                # optimise from scratch for this one batch
-                agent = DiffKS(**CFG_DIFFKS).to(dev)
-                agent.reinit()
-                out = optimiser.optimise(agent, (audio, pitch.squeeze(-1)))
+                    res = {"pred": pred_audio.cpu()}
+                else:
+                    # optimise from scratch for this one batch
+                    agent = DiffKS(**CFG_DIFFKS).to(dev)
+                    agent.reinit()
+                    out = optimiser.optimise(agent, (audio, pitch.squeeze(-1)))
 
-                # Collect timing statistics from non-neural optimizers
-                if "total_time" in out:
-                    bucket["total_time"].append(out["total_time"])
-                if "avg_iteration_time" in out:
-                    bucket["avg_iteration_time"].append(out["avg_iteration_time"])
-                if "total_iterations" in out:
-                    total_iterations += out.get("total_iterations", 0)
-                if "iteration_times" in out:
-                    all_iteration_times.extend(out["iteration_times"])
+                    # Collect timing statistics from non-neural optimizers
+                    if "total_time" in out:
+                        bucket["total_time"].append(out["total_time"])
+                    if "avg_iteration_time" in out:
+                        bucket["avg_iteration_time"].append(out["avg_iteration_time"])
+                    if "total_iterations" in out:
+                        total_iterations += out.get("total_iterations", 0)
+                    if "iteration_times" in out:
+                        all_iteration_times.extend(out["iteration_times"])
 
-                pred_loop = agent.get_constrained_l_coefficients(
-                    agent.loop_coefficients,
-                    agent.loop_gain
-                ).detach()
-                pred_exc = agent.get_constrained_exc_coefficients(
-                    agent.exc_coefficients
-                ).detach()
-                res = {"pred": out["pred"]}
+                    pred_loop = agent.get_constrained_l_coefficients(
+                        agent.loop_coefficients,
+                        agent.loop_gain
+                    ).detach()
+                    pred_exc = agent.get_constrained_exc_coefficients(
+                        agent.exc_coefficients
+                    ).detach()
+                    res = {"pred": out["pred"]}
 
-            # compute simple L1 parameter loss
-            pl_loop = torch.nn.functional.l1_loss(pred_loop, true_loop)
-            pl_exc = torch.nn.functional.l1_loss(pred_exc, true_exc)
-            bucket["param"].append((pl_loop + pl_exc).item())
+                # compute simple L1 parameter loss
+                pl_loop = torch.nn.functional.l1_loss(pred_loop, true_loop)
+                pl_exc = torch.nn.functional.l1_loss(pred_exc, true_exc)
+                bucket["param"].append((pl_loop + pl_exc).item())
 
-            # save target + predicted audio
-            for b in range(audio.size(0)):
-                torchaudio.save((tgt_p / f"{idx:05d}_{b}.wav").as_posix(),
-                                audio[b].unsqueeze(0).cpu(), SR)
-                torchaudio.save((pred_p / f"{idx:05d}_{b}.wav").as_posix(),
-                                res["pred"][b].detach().unsqueeze(0).cpu(), SR)
+                # save target + predicted audio
+                file_prefix = f"file{args.file_index}_" if args.file_index is not None else ""
+                for b in range(audio.size(0)):
+                    torchaudio.save((tgt_p / f"{file_prefix}{idx:05d}_{b}.wav").as_posix(),
+                                    audio[b].unsqueeze(0).cpu(), SR)
+                    torchaudio.save((pred_p / f"{file_prefix}{idx:05d}_{b}.wav").as_posix(),
+                                    res["pred"][b].detach().unsqueeze(0).cpu(), SR)
 
         # ───── 3. summary CSV ───────────────────────────── (FIXED INDENTATION)
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -290,10 +376,16 @@ def main() -> None:
             print(f"Average time per iteration: {avg_iteration_time:.6f} seconds")
             print(f"Total iterations: {total_iterations}")
 
+        # Create file suffix based on dataset and file_index
+        file_suffix = f"_{args.dataset}" if args.dataset != "both" else ""
+        if args.file_index is not None:
+            file_suffix += f"_file{args.file_index}"
+
         df = pd.DataFrame([{"metric": k,
                             "mean": float(np.mean(v)),
                             "std": float(np.std(v))}
                            for k, v in bucket.items()])
+
         df.to_csv(run_dir / "summary.csv", index=False)
 
         # Add timing data to JSON summary
@@ -312,7 +404,10 @@ def main() -> None:
                 "avg_optimization_time": avg_total_time
             })
 
-        with open(run_dir / "summary.json", "w") as f:
+        # Save JSON with appropriate suffix
+        # Use this suffix in both the CSV and JSON output
+        df.to_csv(run_dir / f"summary{file_suffix}.csv", index=False)
+        with open(run_dir / f"summary{file_suffix}.json", "w") as f:
             json.dump(summary_data, f, indent=2)
 
         print("✔ summary saved to", run_dir / "summary.csv")

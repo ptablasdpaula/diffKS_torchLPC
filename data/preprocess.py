@@ -230,6 +230,9 @@ class NsynthDataset(torch.utils.data.Dataset):
 
         return itm["audio"], pitch, loud
 
+    def get_filename(self, idx):
+        return self.keys[idx]
+
 # --------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

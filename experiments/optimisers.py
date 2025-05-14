@@ -23,9 +23,9 @@ def _compute_losses(metrics: Dict[str, Callable],
     out = {}
     for name, fn in metrics.items():
         if name == "param":
-            out[name] = float(fn(agent).cpu())
+            out[name] = fn(agent)
         else:
-            out[name] = float(fn(pred, target).mean().cpu())
+            out[name] = fn(pred, target)
     return out
 
 
@@ -90,8 +90,10 @@ class GradientDescentOptimiser(Optimiser):
     def __init__(self, cfg, device, metrics):
         super().__init__(cfg, device, metrics)
         self.sample_rate = cfg.get("sample_rate", 16_000)
-        self.direct      = cfg.get("direct", False)
-        self.loss_fn     = metrics["stft"]
+        self.direct = cfg.get("direct", False)
+        self.loss_fn = metrics["stft"]
+        self.early_stop_threshold = cfg.get("early_stop_threshold", 0.0001)
+        self.early_stop_patience = cfg.get("early_stop_patience", 20)
 
     def _optimise(self, agent, batch):
         target, pitch = (t.to(self.device) for t in batch)
@@ -99,23 +101,43 @@ class GradientDescentOptimiser(Optimiser):
         opt = torch.optim.Adam(agent.parameters(), lr=self.cfg.get("lr", 0.035))
         best_loss, best_pred = math.inf, None
 
-        iterator = (tq := tqdm(range(self.cfg.get("max_steps", 500)),
-                               desc="GD", leave=False)) if self.verbose else range(self.cfg.get("max_steps", 500))
+        # Early stopping variables
+        non_improving_iterations = 0
 
-        for _ in iterator:
+        max_steps = self.cfg.get("max_steps", 500)
+        iterator = (tq := tqdm(range(max_steps), desc="GD", leave=False)) if self.verbose else range(max_steps)
+
+        for i in iterator:
             iter_start_time = time.time()
 
             pred = agent(f0_frames=pitch, input=target,
                          input_sr=self.sample_rate, direct=self.direct)
             loss = self.loss_fn(pred.unsqueeze(1), target.unsqueeze(1))
-            opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
+            opt.zero_grad(set_to_none=True);
+            loss.backward();
+            opt.step()
 
             self.iteration_times.append(time.time() - iter_start_time)
 
-            if loss.item() < best_loss:
-                best_loss, best_pred = loss.item(), pred.detach()
+            current_loss = loss.item()
+
+            # Check if loss improved by at least threshold
+            if best_loss - current_loss > self.early_stop_threshold:
+                best_loss = current_loss
+                best_pred = pred.detach()
+                non_improving_iterations = 0
+            else:
+                non_improving_iterations += 1
+
+            # Early stopping check
+            if non_improving_iterations >= self.early_stop_patience:
+                if self.verbose:
+                    tq.set_description(f"GD - Early stopped at iteration {i + 1}/{max_steps}")
+                break
+
             if self.verbose:
-                tq.set_postfix(loss=f"{best_loss:.4f}")
+                tq.set_postfix(loss=f"{best_loss:.4f}",
+                               patience=f"{non_improving_iterations}/{self.early_stop_patience}")
 
         final_pred = best_pred if best_pred is not None else pred.detach()
         return {
@@ -127,22 +149,29 @@ class GradientDescentOptimiser(Optimiser):
         }
 
 
-# ╭───────────────── 2. Genetic Algorithm ────────────────────────╮
 class GeneticAlgorithmOptimiser(Optimiser):
     def __init__(self, cfg, device, metrics):
         super().__init__(cfg, device, metrics)
         self.sample_rate = cfg.get("sample_rate", 16_000)
-        self.direct      = cfg.get("direct", False)
-        self.loss_fn     = metrics["stft"]
-        self.seed        = cfg.get("seed", 42)
+        self.direct = cfg.get("direct", False)
+        self.loss_fn = metrics["stft"]
+        self.seed = cfg.get("seed", 42)
+        self.early_stop_threshold = cfg.get("early_stop_threshold", 0.0001)
+        self.early_stop_patience = cfg.get("early_stop_patience", 20)
+
+        # Early stopping variables to be used by callback
+        self.best_fitness = -math.inf
+        self.non_improving_generations = 0
+        self.early_stopped = False
 
     @staticmethod
     def _split(sol: np.ndarray, shapes: List[Tuple[int, ...]], device) -> Tuple[torch.Tensor, ...]:
         idx, parts = 0, []
         for sh in shapes:
             size = int(np.prod(sh))
-            arr  = torch.tensor(sol[idx:idx+size].reshape(sh), device=device)
-            parts.append(arr); idx += size
+            arr = torch.tensor(sol[idx:idx + size].reshape(sh), device=device)
+            parts.append(arr);
+            idx += size
         return tuple(parts)
 
     def _optimise(self, agent, batch):
@@ -153,6 +182,11 @@ class GeneticAlgorithmOptimiser(Optimiser):
                   agent.exc_coefficients.shape)
         num_genes = sum(int(np.prod(s)) for s in shapes)
 
+        # Reset early stopping variables for this optimization run
+        self.best_fitness = -math.inf
+        self.non_improving_generations = 0
+        self.early_stopped = False
+
         def fitness(_, sol, __):
             loop_b, loop_g, exc_b = self._split(sol, shapes, self.device)
             with torch.no_grad():
@@ -162,7 +196,7 @@ class GeneticAlgorithmOptimiser(Optimiser):
                              exc_coefficients=exc_b)
                 return -float(self.loss_fn(pred.unsqueeze(1), target.unsqueeze(1)))
 
-        # Create a callback to track generation timing
+        # Create a callback to track generation timing and implement early stopping
         def on_generation_callback(ga_instance):
             # Time each generation/iteration
             iter_end_time = time.time()
@@ -174,20 +208,42 @@ class GeneticAlgorithmOptimiser(Optimiser):
             # Update the start time for the next generation
             self._last_gen_time = iter_end_time
 
+            # Get current best fitness
+            current_fitness = ga_instance.best_solution()[1]
+
+            # Check if fitness improved by at least threshold (negative because we're maximizing)
+            if current_fitness - self.best_fitness > self.early_stop_threshold:
+                self.best_fitness = current_fitness
+                self.non_improving_generations = 0
+            else:
+                self.non_improving_generations += 1
+
             # Update progress bar if verbose
             if pbar:
                 pbar.update(1)
+                pbar.set_postfix(
+                    fitness=f"{current_fitness:.4f}",
+                    patience=f"{self.non_improving_generations}/{self.early_stop_patience}"
+                )
+
+            # Early stopping check
+            if self.non_improving_generations >= self.early_stop_patience:
+                self.early_stopped = True
+                if pbar:
+                    pbar.set_description(
+                        f"GA - Early stopped at generation {ga_instance.generations_completed}/{ga_instance.num_generations}")
+                return "stop"
 
         # Set initial generation time
         self._last_gen_time = time.time()
 
-        pbar = tqdm(total=self.cfg.get("max_steps", 200),
-                    desc="GA", leave=False) if self.verbose else None
+        max_steps = self.cfg.get("max_steps", 200)
+        pbar = tqdm(total=max_steps, desc="GA", leave=False) if self.verbose else None
 
         ga = pygad.GA(
-            num_generations=self.cfg.get("max_steps", 200),
+            num_generations=max_steps,
             sol_per_pop=self.cfg.get("population", 32),
-            num_parents_mating=self.cfg.get("parents", 18),  # Original used 18
+            num_parents_mating=self.cfg.get("parents", 18),
             num_genes=num_genes,
             fitness_func=fitness,
             gene_type=np.float32,
@@ -198,7 +254,8 @@ class GeneticAlgorithmOptimiser(Optimiser):
             random_mutation_max_val=0.1,
             mutation_probability=0.5,
             on_generation=on_generation_callback,
-            random_seed=self.seed
+            random_seed=self.seed,
+            stop_criteria=["reach_0", "saturate_20"]  # Add stop criteria for PyGAD
         )
 
         ga.run()
@@ -222,6 +279,11 @@ class GeneticAlgorithmOptimiser(Optimiser):
                                  final_pred.unsqueeze(1),
                                  target.unsqueeze(1))
         losses["stft"] = -ga.best_solution()[1]
+
+        # Add early stopping information to results
+        losses["early_stopped"] = self.early_stopped
+        losses["stopped_at_generation"] = ga.generations_completed
+
         return {"pred": final_pred.cpu(), **losses}
 
 def inspect_checkpoint(path):
