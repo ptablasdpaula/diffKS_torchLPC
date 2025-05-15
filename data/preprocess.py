@@ -221,7 +221,7 @@ if __name__ == "__main__":
     env = os.environ.get
 
     parser.add_argument("--batch_size", type=int, default=int(env("BATCH_SIZE", 8)))
-    parser.add_argument("--split", type=str, default=env("SPLIT", "test"))
+    parser.add_argument("--split", type=str, default=env("SPLIT", "train, valid, test"))
 
     parser.add_argument("--families", type=str, default=env("FAMILIES", "guitar"),
                         help="comma-separated list, e.g. guitar,piano")

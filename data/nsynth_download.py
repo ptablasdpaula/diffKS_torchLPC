@@ -77,7 +77,7 @@ if __name__ == "__main__":
 
     logging.info(f"Starting NSynth dataset download and processing")
 
-    download_and_extract_nsynth(data_dir, splits=['test'])
+    download_and_extract_nsynth(data_dir, splits=['train, valid, test'])
 
     total_time = time.time() - start_time
     logging.info(f"Total processing time: {total_time:.2f} seconds ({total_time / 60:.2f} minutes)")
