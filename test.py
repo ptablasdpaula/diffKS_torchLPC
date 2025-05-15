@@ -317,7 +317,6 @@ def optimise_model(model: DiffKS,
     plt.grid(True);
     plt.tight_layout()
     plt.savefig("analysis/loss_curve.png")
-    plt.close()
 
 # -----------------------------------------------------------------------------
 # Entry‑point ------------------------------------------------------------------
@@ -517,8 +516,6 @@ def main() -> None:
         plt.grid(True)
         plt.tight_layout()
         plt.savefig("inverse_excitation_opt.png")
-        plt.close()
-
 
 if __name__ == "__main__":
     main()

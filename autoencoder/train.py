@@ -15,35 +15,6 @@ from data.preprocess import NsynthDataset, a_weighted_loudness
 from data.synthetic_generate import random_param_batch
 from utils import get_device, str2bool
 
-from torch import nn
-
-class DerivDiffLoss(nn.Module):
-    """Loss comparing derivative differences between sequential data.
-
-    Calculates mean absolute difference between derivatives of two sequences.
-    Useful for audio, motion tracking, time series, or any sequential data
-    where rate of change matters more than absolute values.
-    """
-
-    def __init__(self):
-        super().__init__()
-
-    def forward(self,
-                pred: torch.Tensor,  # [Batches, Frames]
-                target: torch.Tensor  # [Batches, Frames]
-                ) -> torch.Tensor:
-        d_pred = pred[:, 1:] - pred[:, :-1]  # (B, F-1)
-        d_target = target[:, 1:] - target[:, :-1]  # (B, F-1)
-
-        return torch.mean(torch.abs(d_pred - d_target))
-
-def load_loud_stats(ds_root, split="train", pitch_mode="meta", device="cpu"):
-    stats_path = os.path.join(ds_root, split, pitch_mode, f"{split}_stats.json")
-    with open(stats_path) as f:
-        stats = json.load(f)
-    return (torch.tensor(stats["mean"], device=device),
-            torch.tensor(stats["std"],  device=device))
-
 def parse_args():
     p = argparse.ArgumentParser()
     env = os.environ.get
@@ -172,17 +143,6 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False,
                             drop_last=True, pin_memory=True if device.type != "mps" else False, num_workers=config["num_workers"])
 
-    # ─── temporal loss ─────────────────────────────────────────────────────
-    use_temporal_loss = config["loudness_loss_delta"] != 0
-
-    if use_temporal_loss:
-        mu, std = load_loud_stats(NSYNTH_PREPROCESSED_DIR,
-                                  split="train",
-                                  pitch_mode=config["pitch_mode"],
-                                  device=device)
-    else:
-        mu = std = None
-
     # ─── Start Model, optimizer & Loss ────────────────────────── #
     model = AE_KarplusModel(batch_size=config["batch_size"], hidden_size=config["hidden_size"],
                             loop_order=config["loop_order"], loop_n_frames=config["loop_n_frames"],
@@ -194,8 +154,6 @@ def main():
 
     mr_stft = MultiResolutionSTFTLoss(scale_invariance=True, perceptual_weighting=True,
                                       sample_rate=config["sample_rate"], device=device, )
-
-    derivDiff = DerivDiffLoss().to(device)
 
     # ─── Resume from checkpoint if requested ──────────────────────────────
     start_epoch, best_val_loss = 0, float('inf')
@@ -257,23 +215,11 @@ def main():
                 audio, pitch, loud = audio.to(device), pitch.to(device), loud.to(device)
                 recon = model(pitch=pitch, loudness=loud, audio=audio, audio_sr=config["sample_rate"])
 
-                spectral_loss = mr_stft(recon.unsqueeze(1), audio.unsqueeze(1))
-
-                if use_temporal_loss:
-                    loud_hat = a_weighted_loudness(recon)
-                    loud_hat = (loud_hat - mu) / std
-
-                    temporal_loss = derivDiff(loud.squeeze(2),
-                                              loud_hat.squeeze(1)) * config["loudness_loss_delta"]
-                else:
-                    temporal_loss = 0.0
-
-                loss = spectral_loss + temporal_loss
+                loss = mr_stft(recon.unsqueeze(1), audio.unsqueeze(1))
 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-
 
                 #Per batch train loss
                 log_batch("train loss per batch", loss.item())

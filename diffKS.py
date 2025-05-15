@@ -372,53 +372,6 @@ class DiffKS(nn.Module):
 
             indices = z_l + self.num_active_indexes - 1
             A[batch_indices, sample_indices, indices] = -alfa * b[..., -1]
-
-        elif self.interp_type == "allpass":
-            C = (1 - alfa) / (1 + alfa)
-
-            x_processed = torch.zeros_like(x)
-            x_processed[:, 0] = x[:, 0]
-            x_processed[:, 1:] = x[:, 1:] + x[:, :-1] * C[:, 1:]
-            x = x_processed
-
-            A[:, :, 0] = C
-
-            indices = z_l
-            A[batch_indices, sample_indices, indices] = -C * b[..., 0]
-
-            for i in range(1, self.loop_n_coefficients):
-                indices = z_l + i
-                A[batch_indices, sample_indices, indices] = -(b[..., i - 1] + C * b[..., i])
-
-            indices = z_l + self.num_active_indexes - 1
-            A[batch_indices, sample_indices, indices] = -b[..., -1]
-
-        elif self.interp_type == "lagrange":
-            lag_k = self._lagrange_kernel(alfa)  # (B,N,L+1)
-            B, N, M = b.shape
-
-            if b.is_cuda:  # depth‑wise conv
-                inp = b.transpose(1, 2).reshape(1, B * N, M)
-                kern = lag_k.reshape(B * N, 1, LAGRANGE_ORDER + 1)
-
-                b_processed = F.conv1d(
-                    inp, kern, padding=LAGRANGE_ORDER, groups=B * N
-                ).reshape(B, N, -1)  # (B,N,M+L)
-
-            else:  # vectorised einsum
-                L = LAGRANGE_ORDER  # = 5
-                b_unf = F.pad(b, (L, L))  # (B,N,K+2L)   pad left *and* right
-                b_unf = b_unf.unfold(-1, L + 1, 1)  # (B,N,K+2L,L+1)
-                b_processed = torch.einsum('bnml,bnl->bnm', b_unf, lag_k)
-
-            base_idx = z_l.unsqueeze(-1) + torch.arange(
-                self.num_active_indexes, device=self.device
-            )
-
-            A[torch.arange(B).view(-1, 1, 1),
-            torch.arange(N).view(1, -1, 1),
-            base_idx] = -b_processed
-
         else:
             raise NotImplementedError(f"Interpolation type {self.interp_type} not implemented")
 
@@ -525,30 +478,3 @@ class DiffKS(nn.Module):
 
     def get_excitation_filter_out(self):
         return self.excitation_filter_out
-
-    # --- helper: vectorised Lagrange kernel ---------------------------------------
-    def _lagrange_kernel(self, alfa: torch.Tensor) -> torch.Tensor:
-        """
-        alfa : [B, N]  fractional part (0…1)
-        returns a per–sample kernel of shape [B, N, L+1]  (here L = 5)
-        """
-        # α − i   for i = 0…L
-        k = torch.arange(LAGRANGE_ORDER + 1,
-                         device=alfa.device,
-                         dtype=self._dtype)  # (L+1,)
-        diff = alfa.unsqueeze(-1) - k  # (B,N,L+1)
-
-        # numerator / denominator,  mask the diagonals that would be “0/0”
-        num = diff.unsqueeze(-2)  # (B,N,1,L+1)
-
-        mask = self.lagrange_mask.to(alfa.device)
-        denom = self.lagrange_denom.to(alfa.device)  # (L+1,L+1)
-
-        safe_denom = torch.where(mask, denom, 1.) + 1e-6
-
-        kernel = torch.where(mask, num, 1.) / safe_denom  # (B,N,L+1,L+1)
-
-        # Π over the last axis → per‑sample kernel length L+1
-        kernel = kernel.prod(-1)  # (B,N,L+1)
-
-        return kernel

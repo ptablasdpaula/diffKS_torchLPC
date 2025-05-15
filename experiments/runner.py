@@ -15,8 +15,7 @@ from tqdm import tqdm
 from data.synthetic_generate import random_param_batch
 from data.preprocess import NsynthDataset, E2_HZ, fcnf0pp_pitch
 from diffKS import DiffKS
-from experiments.losses import STFTLoss
-from experiments.optimisers import OPTIMISER_REGISTRY, NeuralInference
+from experiments.optimisers import OPTIMISER_REGISTRY, NeuralInference, STFTLoss
 from paths import NSYNTH_PREPROCESSED_DIR, DDSP_METAF0, DDSP_FCNF0, SUPERVISED
 from utils import get_device
 
@@ -37,7 +36,7 @@ CFG_DIFFKS = dict(
 SR = 16_000
 
 OPT_CFG: Dict[str, Dict] = {
-    "gradient": {"lr": 0.5, "max_steps": 250},
+    "gradient": {"lr": 0.1, "max_steps": 250},
     "genetic": {"population": 20, "parents": 10, "max_steps": 250, "seed": 42},
     "ae_meta": {"checkpoint": DDSP_METAF0},
     "ae_fcn": {"checkpoint": DDSP_FCNF0},

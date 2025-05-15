@@ -10,6 +10,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, Tuple, Callable, List
 
+from third_party.auraloss.auraloss.freq import MultiResolutionSTFTLoss
+
 import numpy as np
 import torch
 from torch import nn
@@ -17,6 +19,21 @@ from tqdm import tqdm
 import pygad
 
 # ───────────────────────── loss utility ─────────────────────────
+class STFTLoss(nn.Module):
+    def __init__(self,
+                 sample_rate: int,
+                 scale_invariant: bool = True,
+                 perceptual: bool = True):
+        super().__init__()
+        self.fn = MultiResolutionSTFTLoss(sample_rate        = sample_rate,
+                                          scale_invariance   = scale_invariant,
+                                          perceptual_weighting = perceptual)
+
+    def forward(self,
+                pred: torch.Tensor,
+                target: torch.Tensor) -> torch.Tensor: # i/o: (B, 1, N)
+        return self.fn(pred, target) # i/o: (B, 1, N)
+
 def _compute_losses(metrics: Dict[str, Callable],
                     pred: torch.Tensor, target: torch.Tensor,
                     agent: nn.Module | None = None):
@@ -332,7 +349,7 @@ class AutoencoderInference(NeuralInference):
         raw = torch.load(ckpt_path, map_location="cpu")
         state = raw.get("model_state_dict", raw)
 
-        from experiments.autoencoder.model import AE_KarplusModel, MfccTimeDistributedRnnEncoder
+        from autoencoder.model import AE_KarplusModel, MfccTimeDistributedRnnEncoder
         defaults = dict(
             hidden_size        = 512,
             batch_size         = 8,
