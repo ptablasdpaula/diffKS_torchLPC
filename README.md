@@ -2,6 +2,10 @@
 
 This repository contains the reference implementation and experiment scripts that accompany our WASPAA 2025 paper _Differentiable Karplus‑Strong Synthesis for Neural Resonance Optimisation_.
 
+[transfer]: transfer.png
+
+![alt-text][transfer]
+
 Here we present **DiffKS**, a differentiable [Karplus-Strong algorithm](https://www.jstor.org/stable/3680062?seq=1]) - that is, [we allow gradients to flow through its digital signal processing operations](https://arxiv.org/abs/2001.04643). In turn, this makes Karplus-Strong deemable to be optimised through gradient descent and neural networks. Additionally, we build our architecture on top of [torchLPC](https://github.com/DiffAPF/torchlpc), which allows us to backpropagate in the time-domain, ensuring same behaviour during training and real-time.
 
 ## Installation
