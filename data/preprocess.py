@@ -3,7 +3,6 @@ import os, json
 from typing import List, Dict, Any
 
 import torch
-from torch import nn
 import torchaudio
 from tqdm import tqdm
 from third_party.auraloss.auraloss.perceptual import FIRFilter
