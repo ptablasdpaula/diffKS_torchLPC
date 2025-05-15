@@ -19,37 +19,45 @@ def parse_args():
     p = argparse.ArgumentParser()
     env = os.environ.get
 
+    # ─── Run identification ────────────────────────────────────────────────
     p.add_argument("--name", type=str, default=env("NAME", "exp"),
-                        help="Unique experiment name (used for checkpoints & wandb run)")
+                   help="Unique experiment name (used for checkpoints & wandb run)")
     p.add_argument("--continue_from_checkpoint", action="store_true",
-                        default=str2bool(env("CONTINUE_FROM_CHECKPOINT", "false")),
-                        help="Resume training from latest checkpoint for this --name")
+                   default=str2bool(env("CONTINUE_FROM_CHECKPOINT", "false")),
+                   help="Resume training from latest checkpoint for this --name")
 
+    # ─── Optimisation hyper-parameters ─────────────────────────────────────
     p.add_argument("--learning_rate", type=float, default=float(env("LEARNING_RATE", 1e-4)))
+    p.add_argument("--max_epochs", type=int, default=int(env("MAX_EPOCHS", 330)))
+    p.add_argument("--patience", type=int, default=int(env("PATIENCE", 20)))
+    p.add_argument("--min_delta", type=float, default=float(env("MIN_DELTA", 0.001)),
+                   help="Minimum relative (fractional) validation-loss improvement to reset patience. 0.001 = 0.1 %")
 
-    p.add_argument("--batch_size",  type=int, default=int(env("BATCH_SIZE", 8)))
+    # ─── Data-loading ──────────────────────────────────────────────────────
+    p.add_argument("--batch_size", type=int, default=int(env("BATCH_SIZE", 8)))
     p.add_argument("--num_workers", type=int, default=int(env("NUM_WORKERS", 2)))
 
+    # ─── Model size ────────────────────────────────────────────────────────
     p.add_argument("--hidden_size", type=int, default=int(env("HIDDEN_SIZE", 512)))
 
-    p.add_argument("--l_order",     type=int, default=int(env("L_ORDER", 2)))
-    p.add_argument("--l_n_frames",  type=int, default=int(env("L_N_FRAMES", 16)))
-    p.add_argument("--exc_order",   type=int, default=int(env("EXC_ORDER", 5)))
-    p.add_argument("--exc_n_frames",type=int, default=int(env("EXC_N_FRAMES", 25)))
+    # ─── DiffKS filter configuration ───────────────────────────────────────
+    p.add_argument("--l_order", type=int, default=int(env("L_ORDER", 2)))
+    p.add_argument("--l_n_frames", type=int, default=int(env("L_N_FRAMES", 16)))
+    p.add_argument("--exc_order", type=int, default=int(env("EXC_ORDER", 5)))
+    p.add_argument("--exc_n_frames", type=int, default=int(env("EXC_N_FRAMES", 25)))
 
-    p.add_argument("--families",    type=str, default=env("FAMILIES", "guitar"))
-    p.add_argument("--sources",     type=str, default=env("SOURCES", "acoustic"))
+    # ─── Dataset filters ────────────────────────────────────────────────────
+    p.add_argument("--families", type=str, default=env("FAMILIES", "guitar"))
+    p.add_argument("--sources", type=str, default=env("SOURCES", "acoustic"))
 
+    # ─── DiffKS decoder settings ───────────────────────────────────────────
     p.add_argument("--interpolation_type", type=str, default=env("INTERPOLATION_TYPE", "linear"))
     p.add_argument("--pitch_mode", type=str, default=env("PITCH_MODE", "meta"))
-    p.add_argument("--loudness_loss_delta", type=float, default=float(env("LOUDNESS_LOSS_DELTA", 0)))
 
-    p.add_argument(
-        "--parameter_loss",
-        action="store_true",
-        default=str2bool(env("PARAMETER_LOSS", "false")),
-        help="Use parameter-loss training (overrides default if PARAMETER_LOSS env is set)"
-    )
+    # ─── Training mode ────────────────────────────────────────────────────
+    p.add_argument("--parameter_loss", action="store_true",
+                   default=str2bool(env("PARAMETER_LOSS", "false")),
+                   help="Use parameter-loss training instead of reconstruction loss")
 
     p.add_argument("--batches_per_epoch", type=int, default=int(env("BATCHES_PER_EPOCH", 100)))
 
@@ -67,7 +75,9 @@ def main():
         "ks_sample_rate": 41000,
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
-        "num_epochs": 200,
+        "max_epochs": args.max_epochs,
+        "patience": args.patience,
+        "min_delta": args.min_delta,
         "eval_interval": 1,
         "save_dir": f"autoencoder/runs/{args.name}",
         "families": [f.strip() for f in args.families.split(",")],
@@ -75,14 +85,13 @@ def main():
         "num_workers": args.num_workers,
         "interpolation_type": args.interpolation_type,
         "pitch_mode": args.pitch_mode,
-        "loudness_loss_delta": args.loudness_loss_delta,
         "parameter_loss": args.parameter_loss,
         "batches_per_epoch": args.batches_per_epoch,
     }
 
-    print("\n▶Running with config:")
+    print("\n▶ Running with config:")
     for k, v in vars(args).items():
-        print(f"   {k:12}: {v}")
+        print(f"   {k:15}: {v}")
 
     # ─── device init ───────────────────────────────────────────────────────
     device = get_device()
@@ -133,7 +142,6 @@ def main():
         train_loader = None
         train_gen = torch.Generator(device=device).manual_seed(42)
 
-
     val_dataset = NsynthDataset(root=NSYNTH_PREPROCESSED_DIR,
                                 split="test",
                                 pitch_mode=config["pitch_mode"],
@@ -176,11 +184,15 @@ def main():
 
     bpe = config["batches_per_epoch"] if config["parameter_loss"] else len(train_loader)
 
+    # ─── Early-stopping bookkeeping ───────────────────────────── #
+    epochs_since_improve = 0
+
     # ───────────────────────── training epochs ───────────────────────────
-    for epoch in range(start_epoch, config["num_epochs"]):
+    for epoch in range(start_epoch, config["max_epochs"]):
         model.train()
         t_loss = 0
 
+        # ─── Training step ───────────────────────────────────────────────
         if config["parameter_loss"]:
             for i in tqdm(range(bpe), desc=f"[E{epoch:03d} train]"):
                 # Generate random parameters
@@ -192,7 +204,7 @@ def main():
                 pitch = pitch.to(dtype=torch.float32, device=device)
                 loud = loud.to(dtype=torch.float32, device=device)
 
-                # Generate random audio
+                # Forward pass
                 pred_loop_coeffs, pred_exc_coeffs = model(
                     pitch=pitch, loudness=loud,
                     audio=audio, audio_sr=config["sample_rate"],
@@ -206,9 +218,7 @@ def main():
                 loss.backward()
                 optimizer.step()
 
-                # Per-Batch train loss
                 log_batch("train loss per batch", loss.item())
-
                 t_loss += loss.item()
         else:
             for audio, pitch, loud in tqdm(train_loader, desc=f"[E{epoch:03d} train]"):
@@ -221,22 +231,17 @@ def main():
                 loss.backward()
                 optimizer.step()
 
-                #Per batch train loss
                 log_batch("train loss per batch", loss.item())
                 t_loss += loss.item()
 
         t_loss /= bpe
 
-        # ░░ VALID ░░ (every eval_interval)
+        # ─── VALID ───────────────────────────────────────────────────────
         if epoch % config["eval_interval"] == 0:
             if config["parameter_loss"]:
-                # validate on "synthetic" param batches
                 model.eval()
                 v_losses = []
-
-                # Number of synthetic batches to cover (approx. 200 items)
                 n_val_batches = math.ceil(200 / config["batch_size"])
-
                 with torch.no_grad():
                     for _ in range(n_val_batches):
                         audio, pitch, loud, loop_c, exc_c = random_param_batch(
@@ -256,13 +261,9 @@ def main():
                             torch.nn.functional.l1_loss(pred_loop, loop_c).item() +
                             torch.nn.functional.l1_loss(pred_exc, exc_c).item()
                         )
-
-                        # Compute and log per-batch validation loss
                         log_batch("val loss per batch", batch_v)
                         v_losses.append(batch_v)
-
                 v_loss = float(np.mean(v_losses))
-
             else:
                 model.eval()
                 v_losses = []
@@ -270,8 +271,6 @@ def main():
                     for audio, pitch, loud in val_loader:
                         audio, pitch, loud = audio.to(device), pitch.to(device), loud.to(device)
                         recon = model(pitch=pitch, loudness=loud, audio=audio, audio_sr=config["sample_rate"])
-
-                        # compute and log per-batch val loss
                         batch_v = mr_stft(recon.unsqueeze(1), audio.unsqueeze(1)).item()
                         log_batch("val loss per batch", batch_v)
                         v_losses.append(batch_v)
@@ -279,14 +278,23 @@ def main():
         else:
             v_loss = np.nan
 
-        # ░░ logging ░░
+        # ─── LOGGING ───────────────────────────────────────────────────────
         log_batch("train loss per epoch", t_loss)
         log_batch("val loss per epoch", v_loss)
 
-        # ░░ save ckpt ░░
-        improved = v_loss < best_val_loss if not np.isnan(v_loss) else False
-        if improved:
-            best_val_loss = v_loss
+        # ─── CHKPTS  ───────────────────────────────────────────────────────
+        improved = False
+        if not np.isnan(v_loss):
+            # Relative improvement wrt best
+            if best_val_loss == float('inf') or (best_val_loss - v_loss) / best_val_loss >= config["min_delta"]:
+                improved = True
+                best_val_loss = v_loss
+                epochs_since_improve = 0
+            else:
+                epochs_since_improve += 1
+        else:
+            epochs_since_improve += 1  # treat missing val as no improvement
+
         ckpt = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
@@ -298,89 +306,43 @@ def main():
         if improved:
             torch.save(ckpt, os.path.join(config["save_dir"], f"best_model_{args.name}.pth"))
 
-        # ░░ log & save audio every eval_interval ░░
-        # ░░ log & save audio every eval_interval ░░
+        # ─── EARLY STOPPING ───────────────────────────────────────────────
+        if epochs_since_improve >= config["patience"]:
+            print(f"[STOP] Early stopping triggered after {config['patience']} epochs without ≥{config['min_delta']*100:.2f}% improvement.")
+            break
+
+        # ─── AUDIO LOGS ──────────────────────────────────────────────────
         if epoch % config["eval_interval"] == 0:
             with torch.no_grad():
-                # parameter‐loss mode: only log synthetic audio
                 if config["parameter_loss"]:
-                    # generate one synthetic batch
                     audio, pitch, loud, _, _ = random_param_batch(
                         model.decoder,
                         config["batch_size"],
                         generator=train_gen,
                     )
-
                     audio = audio.to(dtype=torch.float32, device=device)
                     pitch = pitch.to(dtype=torch.float32, device=device)
                     loud = loud.to(dtype=torch.float32, device=device)
-
-                    # get model reconstruction
-                    rec = model(
-                        pitch=pitch,
-                        loudness=loud,
-                        audio=audio,
-                        audio_sr=config["sample_rate"],
-                    )
-                    # pick 5 examples
+                    rec = model(pitch=pitch, loudness=loud, audio=audio, audio_sr=config["sample_rate"])
                     rand_idx = np.random.choice(audio.size(0), 5, replace=False)
                     for k, idx in enumerate(rand_idx):
                         sample = torch.cat([audio[idx], rec[idx]]).cpu().numpy()
-                        # save locally if desired
-                        sf.write(
-                            os.path.join(
-                                config["save_dir"],
-                                f"param_sample_e{epoch}_{k}.wav"
-                            ),
-                            sample,
-                            config["sample_rate"]
-                        )
-                        # log only these synthetic samples
-                        wandb.log({
-                            f"audio_param_compare_{k}": wandb.Audio(
-                                sample,
-                                sample_rate=config["sample_rate"],
-                                caption=(
-                                    f"epoch {epoch} | param sample {k} | "
-                                    "original + recon"
-                                )
-                            )
-                        })
-                # normal mode: log Nsynth val‐set audio
+                        sf.write(os.path.join(config["save_dir"], f"param_sample_e{epoch}_{k}.wav"), sample, config["sample_rate"])
+                        wandb.log({f"audio_param_compare_{k}": wandb.Audio(sample, sample_rate=config["sample_rate"], caption=f"epoch {epoch} | param sample {k} | original + recon")})
                 else:
                     a, p, l = next(iter(val_loader))
                     a, p, l = a.to(device), p.to(device), l.to(device)
-                    rec = model(
-                        pitch=p,
-                        loudness=l,
-                        audio=a,
-                        audio_sr=config["sample_rate"],
-                    )
+                    rec = model(pitch=p, loudness=l, audio=a, audio_sr=config["sample_rate"])
                     rand_idx = np.random.choice(a.size(0), 5, replace=False)
                     for k, idx in enumerate(rand_idx):
                         sample = torch.cat([a[idx], rec[idx]]).cpu().numpy()
-                        sf.write(
-                            os.path.join(
-                                config["save_dir"],
-                                f"sample_e{epoch}_{k}.wav"
-                            ),
-                            sample,
-                            config["sample_rate"]
-                        )
-                        wandb.log({
-                            f"audio_compare_{k}": wandb.Audio(
-                                sample,
-                                sample_rate=config["sample_rate"],
-                                caption=(
-                                    f"epoch {epoch} | sample {k} | "
-                                    "original + recon"
-                                )
-                            )
-                        })
+                        sf.write(os.path.join(config["save_dir"], f"sample_e{epoch}_{k}.wav"), sample, config["sample_rate"])
+                        wandb.log({f"audio_compare_{k}": wandb.Audio(sample, sample_rate=config["sample_rate"], caption=f"epoch {epoch} | sample {k} | original + recon")})
 
-        print(f"[E{epoch}] train={t_loss:.4f} val={v_loss:.4f} best={best_val_loss:.4f}")
+        print(f"[E{epoch}] train={t_loss:.4f} val={v_loss:.4f} best={best_val_loss:.4f} (no-improve {epochs_since_improve}/{config['patience']})")
 
     wandb.finish()
+
 
 if __name__ == '__main__':
     mp.freeze_support()
