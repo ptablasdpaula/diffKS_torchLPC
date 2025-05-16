@@ -144,3 +144,27 @@ def random_param_batch(agent: DiffKS, batch_size: int, generator: torch.Generato
     pitch = pitch.expand(-1, loud.shape[1])
 
     return audio, pitch.unsqueeze(-1), loud.unsqueeze(-1), loop_coeffs * loop_gain, exc_coeffs
+
+class OnTheFlySynth(torch.utils.data.IterableDataset):
+    """
+    Generates `num_batches` random DiffKS examples.
+
+    If `batch_size` is omitted, we use `diffks.batch_size`
+    (so you don’t have to pass it twice).
+    """
+    def __init__(
+        self,
+        diffks: DiffKS,
+        *,
+        num_batches: int,
+        batch_size: int | None = None,
+        seed: int = 42,
+    ):
+        self.diffks = diffks
+        self.batch_size = batch_size if batch_size is not None else diffks.batch_size
+        self.num_batches = num_batches
+        self.gen = torch.Generator(device=get_device()).manual_seed(seed)
+
+    def __iter__(self):
+        for _ in range(self.num_batches):
+            yield random_param_batch(self.diffks, self.batch_size, generator=self.gen)
