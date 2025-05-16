@@ -24,11 +24,19 @@ def kaiser_resample(x, sr_in: int, sr_out: int,
     beta     : Kaiser β; 14 ≈ >90 dB stop-band
     rolloff  : pass-band edge / Nyquist (DDSP uses 0.94759371674)
     """
-    return TAF.resample(x, sr_in, sr_out,
-                        lowpass_filter_width=width,
-                        rolloff=rolloff,
-                        resampling_method='sinc_interp_kaiser',
-                        beta=beta)
+    orig_dev = x.device
+    # if on MPS, do the actual resampling on CPU
+    if orig_dev.type == "mps":
+        x = x.cpu()
+    y = TAF.resample(
+        x, sr_in, sr_out,
+        lowpass_filter_width=width,
+        rolloff=rolloff,
+        resampling_method="sinc_interp_kaiser",
+        beta=beta
+    )
+    # move back to the original device only if we fell back
+    return y.to(orig_dev) if orig_dev.type == "mps" else y
 
 def spline_upsample(x: torch.Tensor,  # shape [B, Frames, D]
                     num_samples) -> torch.Tensor:  # shape [B, Samples, D]
@@ -126,14 +134,14 @@ class DiffKS(nn.Module):
         self.exc_order = exc_order
         self.exc_n_coefficients = exc_order + 1 # To account for exc_g
         self.exc_length_n = int (exc_length_s * internal_sr)
-        self.exc_coefficients = nn.Parameter(torch.rand(batch_size, self.exc_n_frames, self.exc_n_coefficients, dtype=self._dtype) * 1e-4)
+        self.exc_coefficients = nn.Parameter(torch.rand(batch_size, self.exc_n_frames, self.exc_n_coefficients, dtype=self._dtype))
 
         # ====== Loop Filter ============================
         self.loop_n_frames = loop_n_frames
         self.loop_order = loop_order
         self.loop_n_coefficients = loop_order + 1  # To account for DC coefficient
-        self.loop_coefficients = torch.rand(batch_size, self.loop_n_frames, self.loop_n_coefficients,
-                                                 dtype=self._dtype).uniform_(-2, 0)
+        self.loop_coefficients = nn.Parameter(torch.rand(batch_size, self.loop_n_frames, self.loop_n_coefficients,
+                                                 dtype=self._dtype).uniform_(-2, 0))
         self.loop_gain = nn.Parameter(torch.rand(batch_size, loop_n_frames, 1, dtype=self._dtype))
 
         # ====== Interpolation Settings ==================
@@ -147,8 +155,8 @@ class DiffKS(nn.Module):
                              torch.where(self.lagrange_mask, self.lagrange_denom, 1))
 
         # ====== Analysis Buffers =======================
-        self.register_buffer("excitation_filter_out", torch.empty(batch_size, self.exc_length_n))
-        self.register_buffer("ks_inverse_signal", torch.zeros(batch_size, self.exc_length_n))
+        self.register_buffer("excitation_filter_out", torch.empty(batch_size, self.exc_length_n), persistent=False)
+        self.register_buffer("ks_inverse_signal", torch.zeros(batch_size, self.exc_length_n), persistent=False)
 
         # ====== METADATA table for inner shapes (no batch)
         self._param_meta: dict[str, Tuple[Tuple[int, ...], str]] = {
@@ -204,6 +212,14 @@ class DiffKS(nn.Module):
     def set_loop_gain(self, value: torch.Tensor) -> None:
         self._prepare("loop_gain", value, inplace=True)
 
+    @torch.no_grad()
+    def reinit(self) -> None:
+        """Reset learnable tensors to their constructor defaults.
+        """
+        self.loop_coefficients.uniform_(-2, 0)
+        self.loop_gain.uniform_(0, 1)
+        self.exc_coefficients.uniform_(0, 1)
+
     @property
     def interp_type(self):
         return self._interp_type
@@ -229,14 +245,23 @@ class DiffKS(nn.Module):
                 loop_coefficients: Optional[torch.Tensor] = None,  # [batch_size, loop_n_frames, loop_n_coefficients]
                 loop_gain: Optional[torch.Tensor] = None,  # [batch_size, loop_n_frames, 1]
                 exc_coefficients: Optional[torch.Tensor] = None,  # [batch_size, exc_n_frames, exc_order]
+                constrain_coefficients: bool = True,
                 ) -> torch.Tensor:  # [batch_size, n_samples]
 
         assert f0_frames.dim() == 2, f"f0_frames must have 2 dimensions, got shape {f0_frames.shape}"
         assert input.dim() == 2, f"target must have 2 dimensions (batch, samples), got shape {input.shape}"
 
-        l_b = self._prepare("loop_coefficients", loop_coefficients)
-        l_g = self._prepare("loop_gain", loop_gain)
-        exc_b = self._prepare("exc_coefficients", exc_coefficients)
+
+        if constrain_coefficients:
+            l_b = self._prepare("loop_coefficients", loop_coefficients)
+            l_g = self._prepare("loop_gain", loop_gain)
+            exc_b = self._prepare("exc_coefficients", exc_coefficients)
+        else:
+            l_b = loop_coefficients
+            l_g = loop_gain
+            exc_b = exc_coefficients
+
+        f0_frames = self.internal_sr / f0_frames # Convert from Hz to samples
 
         if input_sr != self.internal_sr:
             input = kaiser_resample(input, sr_in=input_sr, sr_out=self.internal_sr)
@@ -248,9 +273,18 @@ class DiffKS(nn.Module):
             l_b=l_b, l_g=l_g, exc_b=exc_b
         )
 
-        l_b = self.get_constrained_l_coefficients(l_b=l_b, l_g=l_g)
+        if constrain_coefficients:
+            l_b = self.get_constrained_l_coefficients(l_b=l_b, l_g=l_g)
 
-        exc_b = self.get_constrained_exc_coefficients(exc_b=exc_b)
+            exc_b = self.get_constrained_exc_coefficients(exc_b=exc_b)
+        else:
+            # make sure interpolation didn't produce out of range values
+            l_b = l_b.clamp(min=0.0, max=1.0)
+            l_g = l_g.clamp(min=0.0, max=1.0)
+            exc_b = exc_b.clamp(min=0.0, max=1.0)
+
+            # Apply gain to the loop coefficients
+            l_b = l_b * l_g
 
         A, x = self.compute_resonator_matrix(f0=f0,
                                              loop_coefficients=l_b,
@@ -259,7 +293,7 @@ class DiffKS(nn.Module):
         if not direct:
             loop_inv = invert_lpc(x, A)
             ks_inv_signal = self._windowed_lpc(loop_inv, exc_b, 'inverse')
-            self.ks_inv_signal = ks_inv_signal
+            self.ks_inverse_signal = ks_inv_signal.detach().clone()
 
         exc_filter_out = self._windowed_lpc(ks_inv_signal if not direct else x,
                                             exc_b, 'forward')
@@ -338,53 +372,6 @@ class DiffKS(nn.Module):
 
             indices = z_l + self.num_active_indexes - 1
             A[batch_indices, sample_indices, indices] = -alfa * b[..., -1]
-
-        elif self.interp_type == "allpass":
-            C = (1 - alfa) / (1 + alfa)
-
-            x_processed = torch.zeros_like(x)
-            x_processed[:, 0] = x[:, 0]
-            x_processed[:, 1:] = x[:, 1:] + x[:, :-1] * C[:, 1:]
-            x = x_processed
-
-            A[:, :, 0] = C
-
-            indices = z_l
-            A[batch_indices, sample_indices, indices] = -C * b[..., 0]
-
-            for i in range(1, self.loop_n_coefficients):
-                indices = z_l + i
-                A[batch_indices, sample_indices, indices] = -(b[..., i - 1] + C * b[..., i])
-
-            indices = z_l + self.num_active_indexes - 1
-            A[batch_indices, sample_indices, indices] = -b[..., -1]
-
-        elif self.interp_type == "lagrange":
-            lag_k = self._lagrange_kernel(alfa)  # (B,N,L+1)
-            B, N, M = b.shape
-
-            if b.is_cuda:  # depth‑wise conv
-                inp = b.transpose(1, 2).reshape(1, B * N, M)
-                kern = lag_k.reshape(B * N, 1, LAGRANGE_ORDER + 1)
-
-                b_processed = F.conv1d(
-                    inp, kern, padding=LAGRANGE_ORDER, groups=B * N
-                ).reshape(B, N, -1)  # (B,N,M+L)
-
-            else:  # vectorised einsum
-                L = LAGRANGE_ORDER  # = 5
-                b_unf = F.pad(b, (L, L))  # (B,N,K+2L)   pad left *and* right
-                b_unf = b_unf.unfold(-1, L + 1, 1)  # (B,N,K+2L,L+1)
-                b_processed = torch.einsum('bnml,bnl->bnm', b_unf, lag_k)
-
-            base_idx = z_l.unsqueeze(-1) + torch.arange(
-                self.num_active_indexes, device=self.device
-            )
-
-            A[torch.arange(B).view(-1, 1, 1),
-            torch.arange(N).view(1, -1, 1),
-            base_idx] = -b_processed
-
         else:
             raise NotImplementedError(f"Interpolation type {self.interp_type} not implemented")
 
@@ -491,30 +478,3 @@ class DiffKS(nn.Module):
 
     def get_excitation_filter_out(self):
         return self.excitation_filter_out
-
-    # --- helper: vectorised Lagrange kernel ---------------------------------------
-    def _lagrange_kernel(self, alfa: torch.Tensor) -> torch.Tensor:
-        """
-        alfa : [B, N]  fractional part (0…1)
-        returns a per–sample kernel of shape [B, N, L+1]  (here L = 5)
-        """
-        # α − i   for i = 0…L
-        k = torch.arange(LAGRANGE_ORDER + 1,
-                         device=alfa.device,
-                         dtype=self._dtype)  # (L+1,)
-        diff = alfa.unsqueeze(-1) - k  # (B,N,L+1)
-
-        # numerator / denominator,  mask the diagonals that would be “0/0”
-        num = diff.unsqueeze(-2)  # (B,N,1,L+1)
-
-        mask = self.lagrange_mask.to(alfa.device)
-        denom = self.lagrange_denom.to(alfa.device)  # (L+1,L+1)
-
-        safe_denom = torch.where(mask, denom, 1.) + 1e-6
-
-        kernel = torch.where(mask, num, 1.) / safe_denom  # (B,N,L+1,L+1)
-
-        # Π over the last axis → per‑sample kernel length L+1
-        kernel = kernel.prod(-1)  # (B,N,L+1)
-
-        return kernel

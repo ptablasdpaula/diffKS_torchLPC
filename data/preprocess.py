@@ -3,7 +3,6 @@ import os, json
 from typing import List, Dict, Any
 
 import torch
-from torch import nn
 import torchaudio
 from tqdm import tqdm
 from third_party.auraloss.auraloss.perceptual import FIRFilter
@@ -35,19 +34,6 @@ for p in a_weight.parameters():
 # --------------------------
 # Helper functions
 # --------------------------
-class LoudnessDerivLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self,
-                loud_hat: torch.Tensor, # [Batches, Frames]
-                loud_ref: torch.Tensor  # [Batches, Frames]
-                ) -> torch.Tensor:
-        d_hat = loud_hat[:, 1:] - loud_hat[:, :-1]  # (B, F-1)
-        d_ref = loud_ref[:, 1:] - loud_ref[:, :-1]  # (B, F-1)
-
-        return torch.mean(torch.abs(d_hat - d_ref))
-
 def a_weighted_loudness(x: torch.Tensor) -> torch.Tensor:
     """Return log‑power loudness per frame (B, F). x is (B, N)."""
     y = a_weight.fir(x.unsqueeze(1)).pow(2)                               # (B,1,N)
@@ -101,10 +87,6 @@ def fcnf0pp_pitch(batch: torch.Tensor,
         pitches.append(p)  # (1, F)
 
     return torch.cat(pitches, dim=0)  # (B, F)
-
-@torch.no_grad()
-def autocorrelation_pitch() -> torch.Tensor:
-    pass
 
 # --------------------------
 # Preprocessing routine
@@ -202,10 +184,10 @@ class NsynthDataset(torch.utils.data.Dataset):
     def __init__(
             self,
             root:str,
-            split:str="train",
+            split:str="test",
             pitch_mode:str="meta",
-            families:List[str]|None=None,
-            sources:List[str]|None=None
+            families:List[str]|None="guitar",
+            sources:List[str]|None="acoustic"
             ):
         self.base = os.path.join(root, split, pitch_mode)
         self.meta = json.load(open(os.path.join(self.base, "metadata.json")))
@@ -230,13 +212,16 @@ class NsynthDataset(torch.utils.data.Dataset):
 
         return itm["audio"], pitch, loud
 
+    def get_filename(self, idx):
+        return self.keys[idx]
+
 # --------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     env = os.environ.get
 
     parser.add_argument("--batch_size", type=int, default=int(env("BATCH_SIZE", 8)))
-    parser.add_argument("--split", type=str, default=env("SPLIT", "test"))
+    parser.add_argument("--split", type=str, default=env("SPLIT", "train, valid, test"))
 
     parser.add_argument("--families", type=str, default=env("FAMILIES", "guitar"),
                         help="comma-separated list, e.g. guitar,piano")
@@ -244,7 +229,7 @@ if __name__ == "__main__":
                         help="comma-separated list, e.g. acoustic,electric")
 
     parser.add_argument("--pitch_mode", type=str, default=env("PITCH_MODE", "meta"),
-                        choices=["fcnf0", "autocorrelation", "meta"])
+                        choices=["fcnf0", "meta"])
     parser.add_argument("--interpolation_unvoiced", type=float, default=env("INTERPOLATION_UNVOICED", 0.065),)
 
     parser.add_argument("--max_files", type=int, default=env("MAX_FILES", None))
