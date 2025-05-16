@@ -51,10 +51,9 @@ python -m autoencoder.train --parameter_loss
 When training completes, move (or symlink) the best‑validation checkpoint(s) into ``autoencoders/models``, where the experiment runner expects to find them.
 
 ## Experiments & Evaluation
-
-run:
+for the optimization experiment:
 ```bash
-python -m experiments.runner --methods gradient,genetic,ae_meta,ae_fcn,ae_sup
+python -m experiments.optimization --methods gradient,genetic # This can be input separately too
 ```
 
 where:
@@ -62,9 +61,26 @@ where:
 - ``genetic``: genetic-algorithm baseline
 both of which are tested on the reconstruction of a hand-picked selection of 6 samples from our subset's test split.
 
+for the inference experiment:
+```bash
+python -m experiments.runner --methods ae_meta # other options are ae_fcn and ae_sup (only one at a time)
+```
+where:
 - ``ae_meta``: autoencoder trained with metadata pitch (default).
 - ``ae_fcn``: autoencoder trained with FCNF0 pitch mode.
 - ``ae_sup``: autoencoder trained on supervised parameter loss.
 which are tested on the reconstruction of our entire subset's split
 
+In both experiments the flag ``--dataset``, along with ``nsynth`` or ``synthetic`` can be passed to evaluate an specifc dataset. Otherwise both will be evaluated.
 The results should be available at ``experiments/results``
+
+## Kernel Audio Distance Scores
+To calculate the KAD scores copy the full paths of the target and predicted directories such as (here an example on ``ae_meta/nsynth``), 
+```bash
+kadtk panns-wavegram-logmel {.../experiments/results/ae_meta/nsynth/target} {.../experiments/results/ae_meta/nsynth/pred}
+kadtk vggish {.../experiments/results/ae_meta/nsynth/target} {.../experiments/results/ae_meta/nsynth/pred}
+kadtk clap-laion-music {.../experiments/results/ae_meta/nsynth/target} {.../experiments/results/ae_meta/nsynth/pred}
+kadtk cdpam-acoustic {.../experiments/results/ae_meta/nsynth/target} {.../experiments/results/ae_meta/nsynth/pred}
+
+```
+
