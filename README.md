@@ -39,21 +39,29 @@ python -m data.preprocess --pitch_mode fcnf0  # if also testing fcnf0 pitch mode
 ## Training
 Train the autoencoders (if only wanting to tests experiments, checkpoints are already saved in ``autoencoder/models``)
 ```bash
-# Unsupervised (meta pitch track)
+# With NSynth F0 Annotations
 python -m autoencoder.train
 
-# Alternative pitch tracker
+# With FCNF0++ Pitch Tracker
 python -m autoencoder.train --pitch_mode fcnf0
 
-# Supervised parameter loss
+# Trained on Supervised parameter loss (Synthetic Dataset)
 python -m autoencoder.train --parameter_loss
 ```
-When training completes, move (or symlink) the best‑validation checkpoint(s) into ``autoencoders/models``, where the experiment runner expects to find them.
+When training completes, move the best‑validation checkpoint(s) into ``autoencoders/models``, where the experiment runner expects to find them.
 
 ## Experiments & Evaluation
 for the optimization experiment:
 ```bash
-python -m experiments.optimization --methods gradient,genetic # This can be input separately too
+python -m experiments.optimization --methods gradient,genetic
+```
+
+If wishing to run experiments in paralell to reduce time costs, try:
+```bash
+python -m experiments.optimization --methods gradient --dataset nsynth
+python -m experiments.optimization --methods gradient --dataset synthetic
+python -m experiments.optimization --methods genetic --dataset nsynth
+python -m experiments.optimization --methods genetic --dataset synthetic
 ```
 
 where:
@@ -63,7 +71,7 @@ both of which are tested on the reconstruction of a hand-picked selection of 6 s
 
 for the inference experiment:
 ```bash
-python -m experiments.runner --methods ae_meta # other options are ae_fcn and ae_sup (only one at a time)
+python -m experiments.runner --methods ae_meta # other options are ae_fcn and ae_sup (only one at a time is possible)
 ```
 where:
 - ``ae_meta``: autoencoder trained with metadata pitch (default).
@@ -75,12 +83,12 @@ In both experiments the flag ``--dataset``, along with ``nsynth`` or ``synthetic
 The results should be available at ``experiments/results``
 
 ## Kernel Audio Distance Scores
-To calculate the KAD scores copy the full paths of the target and predicted directories such as (here an example on ``ae_meta/nsynth``), 
+To calculate the KAD scores copy the full paths of the target and predicted directories (We recommend creating a separate environment for this).
+For ex:
 ```bash
 kadtk panns-wavegram-logmel {.../experiments/results/ae_meta/nsynth/target} {.../experiments/results/ae_meta/nsynth/pred}
 kadtk vggish {.../experiments/results/ae_meta/nsynth/target} {.../experiments/results/ae_meta/nsynth/pred}
 kadtk clap-laion-music {.../experiments/results/ae_meta/nsynth/target} {.../experiments/results/ae_meta/nsynth/pred}
 kadtk cdpam-acoustic {.../experiments/results/ae_meta/nsynth/target} {.../experiments/results/ae_meta/nsynth/pred}
-
 ```
 
