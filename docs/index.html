@@ -72,7 +72,7 @@
   <!-- ===== ABSTRACT & FIGURE ===== -->
   <section class="section hero is-light"><div class="container is-max-desktop">
     <h2 class="title is-3">Abstract</h2>
-    <div class="abstract"><p>The Karplus-Strong algorithm is a well-known approach for realistic string simulation through an extremely efficient delay-line formulation, but parameter optimisation traditionally relies on manual tuning or non-differentiable search. We present <strong>DiffKS</strong>, a fully differentiable time-domain implementation of Karplus-Strong synthesis that enables resonance optimisation via gradient descent. Inspired by commuted synthesis, DiffKS separates excitation and resonant body response with a two-filter pipeline and learns both filters end-to-end. We show that (i) DiffKS outperforms a genetic-algorithm baseline both perceptually and computationally, and (ii) when embedded in an auto-encoder it converges faster than a purely supervised approach while learning a latent space that faithfully captures the resonance of an acoustic guitar.</p></div>
+    <div class="abstract"><p>The Karplus-Strong algorithm is a well-known approach for realistic string simulation through a highly efficient formulation, but parameter optimisation traditionally relies on manual tuning or non-differentiable optimisation methods. We present DiffKS, a fully differentiable time-domain implementation of Karplus-Strong synthesis that enables resonance optimisation through gradient descent. Our time-domain formulation allows for expressive pitch and timbre modulation while learning exact gradients. Inspired by commuted synthesis, we propose a two-filtering stage pipeline: an excitation filter capturing pluck absorption, and a loop filter modelling the system's body resonance. A preceding inverse-filtering stage uses the learnt impulse response to extract plucking information. We demonstrate that DiffKS can optimise by gradient descent and outperforms genetic algorithm optimisation perceptually and in terms of computational efficiency. Additionally, we embed DiffKS onto an autoencoder neural network and compare it to a previous neural supervised approach. We find our proposed architecture converges substantially quicker than its supervised counterpart and learns a latent representation that accurately captures the resonance of an acoustic guitar.</p></div>
 
     <img src="images/diffKS_diagram.svg" alt="DiffKS diagram" style="width:100%;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.1)">
     <p style="text-align:center;font-size:0.9rem;margin-top:0.4rem"><strong>Figure 1: Diagram of our proposed DiffKS architecture.</strong></p>
@@ -108,7 +108,7 @@
     title:'DiffKS (Gradient Descent) vs Genetic Algorithm (GA)',
     path:'grad_vs_gen',
     models:['truth','diffks','ga'],
-    labels:{truth:'Ground Truth',diffKS:'DiffKS',ga:'GA'},
+    labels:{truth:'Ground Truth',diffks:'DiffKS',ga:'GA'},
           metrics : `
         <table class="tg metrics"><thead><tr>
           <th>Optimization Method</th><th>MSL</th><th>Param&nbsp;Loss</th>
