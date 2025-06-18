@@ -1,577 +1,259 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-<meta charset="utf-8">
-<!-- Meta tags for social media banners, these should be filled in appropriatly as they are your "business card" -->
-<!-- Replace the content tag with appropriate information -->
-<meta name="description" content="DESCRIPTION META TAG">
-<meta property="og:title" content="SOCIAL MEDIA TITLE TAG"/>
-<meta property="og:description" content="SOCIAL MEDIA DESCRIPTION TAG TAG"/>
-<meta property="og:url" content="URL OF THE WEBSITE"/>
-<!-- Path to banner image, should be in the path listed below. Optimal dimenssions are 1200X630-->
-<meta property="og:image" content="static/image/your_banner_image.png" />
-<meta property="og:image:width" content="1200"/>
-<meta property="og:image:height" content="630"/>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Differentiable Karplus-Strong Synthesis for Neural Resonance Optimisation</title>
 
+  <!-- ======== SOCIAL / SEO ======== -->
+  <meta name="description"  content="Differentiable Karplus-Strong Synthesis for Neural Resonance Optimisation – project page with audio examples and code links" />
+  <meta property="og:title"        content="Differentiable Karplus-Strong Synthesis for Neural Resonance Optimisation" />
+  <meta property="og:description"  content="Audio examples, paper and code for DiffKS – a differentiable Karplus-Strong string-synthesis model" />
+  <meta property="og:url"          content="URL OF THE WEBSITE" />
+  <meta property="og:image"        content="static/image/your_banner_image.png" />
+  <meta property="og:image:width"  content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta name="twitter:title"  content="DiffKS – Differentiable Karplus-Strong Synthesis" />
+  <meta name="twitter:image"  content="static/images/your_twitter_banner_image.png" />
+  <meta name="twitter:card"   content="summary_large_image" />
+  <meta name="keywords"       content="audio synthesis, differentiable DSP, Karplus-Strong, gradient descent, autoencoder, WASPAA 2025" />
 
-<meta name="twitter:title" content="TWITTER BANNER TITLE META TAG">
-<!-- <meta name="twitter:description" content="TWITTER BANNER DESCRIPTION META TAG"> -->
-<!-- Path to banner image, should be in the path listed below. Optimal dimenssions are 1200X600-->
-<meta name="twitter:image" content="static/images/your_twitter_banner_image.png">
-<meta name="twitter:card" content="summary_large_image">
-<!-- Keywords for your paper to be indexed by-->
-<meta name="keywords" content="KEYWORDS SHOULD BE PLACED HERE">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- fonts & icons (explicitly load 700 & 800 weights to guarantee bold) -->
+  <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;700;800&family=Noto+Sans:wght@400;700;800&family=Castoro&display=swap" rel="stylesheet" />
+  <link href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css" rel="stylesheet" />
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet" />
 
+  <!-- ======== STYLES ======== -->
+  <style>
+    body{font-family:'Google Sans','Noto Sans',Arial,sans-serif;line-height:1.6;color:#333;max-width:1200px;margin:0 auto;padding:20px}
+    .container{max-width:900px;margin:0 auto;padding:0 20px}
+    h1,h2,h3{text-align:center;margin-bottom:1.5rem}
+    h1{color:#2c3e50;margin-bottom:2rem}
+    h2{color:#34495e;margin-top:3rem;margin-bottom:2rem}
+    .abstract{background:#f8f9fa;padding:2rem;border-radius:8px;margin:2rem 0;text-align:justify}
 
-<title>Differentiable Karplus‑Strong Synthesis for Neural Resonance Optimisation</title>
-<link href="https://fonts.googleapis.com/css?family=Google+Sans|Noto+Sans|Castoro"
-rel="stylesheet">
+    table{border-collapse:collapse;width:100%;max-width:900px;margin:2rem auto;box-shadow:0 2px 8px rgba(0,0,0,.1);border-radius:8px;overflow:hidden}
+    th,td{border:1px solid #e1e5e9;padding:10px;text-align:center}
+    th{background:#f0f0f0;font-weight:600}
 
-<link rel="stylesheet"
-href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css">
+    .play-btn,.ctrl-btn{cursor:pointer;padding:6px 14px;background:#007BFF;color:#fff;border:none;border-radius:6px;font-size:15px;transition:.3s;box-shadow:0 2px 4px rgba(0,0,0,.1)}
+    .play-btn:hover,.ctrl-btn:hover{transform:translateY(-1px);box-shadow:0 4px 8px rgba(0,0,0,.15)}
+    .waveform,.spectrogram{height:80px;background:#e8e8e8;margin:6px 0;border-radius:4px;border:1px solid #ddd}
+    .controls{display:flex;justify-content:center;gap:6px;margin-bottom:10px}
 
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
-<style>
-body {
-    font-family: 'Google Sans', 'Noto Sans', Arial, sans-serif;
-    line-height: 1.6;
-    color: #333;
-    max-width: 1200px;
-    margin: 0 auto;
-    padding: 20px;
-}
+    .playerHead{text-align:center;margin-top:3rem}
+    .hero{margin:2rem 0}
 
-.container {
-    max-width: 900px;
-    margin: 0 auto;
-    padding: 0 20px;
-}
+    .button{display:inline-block;padding:10px 18px;text-decoration:none;border-radius:6px;transition:.3s}
+    .is-dark{background:#2c3e50;color:#fff}
+    .is-dark:hover{background:#34495e;transform:translateY(-1px)}
 
-h1, h2, h3 {
-    text-align: center;
-    margin-bottom: 1.5rem;
-}
-
-h1 {
-    color: #2c3e50;
-    margin-bottom: 2rem;
-}
-
-h2 {
-    color: #34495e;
-    margin-top: 3rem;
-    margin-bottom: 2rem;
-}
-
-.abstract {
-    background: #f8f9fa;
-    padding: 2rem;
-    border-radius: 8px;
-    margin: 2rem 0;
-    text-align: justify;
-}
-
-table {
-    border-collapse: collapse;
-    width: 100%;
-    max-width: 600px;
-    margin: 2rem auto 3rem auto;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-    border-radius: 8px;
-    overflow: hidden;
-}
-
-th, td {
-    border: 1px solid #e1e5e9;
-    padding: 15px;
-    text-align: center;
-}
-
-th {
-    background: #f0f0f0;
-    color: #333;
-    font-weight: 600;
-    font-size: 16px;
-}
-
-td {
-    background: white;
-}
-
-.play-btn, .ctrl-btn {
-    cursor: pointer;
-    padding: 8px 16px;
-    background: #007BFF;
-    color: white;
-    border: none;
-    border-radius: 6px;
-    font-size: 16px;
-    transition: all 0.3s ease;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-}
-
-.play-btn:hover, .ctrl-btn:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 4px 8px rgba(0,0,0,0.15);
-}
-
-.expanded-row {
-    background: #f8f9fa;
-}
-
-.expanded-row td {
-    padding: 20px;
-}
-
-.model-detail {
-    text-align: center;
-}
-
-.model-detail > div:first-child {
-    margin-bottom: 15px;
-    font-weight: 600;
-    color: #2c3e50;
-}
-
-.waveform,
-.spectrogram {
-    height: 80px;
-    background: #e8e8e8;
-    margin: 8px 0;
-    border-radius: 4px;
-    border: 1px solid #ddd;
-}
-
-.controls {
-    display: flex;
-    justify-content: center;
-    gap: 8px;
-    margin-bottom: 15px;
-}
-
-.ctrl-btn {
-    padding: 6px 12px;
-    font-size: 14px;
-}
-
-.playerHead {
-    margin-top: 3rem;
-    text-align: center;
-}
-
-.hero {
-    margin: 2rem 0;
-}
-
-.publication-links {
-    margin: 2rem 0;
-    text-align: center;
-}
-
-.link-block {
-    display: inline-block;
-    margin: 0 10px;
-}
-
-.button {
-    display: inline-block;
-    padding: 12px 20px;
-    text-decoration: none;
-    border-radius: 6px;
-    transition: all 0.3s ease;
-}
-
-.is-dark {
-    background: #2c3e50;
-    color: white;
-}
-
-.is-dark:hover {
-    background: #34495e;
-    transform: translateY(-1px);
-}
-</style>
-
-<script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
-<script src="https://documentcloud.adobe.com/view-sdk/main.js"></script>
+    /* metrics table */
+    .metrics th,.metrics td{font-size:14px}
+    .metrics td strong,
+    .metrics th strong,
+    .metrics td span[style*="font-weight:700"]{font-weight:800 !important;}
+  </style>
 </head>
 <body>
-
-
-<section class="hero">
-<div class="hero-body">
-    <div class="container is-max-desktop">
-    <div class="columns is-centered">
-        <div class="column has-text-centered">
-        <h1 class="title is-1 publication-title">Differentiable Karplus‑Strong Synthesis for Neural Resonance Optimisation</h1>
-        <div class="is-size-5 publication-authors">
-            <!-- Paper authors -->
-            <span class="author-block">
-<!--                 <a href="javascript:void(0)" target="">Authors anonymized for review</a><sup></sup></span> -->
-            <span class="author-block">
-                <a href="https://github.com/ptablas" target="_blank">Pablo Tablas de Paula</a>,</span>
-                <span class="author-block">
-                <a href="https://github.com/dsuedholt" target="_blank">David Marttila</a>,</span>
-                <span class="author-block">
-                    <a href="https://www.eecs.qmul.ac.uk/~josh/" target="_blank">Joshua D. Reiss</a>
-                </span>
-                </div>
-
-                <div class="is-size-5 publication-authors">
-                <span class="author-block">Centre for Digital Music, Queen Mary University of London<br>Submitted to WASPAA 2025</span>
-                <!-- <span class="eql-cntrb"><small><br><sup>*</sup>Indicates Equal Contribution</small></span> -->
-                </div>
-
-                <div class="column has-text-centered">
-                <div class="publication-links">
-                        <!-- Arxiv PDF link -->
-                    <span class="link-block">
-                    <a href="" target="_blank"
-                    class="external-link button is-normal is-rounded is-dark">
-                    <span class="icon">
-                        <i class="fas fa-file-pdf"></i>
-                    </span>
-                    <span>Paper</span>
-                    </a>
-                </span>
-
-                <!-- Github link -->
-                <span class="link-block">
-                <a href="https://github.com/ptablasdpaula/diffKS_torchLPC" target="_blank"
-                class="external-link button is-normal is-rounded is-dark">
-                <span class="icon">
-                    <i class="fab fa-github"></i>
-                </span>
-                <span>Code</span>
-                </a>
-            </span>
-
-            <!-- ArXiv abstract Link -->
-            <!--   <span class="link-block"> -->
-            <!--     <a href="https://arxiv.org/abs/<ARXIV PAPER ID>" target="_blank" -->
-            <!--     class="external-link button is-normal is-rounded is-dark"> -->
-            <!--     <span class="icon"> -->
-            <!--       <i class="ai ai-arxiv"></i> -->
-            <!--     </span> -->
-            <!--     <span>arXiv</span> -->
-            <!--   </a> -->
-            <!-- </span> -->
-        </div>
-        </div>
+  <!-- ===== HEADER ===== -->
+  <section class="hero">
+    <div class="hero-body">
+      <div class="container is-max-desktop">
+        <div class="columns is-centered"><div class="column has-text-centered">
+          <h1 class="title is-1">Differentiable Karplus-Strong Synthesis for Neural Resonance Optimisation</h1>
+          <div class="is-size-5"><span><a href="https://github.com/ptablas" target="_blank">Pablo Tablas de Paula</a>, </span><span><a href="https://github.com/dsuedholt" target="_blank">David Marttila</a>, </span><span><a href="https://www.eecs.qmul.ac.uk/~josh/" target="_blank">Joshua D. Reiss</a></span><br><span>Centre for Digital Music, QMUL &middot; Submitted to WASPAA 2025</span></div>
+          <div style="margin-top:1rem"><a href="static/paper.pdf" target="_blank" class="button is-dark is-rounded"><i class="fas fa-file-pdf"></i>&nbsp;Paper</a> <a href="https://github.com/ptablasdpaula/diffKS_torchLPC" target="_blank" class="button is-dark is-rounded"><i class="fab fa-github"></i>&nbsp;Code</a></div>
+        </div></div>
+      </div>
     </div>
-    </div>
-</div>
-</div>
-</section>
+  </section>
 
-
-<!-- Teaser video-->
-<!-- <section class="hero teaser"> -->
-<!--   <div class="container is-max-desktop"> -->
-<!--     <div class="hero-body"> -->
-<!--         <img src="static/images/overview.png" alt="MY ALT TEXT"/> -->
-<!--         <h2 class="subtitle has-text-centered"> -->
-<!--           First image description. -->
-<!--         </h2> -->
-<!--     </div> -->
-<!--   </div> -->
-<!-- </section> -->
-<!-- End teaser video -->
-
-<!-- Paper abstract -->
-<section class="section hero is-light">
-<div class="container is-max-desktop">
-<div class="columns is-centered has-text-centered">
-    <div class="column is-four-fifths">
+  <!-- ===== ABSTRACT & FIGURE ===== -->
+  <section class="section hero is-light"><div class="container is-max-desktop">
     <h2 class="title is-3">Abstract</h2>
-    <div class="content has-text-justified">
-        <p>
-            The Karplus-Strong algorithm is a well-known approach for realistic string simulation through a highly efficient formulation, but parameter optimisation traditionally relies on manual tuning or non-differentiable optimisation methods. We present DiffKS, a fully differentiable time-domain implementation of Karplus-Strong synthesis that enables resonance optimisation through gradient descent. Our time-domain formulation allows for expressive pitch and timbre modulation while learning exact gradients. Inspired by commuted synthesis, we propose a two-filtering stage pipeline: an excitation filter capturing pluck absorption, and a loop filter modelling the system's body resonance. A preceding inverse-filtering stage uses the learnt impulse response to extract plucking information. We demonstrate that DiffKS can optimise by gradient descent and outperforms genetic algorithm optimisation perceptually and in terms of computational efficiency. Additionally, we embed DiffKS onto an autoencoder neural network and compare it to a previous neural supervised approach. We find our proposed architecture converges substantially quicker than its supervised counterpart and learns a latent representation that accurately captures the resonance of an acoustic guitar.
-        </p>
-    </div>
-    </div>
-</div>
-</div>
-</section>
-<!-- End paper abstract -->
+    <div class="abstract"><p>The Karplus-Strong algorithm is a well-known approach for realistic string simulation through an extremely efficient delay-line formulation, but parameter optimisation traditionally relies on manual tuning or non-differentiable search. We present <strong>DiffKS</strong>, a fully differentiable time-domain implementation of Karplus-Strong synthesis that enables resonance optimisation via gradient descent. Inspired by commuted synthesis, DiffKS separates excitation and resonant body response with a two-filter pipeline and learns both filters end-to-end. We show that (i) DiffKS outperforms a genetic-algorithm baseline both perceptually and computationally, and (ii) when embedded in an auto-encoder it converges faster than a purely supervised approach while learning a latent space that faithfully captures the resonance of an acoustic guitar.</p></div>
 
+    <img src="images/diffKS_diagram.svg" alt="DiffKS diagram" style="width:100%;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.1)">
+    <p style="text-align:center;font-size:0.9rem;margin-top:0.4rem"><strong>Figure 1: Diagram of our proposed DiffKS architecture.</strong></p>
+    <p style="text-align:center;font-size:0.9rem">The learnable parameters are shown in a pink-to-egg-white gradient. On the right, a forward custom Extended Karplus-Strong (EKS) generates the resonant output; on the left, its inversion extracts the pluck excitation. For clarity, inversion collapses excitation filter coefficients <code>a<sub>3</sub></code>, <code>a<sub>2</sub></code>, and <code>a<sub>1</sub></code>, while forward mode collapses <code>a<sub>2</sub></code>, <code>a<sub>3</sub></code>, and <code>a<sub>4</sub></code>. Blocks with points joint by dashed-lines and a tuning-fork icon denote linear interpolation and tuning operations.</p>
+  </div></section>
 
+  <!-- ===== AUDIO TABLE CONTAINERS ===== -->
+  <section class="hero is-small"><div class="hero-body"><div class="container" id="container-grad_vs_gen"></div></div></section>
+  <section class="hero is-small is-light"><div class="hero-body"><div class="container" id="container-ae"></div></div></section>
 
+  <!-- ===== BIBTEX ===== -->
+  <section class="section" id="BibTeX"><div class="container is-max-desktop content"><h2 class="title">BibTeX</h2><pre><code>@inproceedings{tablas2025diffks,
+  title   = {Differentiable Karplus-Strong Synthesis for Neural Resonance Optimisation},
+  author  = {Tablas de Paula, Pablo and Marttila, David and Reiss, Joshua D.},
+  booktitle = {Proc. IEEE Workshop on Applications of Signal Processing to Audio and Acoustics (WASPAA)},
+  year    = {2025},
+  address = {New Paltz, NY}
+}</code></pre></div></section>
 
-<!-- <!-- Youtube video --> 
-<!-- <section class="hero is-small"> -->
-<!--   <div class="hero-body"> -->
-<!--     <div class="container"> -->
-<!--       <!-- Paper video. --> 
-<!--       <!-- <h2 class="title is-3">Overview Figure</h2> --> 
-<!--       <div class="columns is-centered has-text-centered"> -->
-<!--         <div class="column is-two-thirds"> -->
-<!--            -->
-<!--           <div class="container"> -->
-<!--             <img src="static/images/overview.png" alt="MY ALT TEXT" style="width:800px"/> -->
-<!--           </div> -->
-<!--         <h2 class="subtitle has-text-centered"> -->
-<!--           <b>Top: </b>  Audio synthesis is the forward map we wish to invert. -->
-<!--    Synthesizers can be invariant to certain transformations of their parameters, which makes the inverse problem ill-posed. -->
-<!--    <b>Bottom-left: </b> Synthesizer inversion by parameter regression. The neural network produces a point estimate, and does not account for symmetries in the synthesizer. <b>Bottom-middle: </b> A generative model approximates the conditional distribution of parameters <b>x</b> given audio <b>y</b>, but can only learn the appropriate invariances if present in the data. <b>Bottom-right: </b> Using an equivariant flow, the learned distribution is inherently invariant to the symmetries of the synthesizer. -->
-<!--         </h2> -->
-<!--         </div> -->
-<!--       </div> -->
-<!--     </div> -->
-<!--   </div> -->
-<!-- </section> -->
-<!-- <!-- End youtube video -->
+  <!-- ===== FOOTER ===== -->
+  <footer class="footer"><div class="container"><p style="text-align:center;font-size:0.85rem">© 2025 DiffKS — built from the Academic Project Page template.</p></div></footer>
 
+  <!-- ===== PLAYER & TABLE SCRIPT ===== -->
+  <script type="module">
+  import WaveSurfer from 'https://cdn.jsdelivr.net/npm/wavesurfer.js@7/dist/wavesurfer.esm.js';
+  import Spectrogram from 'https://cdn.jsdelivr.net/npm/wavesurfer.js@7/dist/plugins/spectrogram.js';
 
-<!-- Audio Examples -->
-<section class="hero is-small">
-<div class="hero-body">
-<div class="container">
-    <div id="container-indomain"></div>
-</div>
-</div>
-</section>
+  /* ---------- BASIC CONFIG ---------- */
+  const AUDIO_EXT='.mp4', ROWS=3;
 
-<section class="hero is-small is-light">
-<div class="hero-body">
-<div class="container">
-    <div id="container-outofdomain"></div>
-</div>
-</div>
-</section>
-<!-- End video carousel -->
+  /* ---------- TABLE DEFINITIONS ---------- */
+  const TABLES=[{
+    title:'DiffKS (Gradient Descent) vs Genetic Algorithm (GA)',
+    path:'grad_vs_gen',
+    models:['truth','diffks','ga'],
+    labels:{truth:'Ground Truth',diffKS:'DiffKS',ga:'GA'},
+          metrics : `
+        <table class="tg metrics"><thead><tr>
+          <th>Optimization Method</th><th>MSL</th><th>Param&nbsp;Loss</th>
+          <th>PANNs</th><th>VGGish</th><th>CDPAM</th><th>CLAP</th>
+          <th>Avg&nbsp;Iter</th><th>Total&nbsp;Time</th></tr></thead><tbody>
+          <tr>
+            <td>Gradient Descent</td><td><strong>0.95 ± 0.94</strong></td><td><strong>0.21 ± 0.07</strong></td>
+            <td><strong>3.941</strong></td><td><strong>0.757</strong></td><td><strong>0.179</strong></td><td><strong>1.335</strong></td>
+            <td><strong>1.24&nbsp;s</strong></td><td><strong>2&nbsp;h 4&nbsp;m 5&nbsp;s</strong></td>
+          </tr>
+          <tr>
+            <td>Genetic Algorithm</td><td>1.18 ± 0.80</td><td>0.23 ± 0.02</td>
+            <td>8.553</td><td>1.645</td><td>1.252</td><td>2.179</td>
+            <td>13.23&nbsp;s</td><td>23&nbsp;h 3&nbsp;m 59&nbsp;s</td>
+          </tr>
+        </tbody></table>
+         <p class="table-caption">
+        <strong>Table 1:</strong> Mean ± std. of MSL, Parameter Loss, KAD scores and wall-clock times for optimization baselines (N=100).
+      </p>\``
+    },{
+    title:'Auto-encoder baselines',
+    path:'ae',
+    models:['truth','nsynth','fcnf0pp','sup'],
+    labels:{truth:'Ground Truth',nsynth:'NSynth-F0',fcnf0pp:'FCNF0++',sup:'Supervised'},
+          metrics : `
+        <table class="tg metrics"><thead><tr>
+          <th>Autoencoder</th><th>MSL</th><th>Parameter Loss</th>
+          <th>PANNs</th><th>VGGish</th><th>CDPAM</th><th>CLAP</th>
+        </tr></thead><tbody>
+          <tr>
+            <td>Nsynth-F0</td><td><strong>0.93 ± 0.19</strong></td><td>0.46 ± 0.02</td>
+            <td><strong>3.139</strong></td><td><strong>0.611</strong></td><td><strong>0.463</strong></td><td><strong>2.582</strong></td>
+          </tr>
+          <tr>
+            <td>FCNF0++</td><td>1.16 ± 0.26</td><td>0.46 ± 0.02</td>
+            <td>4.750</td><td>0.696</td><td>0.706</td><td>3.279</td>
+          </tr>
+          <tr>
+            <td>Supervised</td><td>2.74 ± 0.46</td><td><strong>0.13 ± 0.01</strong></td>
+            <td>31.655</td><td>9.091</td><td>15.557</td><td>7.184</td>
+          </tr>
+        </tbody></table>
+ <p class="table-caption">
+        <strong>Table 2:</strong> Mean ± std. dev. of MSL, Parameter Loss and KAD scores for our auto-encoder baselines (N = 195).
+      </p>`  }];
 
+  /* ---------- HELPERS ---------- */
+  async function getIDs(path){
+    try{
+      const r=await fetch(`${path}/index.json`,{cache:'no-store'});
+      return r.ok?(await r.json()).samples:[];
+    }catch{ return []; }
+  }
+  const rand=(arr,n)=>arr.slice().sort(()=>0.5-Math.random()).slice(0,Math.min(n,arr.length));
+  const icon=(btn,on)=>{ btn.innerHTML = on ? '<i class="fas fa-pause"></i>' : '<i class="fas fa-play"></i>'; };
 
-
-
-
-
-
-<!--BibTex citation -->
-<section class="section" id="BibTeX">
-<div class="container is-max-desktop content">
-    <h2 class="title">BibTeX</h2>
-    <pre><code>BibTex will go here</code></pre>
-</div>
-</section>
-<!--End BibTex citation -->
-
-
-<footer class="footer">
-<div class="container">
-<div class="columns is-centered">
-    <div class="column is-8">
-    <div class="content">
-
-        <p>
-        This page was built using the <a href="https://github.com/eliahuhorwitz/Academic-project-page-template" target="_blank">Academic Project Page Template</a> which was adopted from the <a href="https://nerfies.github.io" target="_blank">Nerfies</a> project page.
-        You are free to borrow the source code of this website, we just ask that you link back to this page in the footer. <br> This website is licensed under a <a rel="license"  href="http://creativecommons.org/licenses/by-sa/4.0/" target="_blank">Creative
-        Commons Attribution-ShareAlike 4.0 International License</a>.
-        </p>
-
-    </div>
-    </div>
-</div>
-</div>
-</footer>
-
-<!-- Statcounter tracking code -->
-
-<!-- You can add a tracker to track page visits by creating an account at statcounter.com -->
-
-<!-- End of Statcounter Code -->
-<script type="module">
-import WaveSurfer from 'https://cdn.jsdelivr.net/npm/wavesurfer.js@7/dist/wavesurfer.esm.js';
-import Spectrogram from 'https://cdn.jsdelivr.net/npm/wavesurfer.js@7/dist/plugins/spectrogram.js';
-
-const MODEL_ORDER = ['truth', 'grad', 'vae'];
-const MODEL_LABELS = {
-    'truth': 'Ground Truth',
-    'grad': 'Gradient Descent',
-    'vae': 'VAE'
-};
-
-const TABLES = [
-    { title: 'In-Domain Examples', path: 'indomain', samples: [1] },
-    { title: 'Out-of-Domain Examples', path: 'outofdomain', samples: [1] }
-];
-
-let globalExpanded = null;
-
-function updateButtonText(button, isPlaying) {
-    button.innerHTML = isPlaying ? '<i class="fas fa-pause"></i>' : '<i class="fas fa-play"></i>';
-}
-
-function createWaveSurfer(container, audioUrl) {
-    const waveformEl = container.querySelector('.waveform');
-    const spectroEl = container.querySelector('.spectrogram');
+  /* ---------- PLAYER CACHE ---------- */
+  const players=new Map();
+  function makePlayer(td,url){
+    const wf = td.querySelector('.waveform');
+    const sp = td.querySelector('.spectrogram');
     const ws = WaveSurfer.create({
-    container: waveformEl,
-    waveColor: '#999',
-    progressColor: '#007BFF',
-    height: 80,
-    plugins: [
-        Spectrogram.create({
-        container: spectroEl,
-        scale: 'mel',
-        labels: false,
-        height: 80
-        })
-    ]
+      container:wf, backend:'MediaElement', height:80,
+      waveColor:'#999', progressColor:'#007BFF',
+      plugins:[ Spectrogram.create({container:sp,scale:'mel',labels:false,height:80}) ]
     });
-    ws.load(audioUrl);
+    ws.load(url);
     return ws;
-}
+  }
 
-function collapseGlobalExpanded() {
-    if (globalExpanded) {
-    const { waveSurfers, buttons, row } = globalExpanded;
-    Object.entries(waveSurfers).forEach(([model, ws]) => {
-        if (ws.isPlaying()) ws.pause();
-        ws.destroy();
+  /* ---------- TABLE FACTORY ---------- */
+  function shell(tbl){
+    const wrap=document.getElementById(`container-${tbl.path}`);
+    wrap.innerHTML='';
+    wrap.insertAdjacentHTML('beforeend',`
+      <div class="playerHead">
+        <h2 class="title is-4">${tbl.title}</h2>
+        ${tbl.metrics || ''}
+        <button class="button is-small is-dark" id="shuffle-${tbl.path}">🔀 Shuffle rows</button>
+      </div>
+      <table id="table-${tbl.path}">
+        <thead><tr>${tbl.models.map(m=>`<th>${tbl.labels[m]}</th>`).join('')}</tr></thead>
+        <tbody></tbody>
+      </table>`);
+    return wrap.querySelector(`#shuffle-${tbl.path}`);
+  }
+
+  function renderRows(tbl,ids){
+    const tbody=document.querySelector(`#table-${tbl.path} tbody`);
+    tbody.innerHTML='';
+
+    /* destroy old players for this table */
+    [...players.entries()].forEach(([btn,ws])=>{
+      if(btn.dataset.path===tbl.path){ ws.destroy(); players.delete(btn); }
     });
-    Object.values(buttons).forEach(btn => updateButtonText(btn, false));
-    row.remove();
-    globalExpanded = null;
+
+    ids.forEach(id=>{
+      const row=document.createElement('tr');
+      row.dataset.sample=id;
+
+      tbl.models.forEach(m=>{
+        const td=document.createElement('td');
+        td.innerHTML=`<div class="controls">
+            <button class="play-btn"><i class="fas fa-play"></i></button>
+            <button class="ctrl-btn" data-act="stop"><i class="fas fa-stop"></i></button>
+            <button class="ctrl-btn" data-act="rew"><i class="fas fa-backward"></i></button>
+          </div>
+          <div class="waveform"></div>
+          <div class="spectrogram"></div>`;
+
+        const url=`${tbl.path}/${id}-${m}${AUDIO_EXT}`;
+        const ws=makePlayer(td,url);
+        const playB=td.querySelector('.play-btn');
+        const stopB=td.querySelector('[data-act="stop"]');
+        const rewB =td.querySelector('[data-act="rew"]');
+
+        playB.onclick=()=>{
+          players.forEach((other,b)=>{
+            if(other.isPlaying()){ other.pause(); icon(b,false); }
+          });
+          if(ws.isPlaying()){ ws.pause(); icon(playB,false); }
+          else              { ws.play();  icon(playB,true);  }
+        };
+        stopB.onclick=()=>{ ws.pause(); ws.seekTo(0); icon(playB,false); };
+        rewB .onclick=()=>{ ws.seekTo(0); ws.play();  icon(playB,true);  };
+
+        playB.dataset.path=tbl.path;
+        players.set(playB,ws);
+        row.appendChild(td);
+      });
+
+      tbody.appendChild(row);
+    });
+  }
+
+  /* ---------- PAGE INITIALISATION ---------- */
+  (async()=>{
+    for(const tbl of TABLES){
+      const shuffleBtn=shell(tbl);
+      const allIDs=await getIDs(tbl.path);
+      let visibleIDs=rand(allIDs,ROWS);
+      renderRows(tbl,visibleIDs);
+      shuffleBtn.onclick=()=>{ visibleIDs=rand(allIDs,ROWS); renderRows(tbl,visibleIDs); };
     }
-}
-
-function buildTableUI(title, tableId, path) {
-    const container = document.createElement('div');
-    const heading = document.createElement('h2');
-    heading.classList.add('playerHead')
-    heading.classList.add('title')
-    heading.classList.add('is-4')
-    heading.innerHTML = title;
-
-    const table = document.createElement('table');
-    table.id = tableId;
-    table.innerHTML = `
-    <thead>
-        <tr>
-        ${MODEL_ORDER.map(m => `<th>${MODEL_LABELS[m]}</th>`).join('')}
-        </tr>
-    </thead>
-    <tbody></tbody>
-    `;
-    container.appendChild(heading);
-    container.appendChild(table);
-    document.getElementById('container-' + path).innerHTML = '';
-    document.getElementById('container-' + path).appendChild(container);
-}
-
-function populateTableBody(samples, tableId, path) {
-    const table = document.getElementById(tableId);
-    const tbody = table.querySelector('tbody');
-    tbody.innerHTML = '';
-
-    samples.forEach(sample => {
-    const row = document.createElement('tr');
-    row.setAttribute('data-sample', sample);
-    row.innerHTML = `
-        ${MODEL_ORDER.map(m => `<td><button class="play-btn" data-model="${m}"><i class='fas fa-play'></i></button></td>`).join('')}
-    `;
-    tbody.appendChild(row);
-
-    row.querySelectorAll('.play-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-        const model = btn.getAttribute('data-model');
-        const sampleId = row.getAttribute('data-sample');
-
-        if (globalExpanded?.sample == sampleId && globalExpanded?.path == path) {
-            const ws = globalExpanded.waveSurfers[model];
-            const b = globalExpanded.buttons[model];
-            if (ws.isPlaying()) {
-            ws.pause();
-            updateButtonText(b, false);
-            } else {
-            Object.entries(globalExpanded.waveSurfers).forEach(([m, otherWs]) => {
-                if (m !== model && otherWs.isPlaying()) {
-                otherWs.pause();
-                updateButtonText(globalExpanded.buttons[m], false);
-                }
-            });
-            ws.play();
-            updateButtonText(b, true);
-            }
-            return;
-        }
-
-        collapseGlobalExpanded();
-
-        const detailRow = document.createElement('tr');
-        detailRow.classList.add('expanded-row');
-
-        const waveSurfers = {};
-        const buttons = {};
-
-        MODEL_ORDER.forEach(modelName => {
-            const td = document.createElement('td');
-            td.innerHTML = `
-            <div class="model-detail">
-                <div><strong>${MODEL_LABELS[modelName]}</strong></div>
-                <div class="controls">
-                    <button class="ctrl-btn" data-action="stop" data-model="${modelName}"><i class="fas fa-stop"></i></button>
-                    <button class="ctrl-btn" data-action="rewind" data-model="${modelName}"><i class="fas fa-backward"></i></button>
-                </div>
-                <div class="waveform"></div>
-                <div class="spectrogram"></div>
-            </div>
-            `;
-            detailRow.appendChild(td);
-
-            const url = `${path}/${sampleId}-${modelName}.wav`;
-            waveSurfers[modelName] = createWaveSurfer(td, url);
-        });
-
-        MODEL_ORDER.forEach(m => {
-            const b = row.querySelector(`.play-btn[data-model='${m}']`);
-            if (b) buttons[m] = b;
-        });
-
-        row.parentNode.insertBefore(detailRow, row.nextSibling);
-        globalExpanded = { row: detailRow, waveSurfers, buttons, sample: sampleId, path: path };
-
-        detailRow.querySelectorAll('[data-action="stop"]').forEach(stopBtn => {
-            stopBtn.addEventListener('click', () => {
-                const modelName = stopBtn.getAttribute('data-model');
-                const ws = waveSurfers[modelName];
-                if (ws.isPlaying()) ws.pause();
-                ws.seekTo(0);
-                updateButtonText(buttons[modelName], false);
-            });
-        });
-        
-        detailRow.querySelectorAll('[data-action="rewind"]').forEach(rewindBtn => {
-            rewindBtn.addEventListener('click', () => {
-                const modelName = rewindBtn.getAttribute('data-model');
-                const ws = waveSurfers[modelName];
-                ws.seekTo(0);
-                ws.play();
-                updateButtonText(buttons[modelName], true);
-            });
-        });
-
-        const ws = waveSurfers[model];
-        const b = buttons[model];
-        ws.play();
-        updateButtonText(b, true);
-        });
-    });
-    });
-}
-
-function loadSamples() {
-    for (const { title, path, samples } of TABLES) {
-        const tableId = `table-${path}`;
-        buildTableUI(title, tableId, path);
-        populateTableBody(samples, tableId, path);
-    }
-}
-
-loadSamples();
-</script>
-
+  })();
+  </script>
 </body>
 </html>

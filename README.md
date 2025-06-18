@@ -2,7 +2,7 @@
 
 This repository contains the reference implementation and experiment scripts that accompany our WASPAA 2025 submission _Differentiable Karplus‑Strong Synthesis for Neural Resonance Optimisation_.
 
-[transfer]: transfer.png
+[transfer]: docs/images/transfer.png
 
 ![alt-text][transfer]
 
