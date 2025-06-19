@@ -76,10 +76,11 @@
 
     <img src="images/diffKS_diagram.svg" alt="DiffKS diagram" style="width:100%;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.1)">
     <p style="text-align:center;font-size:0.9rem;margin-top:0.4rem"><strong>Figure 1: Diagram of our proposed DiffKS architecture.</strong></p>
-    <p style="text-align:center;font-size:0.9rem">The learnable parameters are shown in a pink-to-egg-white gradient. On the right, a forward custom Extended Karplus-Strong (EKS) generates the resonant output; on the left, its inversion extracts the pluck excitation. For clarity, inversion collapses excitation filter coefficients <code>a<sub>3</sub></code>, <code>a<sub>2</sub></code>, and <code>a<sub>1</sub></code>, while forward mode collapses <code>a<sub>2</sub></code>, <code>a<sub>3</sub></code>, and <code>a<sub>4</sub></code>. Blocks with points joint by dashed-lines and a tuning-fork icon denote linear interpolation and tuning operations.</p>
+    <p style="text-align:center;font-size:0.9rem">The learnable parameters are shown in a pink → egg-white gradient. On the right, a forward custom Extended Karplus-Strong (EKS) generates the resonant output; on the left, its inversion extracts the pluck excitation. Note that the learnable parameters are tied between both branches; i.e. The trainable vector θ is used once for the forward EKS and again for the inversed EKS. For clarity, inversion collapses excitation filter coefficients <code>a<sub>3</sub></code>, <code>a<sub>2</sub></code>, and <code>a<sub>1</sub></code>, while forward mode collapses <code>a<sub>2</sub></code>, <code>a<sub>3</sub></code>, and <code>a<sub>4</sub></code>. Blocks with points joint by dashed-lines and a tuning-fork icon denote linear interpolation and tuning operations.</p>
   </div></section>
 
   <!-- ===== AUDIO TABLE CONTAINERS ===== -->
+  <section class="hero is-small"><div class="hero-body"><div class="container" id="container-flow"></div></div></section>
   <section class="hero is-small"><div class="hero-body"><div class="container" id="container-grad_vs_gen"></div></div></section>
   <section class="hero is-small is-light"><div class="hero-body"><div class="container" id="container-ae"></div></div></section>
 
@@ -105,6 +106,12 @@
 
   /* ---------- TABLE DEFINITIONS ---------- */
   const TABLES=[{
+  title : 'DiffKS Path Flow',
+  path  : 'flow',
+  models: ['truth','inv','pred'],
+  labels: { truth:'Ground Truth', inv:'Inverse', pred:'Predicted' }
+},
+    {
     title:'DiffKS (Gradient Descent) vs Genetic Algorithm (GA)',
     path:'grad_vs_gen',
     models:['truth','diffks','ga'],
@@ -166,6 +173,17 @@
   const rand=(arr,n)=>arr.slice().sort(()=>0.5-Math.random()).slice(0,Math.min(n,arr.length));
   const icon=(btn,on)=>{ btn.innerHTML = on ? '<i class="fas fa-pause"></i>' : '<i class="fas fa-play"></i>'; };
 
+  async function filterValid (tbl, ids) {
+  const checks = ids.map(async id => {
+    for (const m of tbl.models) {
+      const resp = await fetch(`${tbl.path}/${id}-${m}${AUDIO_EXT}`, {method:'HEAD'});
+      if (!resp.ok) return null;                 // missing → reject this id
+    }
+    return id;                                   // all files exist
+  });
+  return (await Promise.all(checks)).filter(Boolean);
+}
+
   /* ---------- PLAYER CACHE ---------- */
   const players=new Map();
   function makePlayer(td,url){
@@ -188,7 +206,7 @@
       <div class="playerHead">
         <h2 class="title is-4">${tbl.title}</h2>
         ${tbl.metrics || ''}
-        <button class="button is-small is-dark" id="shuffle-${tbl.path}">🔀 Shuffle rows</button>
+        <button class="button is-small is-dark" id="shuffle-${tbl.path}">🔀 Shuffle Examples</button>
       </div>
       <table id="table-${tbl.path}">
         <thead><tr>${tbl.models.map(m=>`<th>${tbl.labels[m]}</th>`).join('')}</tr></thead>
@@ -246,13 +264,18 @@
   }
 
   /* ---------- PAGE INITIALISATION ---------- */
-  (async()=>{
-    for(const tbl of TABLES){
-      const shuffleBtn=shell(tbl);
-      const allIDs=await getIDs(tbl.path);
-      let visibleIDs=rand(allIDs,ROWS);
-      renderRows(tbl,visibleIDs);
-      shuffleBtn.onclick=()=>{ visibleIDs=rand(allIDs,ROWS); renderRows(tbl,visibleIDs); };
+  (async ()=>{
+    for (const tbl of TABLES) {
+      const shuffleBtn = shell(tbl);
+
+      /* 1️⃣  get the full list, but keep only fully-present samples  */
+      let pool = await filterValid(tbl, await getIDs(tbl.path));
+
+      /* 2️⃣  choose random subset to render                        */
+      let visible = rand(pool, ROWS);
+      renderRows(tbl, visible);
+
+      shuffleBtn.onclick = ()=>{ visible = rand(pool, ROWS); renderRows(tbl, visible); };
     }
   })();
   </script>

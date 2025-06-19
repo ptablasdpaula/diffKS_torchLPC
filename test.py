@@ -1,3 +1,7 @@
+# diffks_experiment.py
+# --------------------------------------------------------------------------
+# Differentiable Karplus-Strong experiment with extra spectrogram outputs
+# --------------------------------------------------------------------------
 from __future__ import annotations
 
 import math
@@ -17,9 +21,9 @@ from diffKS import DiffKS
 from utils import (noise_burst, resize_tensor_dim, )
 
 hp = {
-    "learning_rate": 0.1,
-    "max_epochs": 200,
-    "use_A_weighing": True
+    "learning_rate": 0.2,
+    "max_epochs": 250,
+    "use_A_weighing": True,
 }
 
 mp = {
