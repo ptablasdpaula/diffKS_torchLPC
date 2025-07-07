@@ -14,22 +14,18 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from third_party.auraloss.auraloss.freq import MultiResolutionSTFTLoss as MultiSTFT
-
 from diffKS import DiffKS
-from utils import resize_tensor_dim
 
 hp = {
-    "learning_rate": 0.2,
-    "max_epochs": 250,
+    "learning_rate": 0.1,
+    "max_epochs": 150,
     "use_A_weighing": True,
 }
 
 mp = {
     "exc_order": 5,
-    "exc_n_frames": 4,
     "exc_length_s": 0.025,
     "loop_order": 2,
-    "loop_n_frames": 4,
     "f0_hz": 311.13,
     "min_f0_hz": 82.41,  # MIDI E2 in Hz
     "burst_width_s": 0.03,
@@ -48,6 +44,9 @@ gs = {
 LENGTH_N = 4 * gs["sample_rate"]
 LENGTH_N_UPSAMPLED = 4 * gs["internal_sr"]
 
+triggers_s = torch.tensor([0.0, 3.0])
+# convert trigger times to INTERNAL‑SR sample indices
+triggers_n = (triggers_s * gs["internal_sr"]).long().unsqueeze(0)  # [B(1), F]
 
 # -----------------------------------------------------------------------------
 # Utility helpers
@@ -83,29 +82,26 @@ def build_random_model(seed: int) -> DiffKS:
     np.random.seed(seed)
 
     loop_order = mp["loop_order"]
-    loop_n_frames = mp["loop_n_frames"]
     exc_order = mp["exc_order"]
-    exc_n_frames = mp["exc_n_frames"]
 
     model = DiffKS(
         internal_sr=gs["internal_sr"],
         min_f0_hz=mp["min_f0_hz"],
         loop_order=loop_order,
-        loop_n_frames=loop_n_frames,
         exc_order=exc_order,
-        exc_n_frames=exc_n_frames,
         exc_length_s=mp["exc_length_s"],
         interp_type=mp["interp_type"],
         use_double_precision=mp["use_double_precision"],
         batch_size=1
     )
 
-    model.set_loop_coefficients(torch.rand(1, loop_n_frames, loop_order + 1))
-    model.set_loop_gain(torch.rand((1, loop_n_frames, 1), ))
-    model.set_exc_coefficients(torch.rand(1, exc_n_frames, exc_order + 1) * 0.1)
+    F = triggers_n.size(1)
+
+    model.set_loop_coefficients(torch.rand(1, F, loop_order + 1))
+    model.set_loop_gain(torch.rand((1, F, 1), ))
+    model.set_exc_coefficients(torch.rand(1, F, exc_order + 1) * 0.1)
 
     return model
-
 
 # -----------------------------------------------------------------------------
 # Composite plotting helpers
@@ -173,13 +169,19 @@ def composite_plot(fig_path: str,
         traj_np = traj if isinstance(traj, np.ndarray) else traj
         traj_np = traj_np if isinstance(traj_np, np.ndarray) else traj_np.cpu().numpy()
 
+        # --- map internal‑SR sample index to outer SR (16 k) -------------
+        sr_vis      = gs["sample_rate"]               # 16 kHz
+        sr_internal = gs["internal_sr"]               # 41 kHz
+        x_coeff     = np.arange(traj_np.shape[0]) * (sr_vis / sr_internal)
+
         if traj_np.ndim == 1:  # single trajectory
-            ax.plot(traj_np, label=name)
+            ax.plot(x_coeff, traj_np, label=name)
         else:  # multiple taps
             for k in range(traj_np.shape[1]):
-                ax.plot(traj_np[:, k], label=f"{name}-b{k}")
+                ax.plot(x_coeff, traj_np[:, k], label=f"{name}-b{k}")
         ax.set_title(name)
-        ax.set_xlabel("samples")
+        ax.set_xlim(0, gs["sample_rate"] * gs["length_audio_s"])
+        ax.set_xlabel("samples (16 kHz)")
         ax.grid(False)
         ax.legend(loc="upper right")
         row += 1
@@ -228,7 +230,8 @@ def optimise_model(model: DiffKS,
         out = model(f0_frames=f0_frames.to(model.device),
                     input=input_signal.to(model.device),
                     input_sr=gs["sample_rate"],
-                    direct=direct)
+                    direct=direct,
+                    triggers=triggers_n)
 
         # Calculate loss
         loss = loss_fn(out.unsqueeze(1),
@@ -284,17 +287,21 @@ def main() -> None:
                    f0_frames=f0_frames_opt,
                    direct=direct_flag)
 
-    optim_audio = model_opt(f0_frames=f0_frames_opt.to(model_opt.device),
-                            input=input_sig.to(model_opt.device),
-                            input_sr=sample_rate,
-                            direct=direct_flag).cpu()[0, ...]
+    optim_audio = model_opt(
+        f0_frames=f0_frames_opt.to(model_opt.device),
+        input=input_sig.to(model_opt.device),
+        input_sr=sample_rate,
+        direct=direct_flag,
+        triggers=triggers_n
+    ).cpu()[0, ...]
 
     save_audio("optimized_model.wav", optim_audio, sample_rate)
 
     # -------------------------------------------------------------------------
     # Upsampled coefficients for comparison ------------------------------------
     _, l_b_opt, _, exc_b_opt = model_opt.get_upsampled_parameters(f0=f0_frames_opt,
-                                                                  num_samples=LENGTH_N_UPSAMPLED)
+                                                                  num_samples=LENGTH_N_UPSAMPLED,
+                                                                  triggers=triggers_n)
     l_b_opt = l_b_opt[0].squeeze().detach().cpu().numpy()
     exc_b_opt = exc_b_opt[0].squeeze().detach().cpu().numpy()
 
@@ -324,7 +331,8 @@ def main() -> None:
     # First get upsampled parameters
     _, l_b_opt_up, l_g_opt_up, exc_b_opt_up = model_opt.get_upsampled_parameters(
         f0=f0_frames_opt,
-        num_samples=LENGTH_N_UPSAMPLED
+        num_samples=LENGTH_N_UPSAMPLED,
+        triggers=triggers_n,
     )
     # Then apply constraints to the upsampled parameters
     l_b_opt = model_opt.get_constrained_l_coefficients(l_b=l_b_opt_up, l_g=l_g_opt_up)

@@ -111,9 +111,7 @@ class DiffKS(nn.Module):
         internal_sr: int = 44100,
         min_f0_hz: float = 27.5,
         loop_order: int = 1,
-        loop_n_frames: int = 1,
         exc_order: int = 5,
-        exc_n_frames: int = 1,
         exc_length_s : float = 0.025,
         interp_type: str = "linear",
         use_double_precision: bool = False,
@@ -130,19 +128,19 @@ class DiffKS(nn.Module):
         self.min_f0_hz = min_f0_hz
 
         # ====== Excitation Filter ======================
-        self.exc_n_frames = exc_n_frames
         self.exc_order = exc_order
         self.exc_n_coefficients = exc_order + 1 # To account for exc_g
         self.exc_length_n = int (exc_length_s * internal_sr)
-        self.exc_coefficients = nn.Parameter(torch.rand(batch_size, self.exc_n_frames, self.exc_n_coefficients, dtype=self._dtype))
+
+        self.exc_coefficients = nn.Parameter(torch.rand(batch_size, 1, self.exc_n_coefficients, dtype=self._dtype))
 
         # ====== Loop Filter ============================
-        self.loop_n_frames = loop_n_frames
         self.loop_order = loop_order
         self.loop_n_coefficients = loop_order + 1  # To account for DC coefficient
-        self.loop_coefficients = nn.Parameter(torch.rand(batch_size, self.loop_n_frames, self.loop_n_coefficients,
+
+        self.loop_coefficients = nn.Parameter(torch.rand(batch_size, 1, self.loop_n_coefficients,
                                                  dtype=self._dtype).uniform_(-2, 0))
-        self.loop_gain = nn.Parameter(torch.rand(batch_size, loop_n_frames, 1, dtype=self._dtype))
+        self.loop_gain = nn.Parameter(torch.rand(batch_size, 1, 1, dtype=self._dtype))
 
         # ====== Interpolation Settings ==================
         self.interp_type = interp_type
@@ -159,17 +157,19 @@ class DiffKS(nn.Module):
         self.register_buffer("ks_inverse_signal", torch.zeros(batch_size, self.exc_length_n), persistent=False)
 
         # ====== METADATA table for inner shapes (no batch)
-        self._param_meta: dict[str, Tuple[Tuple[int, ...], str]] = {
-            "exc_coefficients": ((self.exc_n_frames, self.exc_n_coefficients), "Parameter"),
-            "loop_coefficients": ((self.loop_n_frames, self.loop_n_coefficients), "Parameter"),
-            "loop_gain": ((self.loop_n_frames, 1), "Parameter"),
+        self._param_meta = {
+            "exc_coefficients":  ((None, exc_order + 1),  "Parameter"),  # None = any F
+            "loop_coefficients": ((None, loop_order + 1), "Parameter"),
+            "loop_gain":         ((None, 1),              "Parameter"),
         }
 
     def _expect(self, tensor: torch.Tensor, name: str, shape: Tuple[int, ...],
     ) -> torch.Tensor:
         """Validate *shape*, then cast to model dtype / device if necessary."""
-        if tuple(tensor.shape) != shape:
-            raise ValueError(f"{name}: expected shape {shape}, got {tuple(tensor.shape)}")
+        if tensor.shape[0] != shape[0]:
+            raise ValueError(f"{name}: expected first dim {shape[0]}, got {tensor.shape[0]} (batch mismatch)")
+        if tensor.shape[-1] != shape[-1]:
+            raise ValueError(f"{name}: expected last dim {shape[-1]}, got {tensor.shape[-1]} (order mismatch)")
         return tensor.to(dtype=self._dtype, device=self.device)
 
     def _prepare(self, name: str, new_value: Optional[torch.Tensor], *, inplace: bool = False,
@@ -196,7 +196,13 @@ class DiffKS(nn.Module):
 
         if inplace:
             with torch.no_grad():
-                getattr(self, name).data.copy_(value)
+                param = getattr(self, name)
+                if param.shape != value.shape:
+                    # replace by a fresh Parameter of the right shape
+                    setattr(self, name, nn.Parameter(value.clone()))
+                else:
+                    param.data.copy_(value)
+
         return value
 
     # setters for manual init
@@ -242,10 +248,11 @@ class DiffKS(nn.Module):
                 input: torch.Tensor,  # [batch_size, n_samples]
                 input_sr: int,
                 direct: bool = False,
-                loop_coefficients: Optional[torch.Tensor] = None,  # [batch_size, loop_n_frames, loop_n_coefficients]
-                loop_gain: Optional[torch.Tensor] = None,  # [batch_size, loop_n_frames, 1]
-                exc_coefficients: Optional[torch.Tensor] = None,  # [batch_size, exc_n_frames, exc_order]
+                loop_coefficients: Optional[torch.Tensor] = None,  # [batch_size, F, loop_n_coefficients]
+                loop_gain: Optional[torch.Tensor] = None,  # [batch_size, F, 1]
+                exc_coefficients: Optional[torch.Tensor] = None,  # [batch_size, F, exc_order]
                 constrain_coefficients: bool = True,
+                triggers: Optional[torch.Tensor] = None, # [batch_size, loop_n_frames]
                 ) -> torch.Tensor:  # [batch_size, n_samples]
 
         assert f0_frames.dim() == 2, f"f0_frames must have 2 dimensions, got shape {f0_frames.shape}"
@@ -270,7 +277,8 @@ class DiffKS(nn.Module):
 
         f0, l_b, l_g, exc_b = self.get_upsampled_parameters(
             f0_frames, n_samples,
-            l_b=l_b, l_g=l_g, exc_b=exc_b
+            l_b=l_b, l_g=l_g, exc_b=exc_b,
+            triggers=triggers,
         )
 
         if constrain_coefficients:
@@ -292,7 +300,7 @@ class DiffKS(nn.Module):
 
         if not direct:
             loop_inv = invert_lpc(x, A)
-            ks_inv_signal = self._inversed_windowed_lpc(loop_inv, exc_b)
+            ks_inv_signal = self._inversed_windowed_lpc(loop_inv, exc_b, triggers=triggers)
             self.ks_inverse_signal = ks_inv_signal.detach().clone()
 
         exc_filter_out = sample_wise_lpc(ks_inv_signal if not direct else x, exc_b)
@@ -377,19 +385,26 @@ class DiffKS(nn.Module):
 
         return A, x
 
-    def _inversed_windowed_lpc(self,
-                      x : torch.Tensor, # [B, N],
-                      b : torch.Tensor, # [B, N, O]
-                      ):
+    def _inversed_windowed_lpc(
+            self,
+            x: torch.Tensor,          # [B, N]
+            b: torch.Tensor,          # [B, N, O]
+            triggers: torch.Tensor,   # [B, F]
+    ):
         n_samples = x.size(1)
-        out = torch.zeros_like(x)
-        start_positions = [0, int(3 * self.internal_sr)]
 
-        proc = invert_lpc(x, b)
+        proc = invert_lpc(x, b)                               # ← [B, N]
 
-        for start in start_positions:
-            end = min(start + self.exc_length_n, n_samples)
-            out[:, start:end] = proc[:, start:end]
+        idx = torch.arange(n_samples, device=x.device)                # [N]
+        idx = idx.view(1, 1, -1)                                      # [1,1,N]
+
+        win_start = triggers.to(torch.long).unsqueeze(-1)             # [B,F,1]
+        win_end   = win_start + self.exc_length_n                     # [B,F,1]
+
+        mask = (idx >= win_start) & (idx < win_end)                   # [B,F,N]
+        mask = mask.any(dim=1)                                        # [B,N]
+
+        out = torch.where(mask, proc, torch.zeros_like(proc))
         return out
 
     def get_constrained_exc_coefficients(
@@ -427,39 +442,116 @@ class DiffKS(nn.Module):
         result = (sigmoid_b / sum_b) * (self.get_gain(l_g))
         return result.to(self.device)
 
+    def _upsample_by_triggers(
+            self,
+            frames: torch.Tensor,        # [B, F, D]
+            triggers: torch.Tensor,      # [B, F] (sample indices @ internal‑SR)
+            n_samples: int,              # total output length
+            mode: str = "zoh",        # "spline" (default) or "zoh"
+    ) -> torch.Tensor:                  # [B, n_samples, D]
+        """
+        Interpolate the *frames* timeline according to *triggers*.
+
+        • **mode="spline"          – natural cubic spline between frames,
+          then zero‑order held after the last trigger.
+
+        • **mode="zoh"** (default) –  pure zero‑order hold; each frame
+          is repeated from its trigger until the next one.
+
+        Frames and triggers may disagree on length; extra frames are truncated,
+        missing ones repeat the last frame.
+        """
+        if mode not in ("spline", "zoh"):
+            raise ValueError("mode must be 'spline' or 'zoh'")
+
+        B, F_coef, D = frames.shape
+        B_t, F_trig  = triggers.shape
+        if B != B_t:
+            raise ValueError("batch mismatch between frames and triggers")
+
+        # ----- 1. ensure |frames| == |triggers| ------------------------------
+        if F_coef > F_trig:                                # too many frames
+            frames = frames[:, :F_trig, :]
+        elif F_coef < F_trig:                              # too few  → pad
+            pad = frames[:, -1:, :].expand(-1, F_trig - F_coef, -1)
+            frames = torch.cat([frames, pad], dim=1)
+
+        if mode == "zoh":
+            # -------- legacy repeat‑hold implementation --------------------
+            trig_int = triggers.to(torch.long)
+            segs     = []
+            for b in range(B):
+                if F_trig == 1:
+                    seg_len = torch.tensor([n_samples], device=frames.device)
+                else:
+                    first = trig_int[b, 1]                             # scalar
+                    inner = trig_int[b, 2:] - trig_int[b, 1:-1]        # [F-2]
+                    last  = n_samples - trig_int[b, -1]                # scalar
+                    seg_len = torch.cat([first.unsqueeze(0),
+                                          inner,
+                                          last.unsqueeze(0)])
+                segs.append(seg_len)
+            out = []
+            for b in range(B):
+                out_b = torch.repeat_interleave(frames[b], segs[b], dim=0)
+                out.append(out_b)
+            return torch.stack(out, dim=0)                              # [B,N,D]
+
+        # ------------------- spline mode -------------------------------------
+        device   = frames.device
+        t_out    = torch.arange(n_samples, device=device,
+                                dtype=self._dtype)        # [N]
+        outs = []
+        for b in range(B):
+            t_in     = triggers[b].to(self._dtype)             # [F]
+            y_in     = frames[b]                               # [F, D]
+            # normalise to 0‑1 for torchcubicspline
+            t_norm   = t_in / (n_samples - 1)
+            t_out_n  = t_out / (n_samples - 1)
+
+            coeffs   = natural_cubic_spline_coeffs(t_norm, y_in)
+            y_interp = NaturalCubicSpline(coeffs).evaluate(t_out_n)  # [N, D]
+
+            # hold last value after final trigger
+            after_last = t_out > t_in[-1]
+            y_interp[after_last] = y_in[-1]
+            outs.append(y_interp)
+        return torch.stack(outs, dim=0)                         # [B, N, D]
+
     def get_upsampled_parameters(
             self,
             f0: torch.Tensor, # [batches, f_0_frames,]
             num_samples: int,
-            l_b: Optional[torch.Tensor] = None, # [batches, loop_n_frames, loop_n_coefficients]
-            l_g: Optional[torch.Tensor] = None, # [batches, loop_n_frames, 1]
-            exc_b: Optional[torch.Tensor] = None, # [batches, exc_n_frames, exc_order]
+            l_b: Optional[torch.Tensor] = None, # [batches, frames, loop_n_coefficients]
+            l_g: Optional[torch.Tensor] = None, # [batches, frames, 1]
+            exc_b: Optional[torch.Tensor] = None, # [batches, frames, exc_order]
+            triggers: Optional[torch.Tensor] = None, # [B, loop_frames]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
         loop_b_frames_ = l_b if l_b is not None else self.loop_coefficients
-        loop_g_frames = l_g if l_g is not None else self.loop_gain
+        loop_g_frames_ = l_g if l_g is not None else self.loop_gain
         exc_b_frames_ = exc_b if exc_b is not None else self.exc_coefficients
 
         batch_size = f0.size(0)
         f0_n_frames = f0.size(1)
 
+        # ---------- F0  -----------------------------------------------------
         if f0_n_frames == 1:
             f0_i = f0.expand(batch_size, num_samples)
         else:
             f0_reshaped = f0.unsqueeze(-1).to(dtype=self._dtype)
             f0_i = spline_upsample(f0_reshaped, num_samples).squeeze(-1)
 
-        if self.loop_n_frames == 1:
-            loop_b_i = loop_b_frames_.repeat(1, num_samples, 1)
-            loop_g_i = loop_g_frames.repeat(1, num_samples, 1)
+        # ---------- coefficients -------------------------------------------
+        if triggers is not None:
+            loop_b_i = self._upsample_by_triggers(loop_b_frames_.to(dtype=self._dtype),
+                                             triggers, num_samples)
+            loop_g_i = self._upsample_by_triggers(loop_g_frames_.to(dtype=self._dtype),
+                                             triggers, num_samples)
+            exc_b_i = self._upsample_by_triggers(exc_b_frames_.to(dtype=self._dtype),
+                                            triggers, num_samples)
         else:
-            loop_b_i = spline_upsample(loop_b_frames_.to(dtype=self._dtype), num_samples)
-            loop_g_i = spline_upsample(loop_g_frames.to(dtype=self._dtype), num_samples)
-
-        if self.exc_n_frames == 1:
-            exc_b_i = exc_b_frames_.repeat(1, num_samples, 1)
-        else:
-            exc_b_i = spline_upsample(exc_b_frames_.to(dtype=self._dtype), num_samples)
+            raise NotImplementedError(f"support for no triggers not implemented")
 
         return f0_i.to(self.device), loop_b_i.to(self.device), loop_g_i.to(self.device), exc_b_i.to(self.device)
 
