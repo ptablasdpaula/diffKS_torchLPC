@@ -113,7 +113,7 @@ class DiffKS(nn.Module):
         loop_order: int = 1,
         loop_n_frames: int = 1,
         exc_order: int = 5,
-        exc_n_frames: int = 100,
+        exc_n_frames: int = 1,
         exc_length_s : float = 0.025,
         interp_type: str = "linear",
         use_double_precision: bool = False,
@@ -292,11 +292,11 @@ class DiffKS(nn.Module):
 
         if not direct:
             loop_inv = invert_lpc(x, A)
-            ks_inv_signal = self._windowed_lpc(loop_inv, exc_b, 'inverse')
+            ks_inv_signal = self._inversed_windowed_lpc(loop_inv, exc_b)
             self.ks_inverse_signal = ks_inv_signal.detach().clone()
 
-        exc_filter_out = self._windowed_lpc(ks_inv_signal if not direct else x,
-                                            exc_b, 'forward')
+        exc_filter_out = sample_wise_lpc(ks_inv_signal if not direct else x, exc_b)
+
         self.exc_filter_out = exc_filter_out
 
         y_out = sample_wise_lpc(exc_filter_out, A)
@@ -377,28 +377,19 @@ class DiffKS(nn.Module):
 
         return A, x
 
-    def _windowed_lpc(self,
+    def _inversed_windowed_lpc(self,
                       x : torch.Tensor, # [B, N],
-                      exc_b : torch.Tensor, # [B, N, O]
-                      operation: str, # inverse (invertLPC) or forward (sample_wise_LPC)
+                      b : torch.Tensor, # [B, N, O]
                       ):
         n_samples = x.size(1)
         out = torch.zeros_like(x)
         start_positions = [0, int(3 * self.internal_sr)]
 
+        proc = invert_lpc(x, b)
+
         for start in start_positions:
             end = min(start + self.exc_length_n, n_samples)
-            seg = x[:, start:end]
-
-            if operation == 'inverse':
-                proc = invert_lpc(seg, exc_b)
-            elif operation == 'forward':
-                proc = sample_wise_lpc(seg, exc_b)
-            else:
-                raise ValueError(f"Unknown operation {operation}, use 'inverse' or 'forward'.")
-
-            out[:, start:end] = proc
-
+            out[:, start:end] = proc[:, start:end]
         return out
 
     def get_constrained_exc_coefficients(
@@ -451,7 +442,6 @@ class DiffKS(nn.Module):
 
         batch_size = f0.size(0)
         f0_n_frames = f0.size(1)
-        exc_length_n = self.exc_length_n
 
         if f0_n_frames == 1:
             f0_i = f0.expand(batch_size, num_samples)
@@ -467,9 +457,9 @@ class DiffKS(nn.Module):
             loop_g_i = spline_upsample(loop_g_frames.to(dtype=self._dtype), num_samples)
 
         if self.exc_n_frames == 1:
-            exc_b_i = exc_b_frames_.repeat(1, exc_length_n, 1)
+            exc_b_i = exc_b_frames_.repeat(1, num_samples, 1)
         else:
-            exc_b_i = spline_upsample(exc_b_frames_.to(dtype=self._dtype), exc_length_n)
+            exc_b_i = spline_upsample(exc_b_frames_.to(dtype=self._dtype), num_samples)
 
         return f0_i.to(self.device), loop_b_i.to(self.device), loop_g_i.to(self.device), exc_b_i.to(self.device)
 

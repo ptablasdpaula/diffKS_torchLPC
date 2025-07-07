@@ -28,10 +28,10 @@ hp = {
 
 mp = {
     "exc_order": 5,
-    "exc_n_frames": 25,
+    "exc_n_frames": 4,
     "exc_length_s": 0.025,
     "loop_order": 2,
-    "loop_n_frames": 16,
+    "loop_n_frames": 4,
     "f0_hz": 311.13,
     "min_f0_hz": 82.41,  # MIDI E2 in Hz
     "burst_width_s": 0.03,
@@ -139,7 +139,7 @@ def run_usual_ks(model: DiffKS,
     audio = model(f0_frames=f0_frames.to(model.device),
                   input=burst.to(model.device),
                   input_sr=gs["sample_rate"],
-                  direct=True)  # in‑domain generation
+                  direct=False)  # in‑domain generation
 
     exc_out = model.exc_filter_out  # [1, exc_len_samples]
     return audio.cpu(), exc_out.cpu(), f0_frames
@@ -331,6 +331,8 @@ def main() -> None:
 
     # -------------------------------------------------------------------------
     # 1–2.  In‑domain synthetic reference using "usual" KS ---------------------
+
+
     model_id, burst = build_usual_ks()
     in_domain_audio, exc_after, f0_id = run_usual_ks(model_id, burst)
 
