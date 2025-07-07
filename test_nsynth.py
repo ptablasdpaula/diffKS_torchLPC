@@ -204,10 +204,21 @@ def optimise_model(model: DiffKS,
     # Set up optimizer using Adam
     optimiser = torch.optim.Adam(model.parameters(), lr=hp["learning_rate"])
 
-    # Set up loss function (multi-resolution STFT)
-    loss_fn = MultiSTFT(scale_invariance=True,
-                        perceptual_weighting=hp["use_A_weighing"],
-                        sample_rate=gs["sample_rate"])
+    # Smooth MSS configuration (WF, S5, C2, D2) from “Multi‑Scale Spectral Loss Revisited”
+    loss_fn = MultiSTFT(
+        fft_sizes=[257, 509, 1019, 2039, 4093],
+        hop_sizes=[128, 254, 509, 1019, 2046],
+        win_lengths=[257, 509, 1019, 2039, 4093],
+        window="flattop",          # WF: Flat‑top window with low sidelobes
+        mag_distance="L2",         # D2: squared‑L2 distance
+        log_eps=1.0,               # C2: log‑compression with ε=1 to keep values ≥0
+        w_sc=1.0,                  # default weighting for spectral‑convergence term
+        w_log_mag=1.0,             # log‑magnitude term
+        w_lin_mag=0.0,             # (disabled) linear‑magnitude term
+        perceptual_weighting=hp["use_A_weighing"],
+        scale_invariance=True,
+        sample_rate=gs["sample_rate"],
+    )
 
     loss_curve = []
     pbar = tqdm(range(hp["max_epochs"]), desc="Training")
