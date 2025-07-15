@@ -1,11 +1,19 @@
 import torch
 import torch.nn as nn
+import torchaudio
 import torchaudio.transforms as T
 
 from utils import get_device
 from diffKS import DiffKS
 
 from data.preprocess import E2_HZ
+
+from ddc_onset.spectral import SpectrogramExtractor
+from ddc_onset.cnn      import SpectrogramNormalizer, PlacementCNN
+from ddc_onset.constants import FRAME_RATE, Difficulty
+from ddc_onset import find_peaks, threshold_peaks
+import torch.nn.functional as F
+import numpy as np
 
 def mlp(in_size, hidden_size, n_layers):
     channels = [in_size] + (n_layers) * [hidden_size]
@@ -138,9 +146,7 @@ class AE_KarplusModel(nn.Module):
                  hidden_size,
                  batch_size,
                  loop_order,
-                 loop_n_frames,
                  exc_order,
-                 exc_n_frames,
                  internal_sr,
                  interpolation_type,
                  z_encoder,
@@ -148,9 +154,7 @@ class AE_KarplusModel(nn.Module):
         super().__init__()
         self.internal_sr = internal_sr
         self.loop_order = loop_order
-        self.loop_n_frames = loop_n_frames
         self.exc_order = exc_order
-        self.exc_n_frames = exc_n_frames
 
         self.z_encoder = z_encoder
 
@@ -161,21 +165,33 @@ class AE_KarplusModel(nn.Module):
         self.out_mlp = mlp(hidden_size + 2 + z_encoder.z_dims, hidden_size, 3)
 
         # Output projections
-        self.loop_coeff_proj = nn.Linear(hidden_size, loop_n_frames * (loop_order + 1))
-        self.exc_coeff_proj = nn.Linear(hidden_size, exc_n_frames * (exc_order + 1))
-        self.loop_gain_proj = nn.Linear(hidden_size, loop_n_frames)
+        self.loop_coeff_proj = nn.Linear(hidden_size, loop_order + 1)  # B, T, *
+        self.exc_coeff_proj = nn.Linear(hidden_size, exc_order + 1)
+        self.loop_gain_proj = nn.Linear(hidden_size, 1)  # scalar per frame
 
         # Create a buffer for GRU state
         self.register_buffer("cache_gru", torch.zeros(1, 1, hidden_size))
+
+        # ONSET DETECTOR CONFIG
+        self.onset_extract = SpectrogramExtractor()
+        self.onset_norm = SpectrogramNormalizer()
+        self.onset_cnn = PlacementCNN()
+
+        for m in (self.onset_extract, self.onset_norm, self.onset_cnn):
+            m.eval()                    # Start in Inference mode
+            for p in m.parameters():
+                p.requires_grad_(False) # Initialize Frozen!
+
+        self.pad_left   = 512
+        self.onset_unfrozen = False
+        self.register_buffer("step", torch.tensor(0, dtype=torch.long))
 
         # ----------  differentiable KS decoder  ----------
         self.decoder = DiffKS(
             batch_size = batch_size,
             internal_sr = internal_sr,
             loop_order = loop_order,
-            loop_n_frames = loop_n_frames,
             exc_order = exc_order,
-            exc_n_frames = exc_n_frames,
             interp_type = interpolation_type, # Only linear remains stable for NNs
             use_double_precision = True if get_device() != torch.device('mps') else False,
             min_f0_hz= E2_HZ - 10,
@@ -195,7 +211,60 @@ class AE_KarplusModel(nn.Module):
         hidden = self.out_mlp(hidden)
         return hidden.mean(dim=1, keepdim=True)  # Assuming you're using mean pooling
 
-    def forward(self, pitch, loudness, audio, audio_sr, return_parameters=False):
+    # -------------- helper: compute triggers --------------------------------
+    def _make_triggers(self, audio: torch.Tensor, audio_sr: int,
+                       thresh: float = 0.15) -> torch.Tensor:
+        B, _ = audio.shape
+        ratio = int(self.internal_sr // FRAME_RATE)  # 441
+
+        audio_pad = F.pad(audio, (self.pad_left, 0))
+        audio_44k = torchaudio.functional.resample(audio_pad, audio_sr,
+                                                   self.internal_sr)
+
+        out = []
+        for b in range(B):
+            spec = self.onset_extract(audio_44k[b:b + 1])
+            sal = self.onset_cnn(
+                self.onset_norm(spec),
+                torch.tensor([Difficulty.CHALLENGE.value],
+                             device=audio.device, dtype=torch.int64)
+            )[0]
+            peaks = threshold_peaks(sal.cpu().numpy(),
+                                    find_peaks(sal.cpu().numpy()), thresh)
+            if len(peaks) == 0:
+                peaks = [0]
+
+            trig = torch.tensor(peaks, device=audio.device) * ratio
+            trig = trig - self.pad_left
+            trig = trig.clamp(min=0)
+            out.append(trig.long())
+
+        return self._pad_list(out, pad_value=0)  # [B, Fmax]
+
+    @staticmethod
+    def _pad_list(list_of_tensors: list[torch.Tensor],
+                  pad_value: float = 0.0) -> torch.Tensor:
+        """
+        Turns a Python list of [Fᵢ, …] tensors into one padded
+        tensor [B, Fmax, …] using right‑padding with *pad_value*.
+        """
+        Fmax = max(t.size(0) for t in list_of_tensors)
+        padded = []
+        for t in list_of_tensors:
+            if t.size(0) < Fmax:
+                pad = t.new_full((Fmax - t.size(0), *t.shape[1:]), pad_value)
+                t = torch.cat([t, pad], dim=0)
+            padded.append(t)
+        return torch.stack(padded, dim=0)
+
+    def forward(
+            self,
+            pitch,
+            loudness,
+            audio,
+            audio_sr,
+            unfreeze_onset_after: int = 0,
+            return_parameters=False):
         """
         Forward pass of the neural Karplus-Strong model.
 
@@ -206,56 +275,61 @@ class AE_KarplusModel(nn.Module):
         Returns:
             Tensor of shape [batch_size, n_samples] - Synthesized audio
         """
-        z = self.z_encoder(audio, f0_scaled=pitch)
+        if (not self.onset_unfrozen) and (self.step.item() >= unfreeze_onset_after):
+            for m in (self.onset_extract, self.onset_norm, self.onset_cnn):
+                m.train()
+                for p in m.parameters():
+                    p.requires_grad_(True)
+            self.onset_unfrozen = True
 
-        # Process through network
-        hidden = torch.cat([
-            self.in_mlps[0](pitch),
-            self.in_mlps[1](loudness),
-        ], -1)
-
+        # ─── 1.  build the full‑resolution hidden sequence ───────────────────────
+        z = self.z_encoder(audio, f0_scaled=pitch)  # [B, T, z_dim]
+        hidden = torch.cat([self.in_mlps[0](pitch),
+                            self.in_mlps[1](loudness)], -1)  # [B, T, 2×H]
         hidden = torch.cat([self.gru(hidden)[0], pitch, loudness, z], -1)
-        hidden = self.out_mlp(hidden)
+        hidden = self.out_mlp(hidden)  # [B, T, H]
 
-        hidden_avg = hidden.mean(dim=1, keepdim=True)
+        # ─── 2.  predict a coefficient frame *per* encoder step ──────────────────
+        loop_coeff_all = self.loop_coeff_proj(hidden)  # [B, T, loop_order+1]
+        exc_coeff_all = self.exc_coeff_proj(hidden)  # [B, T, exc_order +1]
+        loop_gain_all = self.loop_gain_proj(hidden)  # [B, T, 1]
 
-        # Get raw outputs
-        batch_size = hidden.shape[0]
-        loop_coeff_flat = self.loop_coeff_proj(hidden_avg)
-        exc_coeff_flat = self.exc_coeff_proj(hidden_avg)
-        loop_gain_flat = self.loop_gain_proj(hidden_avg)
+        # ─── 3.  detect triggers (padded) and map to frame indices ───────────────
+        triggers = self._make_triggers(audio, audio_sr)  # [B, Fmax]
+        B, Fmax = triggers.shape
+        T = pitch.size(1)  # encoder frames per clip
+        n_samples = audio.size(1)
 
-        # Reshape outputs to match expected dimensions
-        loop_coefficients = loop_coeff_flat.reshape(
-            batch_size,
-            self.loop_n_frames,
-            self.loop_order + 1
-        )
+        # sample_idx → frame_idx  (integer rounding)
+        frame_idx = (triggers.float() / n_samples * T).long().clamp(max=T - 1)
 
-        exc_coefficients = exc_coeff_flat.reshape(
-            batch_size,
-            self.exc_n_frames,
-            self.exc_order + 1
-        )
+        # ─── 4.  gather the corresponding coefficient frames ─────────────────────
+        def batch_gather(src, idx):  # src: [B, T, D]  idx: [B, F]
+            B, F = idx.shape
+            D = src.size(-1)
+            idx_exp = idx.unsqueeze(-1).expand(-1, -1, D)  # [B, F, D]
+            return src.gather(1, idx_exp)  # [B, F, D]
 
-        loop_gain = loop_gain_flat.reshape(
-            batch_size,
-            self.loop_n_frames,
-            1
-        )
+        loop_coeff_sel = batch_gather(loop_coeff_all, frame_idx)
+        exc_coeff_sel = batch_gather(exc_coeff_all, frame_idx)
+        loop_gain_sel = batch_gather(loop_gain_all, frame_idx)
 
         if return_parameters:
-            return self.decoder.get_constrained_l_coefficients(loop_coefficients, loop_gain), self.decoder.get_constrained_exc_coefficients(exc_coefficients)
+            return self.decoder.get_constrained_l_coefficients(loop_coeff_sel, loop_gain_sel), self.decoder.get_constrained_exc_coefficients(exc_coeff_sel)
 
-        # Handle batch dimension for DiffKS
-        outputs = []
+        # ─── 5.  call DiffKS with the *selected* frames + triggers ───────────────
+        out = self.decoder(
+            f0_frames=pitch.squeeze(2),
+            input=audio,
+            input_sr=audio_sr,
+            loop_coefficients=loop_coeff_sel,
+            loop_gain=loop_gain_sel,
+            exc_coefficients=exc_coeff_sel,
+            triggers=triggers,
+        )
 
-        # Run DiffKS
-        out = self.decoder(f0_frames= pitch.squeeze(2),
-                           input=audio,
-                           input_sr=audio_sr,
-                           loop_coefficients=loop_coefficients,
-                           loop_gain=loop_gain,
-                           exc_coefficients=exc_coefficients,)
+
+        with torch.no_grad():
+            self.step += 1
 
         return out

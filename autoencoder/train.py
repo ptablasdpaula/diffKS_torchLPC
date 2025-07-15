@@ -42,9 +42,7 @@ def parse_args():
 
     # ─── DiffKS filter configuration ───────────────────────────────────────
     p.add_argument("--l_order", type=int, default=int(env("L_ORDER", 2)))
-    p.add_argument("--l_n_frames", type=int, default=int(env("L_N_FRAMES", 16)))
     p.add_argument("--exc_order", type=int, default=int(env("EXC_ORDER", 5)))
-    p.add_argument("--exc_n_frames", type=int, default=int(env("EXC_N_FRAMES", 25)))
 
     # ─── Dataset filters ────────────────────────────────────────────────────
     p.add_argument("--families", type=str, default=env("FAMILIES", "guitar"))
@@ -68,9 +66,7 @@ def main():
     config = {
         "hidden_size": args.hidden_size,
         "loop_order": args.l_order,
-        "loop_n_frames": args.l_n_frames,
         "exc_order": args.exc_order,
-        "exc_n_frames": args.exc_n_frames,
         "sample_rate": 16000,
         "ks_sample_rate": 41000,
         "batch_size": args.batch_size,
@@ -152,11 +148,15 @@ def main():
                             drop_last=True, pin_memory=True if device.type != "mps" else False, num_workers=config["num_workers"])
 
     # ─── Start Model, optimizer & Loss ────────────────────────── #
-    model = AE_KarplusModel(batch_size=config["batch_size"], hidden_size=config["hidden_size"],
-                            loop_order=config["loop_order"], loop_n_frames=config["loop_n_frames"],
-                            exc_order=config["exc_order"], exc_n_frames=config["exc_n_frames"],
-                            internal_sr=config["ks_sample_rate"], interpolation_type=config["interpolation_type"],
-                            z_encoder=MfccTimeDistributedRnnEncoder(),).to(device)
+    model = AE_KarplusModel(
+        batch_size=config["batch_size"],
+        hidden_size=config["hidden_size"],
+        loop_order=config["loop_order"],
+        exc_order=config["exc_order"],
+        internal_sr=config["ks_sample_rate"],
+        interpolation_type=config["interpolation_type"],
+        z_encoder=MfccTimeDistributedRnnEncoder(),
+    ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
 
