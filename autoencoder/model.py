@@ -13,7 +13,7 @@ from ddc_onset.cnn      import SpectrogramNormalizer, PlacementCNN
 from ddc_onset.constants import FRAME_RATE, Difficulty
 from ddc_onset import find_peaks, threshold_peaks
 import torch.nn.functional as F
-import numpy as np
+from typing import List
 
 def mlp(in_size, hidden_size, n_layers):
     channels = [in_size] + (n_layers) * [hidden_size]
@@ -214,48 +214,64 @@ class AE_KarplusModel(nn.Module):
     # -------------- helper: compute triggers --------------------------------
     def _make_triggers(self, audio: torch.Tensor, audio_sr: int,
                        thresh: float = 0.15) -> torch.Tensor:
+        """
+        Detect onset frames via ddc_onset, convert to *internal_sr* sample
+        indices, compensate for left padding, and right-pad by repeating the
+        last valid onset so that all batch items have the same F dimension.
+        Returns: LongTensor [B, Fmax] (non-decreasing, in-range).
+        """
         B, _ = audio.shape
         ratio = int(self.internal_sr // FRAME_RATE)  # 441
-
+        # left-pad at input sr, then resample to internal_sr (ddc_onset expects 44.1k)
         audio_pad = F.pad(audio, (self.pad_left, 0))
-        audio_44k = torchaudio.functional.resample(audio_pad, audio_sr,
-                                                   self.internal_sr)
-
+        audio_44k = torchaudio.functional.resample(audio_pad, audio_sr, self.internal_sr)
+        # how many internal-sr samples correspond to the left pad
+        pad_left_internal = int(round(self.pad_left * self.internal_sr / audio_sr))
         out = []
         for b in range(B):
+            # 1. Spectrogram extraction for batch item b -> [1, C, F, T]
             spec = self.onset_extract(audio_44k[b:b + 1])
+            # ddc_onset normalizes per-item: drop batch dim -> [C, F, T]
+            spec_n = self.onset_norm(spec[0])
+            # PlacementCNN returns [B=1, T] salience; index [0] for vector
             sal = self.onset_cnn(
-                self.onset_norm(spec),
+                spec_n,
                 torch.tensor([Difficulty.CHALLENGE.value],
                              device=audio.device, dtype=torch.int64)
             )[0]
-            peaks = threshold_peaks(sal.cpu().numpy(),
-                                    find_peaks(sal.cpu().numpy()), thresh)
+            # 2. Peak pick on CPU numpy (non-differentiable)
+            sal_np = sal.detach().cpu().numpy()
+            peaks = threshold_peaks(sal_np, find_peaks(sal_np), thresh)
             if len(peaks) == 0:
                 peaks = [0]
-
+            # 3. Frames -> internal-sr samples; remove pad; clamp
             trig = torch.tensor(peaks, device=audio.device) * ratio
-            trig = trig - self.pad_left
+            trig = trig - pad_left_internal
             trig = trig.clamp(min=0)
+            trig, _ = torch.sort(trig)
             out.append(trig.long())
 
-        return self._pad_list(out, pad_value=0)  # [B, Fmax]
+        return self._pad_list(out)  # [B, Fmax,]
 
     @staticmethod
-    def _pad_list(list_of_tensors: list[torch.Tensor],
-                  pad_value: float = 0.0) -> torch.Tensor:
+    def _pad_list(list_of_tensors: List[torch.Tensor]) -> torch.Tensor:
         """
-        Turns a Python list of [Fᵢ, …] tensors into one padded
-        tensor [B, Fmax, …] using right‑padding with *pad_value*.
+        Right-pad per-item tensors by **repeating the last element**.
+        This preserves non-decreasing trigger timelines and prevents
+        negative segment lengths downstream in DiffKS._upsample_by_triggers().
+        Supports 1-D [F] or 2-D [F, D] tensors.
         """
+        if len(list_of_tensors) == 0:
+            raise ValueError("_pad_list received empty list")
         Fmax = max(t.size(0) for t in list_of_tensors)
-        padded = []
+        out = []
         for t in list_of_tensors:
-            if t.size(0) < Fmax:
-                pad = t.new_full((Fmax - t.size(0), *t.shape[1:]), pad_value)
-                t = torch.cat([t, pad], dim=0)
-            padded.append(t)
-        return torch.stack(padded, dim=0)
+            pad = Fmax - t.size(0)
+            if pad > 0:
+                last = t[-1:].expand(pad, *t.shape[1:])
+                t = torch.cat([t, last], dim=0)
+            out.append(t)
+        return torch.stack(out, dim=0)
 
     def forward(
             self,
@@ -289,6 +305,7 @@ class AE_KarplusModel(nn.Module):
         hidden = torch.cat([self.gru(hidden)[0], pitch, loudness, z], -1)
         hidden = self.out_mlp(hidden)  # [B, T, H]
 
+        # NOTE: triggers returned padded & sorted; shape [B, Fmax].
         # ─── 2.  predict a coefficient frame *per* encoder step ──────────────────
         loop_coeff_all = self.loop_coeff_proj(hidden)  # [B, T, loop_order+1]
         exc_coeff_all = self.exc_coeff_proj(hidden)  # [B, T, exc_order +1]
@@ -298,12 +315,15 @@ class AE_KarplusModel(nn.Module):
         triggers = self._make_triggers(audio, audio_sr)  # [B, Fmax]
         B, Fmax = triggers.shape
         T = pitch.size(1)  # encoder frames per clip
-        n_samples = audio.size(1)
 
-        # sample_idx → frame_idx  (integer rounding)
-        frame_idx = (triggers.float() / n_samples * T).long().clamp(max=T - 1)
+        # duration in seconds at input sample rate
+        dur_s = audio.size(1) / audio_sr
+        # triggers are in internal_sr samples -> seconds
+        trig_sec = triggers.float() / self.internal_sr  # [B, F]
+        # proportion of clip -> encoder frame index
+        frame_idx = (trig_sec / dur_s * T).long().clamp(min=0, max=T - 1)
 
-        # ─── 4.  gather the corresponding coefficient frames ─────────────────────
+        # NOTE: frame_idx is clamped to [0, T-1] so gather is safe.
         def batch_gather(src, idx):  # src: [B, T, D]  idx: [B, F]
             B, F = idx.shape
             D = src.size(-1)

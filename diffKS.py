@@ -477,19 +477,24 @@ class DiffKS(nn.Module):
             frames = torch.cat([frames, pad], dim=1)
 
         if mode == "zoh":
-            # -------- legacy repeat‑hold implementation --------------------
             trig_int = triggers.to(torch.long)
+            # --- safety: enforce non‑decreasing, in‑range trigger timeline ----
+            # triggers may contain padded or unsorted values (e.g., from batching)
+            trig_int = torch.clamp(trig_int, min=0, max=n_samples - 1)
+            # ensure monotonic non‑decreasing: cumulative maximum along time axis
+            trig_int = torch.cummax(trig_int, dim=1).values
             segs     = []
             for b in range(B):
+                tb = trig_int[b]  # [F_trig]
                 if F_trig == 1:
-                    seg_len = torch.tensor([n_samples], device=frames.device)
+                    seg_len = torch.tensor([n_samples], device=frames.device, dtype=torch.long)
                 else:
-                    first = trig_int[b, 1]                             # scalar
-                    inner = trig_int[b, 2:] - trig_int[b, 1:-1]        # [F-2]
-                    last  = n_samples - trig_int[b, -1]                # scalar
-                    seg_len = torch.cat([first.unsqueeze(0),
-                                          inner,
-                                          last.unsqueeze(0)])
+                    first = tb[1]                                       # samples from 0→t1
+                    inner = tb[2:] - tb[1:-1]
+                    last  = n_samples - tb[-1]
+                    seg_len = torch.cat([first.unsqueeze(0), inner, last.unsqueeze(0)])
+                # guard against any residual negatives due to numerical drift
+                seg_len = torch.clamp(seg_len, min=0)
                 segs.append(seg_len)
             out = []
             for b in range(B):
