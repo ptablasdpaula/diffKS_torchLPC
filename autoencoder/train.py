@@ -5,9 +5,10 @@ import torch, torch.optim as optim, wandb
 from third_party.auraloss.auraloss.freq import MultiResolutionSTFTLoss
 from torch.utils.data import DataLoader
 from .model import AE_KarplusModel, MfccTimeDistributedRnnEncoder
-import argparse, os, json
+import argparse, os
 import multiprocessing as mp
 import psutil
+# from typing import Optional
 
 from paths import NSYNTH_PREPROCESSED_DIR
 from data.preprocess import NsynthDataset
@@ -115,9 +116,17 @@ def main():
     if wandb_id is None:
         wandb_id = wandb_run.id  # store for fresh runs
 
-    def log_batch(metric_name, value):
+    # ----- WandB logging helpers (single global step; let wandb manage) -----
+    def log_train_batch(value: float):
         if wandb.run is not None:
-            wandb.log({metric_name: value})
+            wandb.log({"train loss per batch": value})
+
+    def log_epoch(train_loss: float, val_loss: float):
+        if wandb.run is not None:
+            wandb.log({
+                "train loss per epoch": train_loss,
+                "val loss per epoch":   val_loss,
+            })
 
     # ─── RAM check ────────────────────────────────────────────── #
     process = psutil.Process(os.getpid())
@@ -211,7 +220,7 @@ def main():
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            log_batch("train loss per batch", loss.item())
+            log_train_batch(loss.item())
             t_loss += loss.item()
 
         t_loss /= len(train_loader)
@@ -231,15 +240,13 @@ def main():
                         unfreeze_onset_after=config["unfreeze_onset_after"],
                     )
                     batch_v = mr_stft(recon.unsqueeze(1), audio.unsqueeze(1)).item()
-                    log_batch("val loss per batch", batch_v)
                     v_losses.append(batch_v)
             v_loss = float(np.mean(v_losses))
         else:
             v_loss = np.nan
 
         # ─── LOGGING ───────────────────────────────────────────────────────
-        log_batch("train loss per epoch", t_loss)
-        log_batch("val loss per epoch", v_loss)
+        log_epoch(t_loss, v_loss)
 
         # ─── CHKPTS  ───────────────────────────────────────────────────────
         improved = False
@@ -283,11 +290,24 @@ def main():
                     unfreeze_onset_after=config["unfreeze_onset_after"],
                 )
                 rand_idx = np.random.choice(a.size(0), 5, replace=False)
+
+                media_log = {}
                 for k, idx in enumerate(rand_idx):
                     sample = torch.cat([a[idx], rec[idx]]).cpu().numpy()
-                    sf.write(os.path.join(config["save_dir"], f"sample_e{epoch}_{k}.wav"), sample, config["sample_rate"])
+                    wav_name = f"sample_e{epoch}_{k}.wav"
+                    wav_path = os.path.join(config["save_dir"], wav_name)
+                    sf.write(wav_path, sample, config["sample_rate"])
+                    print(f"[AUDIO] wrote: {os.path.abspath(wav_path)}")
                     if wandb.run is not None:
-                        wandb.log({f"audio_compare_{k}": wandb.Audio(sample, sample_rate=config["sample_rate"], caption=f"epoch {epoch} | sample {k} | original + recon")})
+                        media_log[f"audio_compare_{k}"] = wandb.Audio(
+                            sample,
+                            sample_rate=config["sample_rate"],
+                            caption=f"epoch {epoch} | sample {k} | original + recon",
+                        )
+
+                # log all 5 audio files in one WandB row tied to this epoch
+                if wandb.run is not None and len(media_log) > 0:
+                    wandb.log(media_log)
 
         print(f"[E{epoch}] train={t_loss:.4f} val={v_loss:.4f} best={best_val_loss:.4f} (no-improve {epochs_since_improve}/{config['patience']})")
 
