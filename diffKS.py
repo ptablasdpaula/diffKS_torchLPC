@@ -115,6 +115,8 @@ class DiffKS(nn.Module):
         exc_length_s : float = 0.025,
         interp_type: str = "linear",
         use_double_precision: bool = False,
+        upsample_mode: str = "zoh",
+        soft_zoh_tau: float = 5.0,
         device: torch.device = get_device(),
     ):
         super().__init__()
@@ -126,6 +128,10 @@ class DiffKS(nn.Module):
         self.device = device
         self._dtype = torch.float64 if use_double_precision else torch.float32
         self.min_f0_hz = min_f0_hz
+        # upsampling mode for parameter frames ('zoh', 'spline', or 'soft')
+        self.upsample_mode = upsample_mode
+        # softness (in *samples*) of the rising/falling sigmoid edges used in soft ZOH
+        self.soft_zoh_tau = float(soft_zoh_tau)
 
         # ====== Excitation Filter ======================
         self.exc_order = exc_order
@@ -447,7 +453,7 @@ class DiffKS(nn.Module):
             frames: torch.Tensor,        # [B, F, D]
             triggers: torch.Tensor,      # [B, F] (sample indices @ internal‑SR)
             n_samples: int,              # total output length
-            mode: str = "zoh",        # "spline" (default) or "zoh"
+            mode: str = "soft",        # "spline" (default), "zoh", or "soft"
     ) -> torch.Tensor:                  # [B, n_samples, D]
         """
         Interpolate the *frames* timeline according to *triggers*.
@@ -455,14 +461,18 @@ class DiffKS(nn.Module):
         • **mode="spline"          – natural cubic spline between frames,
           then zero‑order held after the last trigger.
 
-        • **mode="zoh"** (default) –  pure zero‑order hold; each frame
-          is repeated from its trigger until the next one.
+        • **mode="zoh"** – pure zero‑order hold; hard, non‑differentiable w.r.t. trigger times.
+
+        • **mode="soft"** – *differentiable* soft zero‑order hold: each frame owns a
+          soft rectangular window defined by adjacent trigger positions; edges are
+          smoothed by sigmoids of width `self.soft_zoh_tau` samples so gradients flow
+          back to the trigger times.
 
         Frames and triggers may disagree on length; extra frames are truncated,
         missing ones repeat the last frame.
         """
-        if mode not in ("spline", "zoh"):
-            raise ValueError("mode must be 'spline' or 'zoh'")
+        if mode not in ("spline", "zoh", "soft"):
+            raise ValueError("mode must be 'spline' or 'zoh' or 'soft'")
 
         B, F_coef, D = frames.shape
         B_t, F_trig  = triggers.shape
@@ -475,6 +485,32 @@ class DiffKS(nn.Module):
         elif F_coef < F_trig:                              # too few  → pad
             pad = frames[:, -1:, :].expand(-1, F_trig - F_coef, -1)
             frames = torch.cat([frames, pad], dim=1)
+
+        if mode == "soft":
+            # ----- differentiable soft ZOH ------------------------------------
+            # We approximate a rectangular ownership window for each trigger with
+            # smooth sigmoid edges so gradients can flow to trigger locations.
+            # frames: [B,F,D]; triggers: [B,F] (floatable); returns [B,N,D]
+            trig_f = triggers.to(dtype=self._dtype)
+            device = frames.device
+            N = n_samples
+            # build "next trigger" tensor by concatenating last index = N-1
+            last = torch.full((B,1), float(N-1), device=device, dtype=self._dtype)
+            trig_next = torch.cat([trig_f[:,1:], last], dim=1)
+            # time axis
+            t = torch.arange(N, device=device, dtype=self._dtype).view(1,1,-1)  # [1,1,N]
+            # softness
+            tau = torch.tensor(self.soft_zoh_tau, device=device, dtype=self._dtype)
+            # rising edge at current trigger; falling edge at next trigger
+            start = torch.sigmoid((t - trig_f.unsqueeze(-1)) / tau)      # [B,F,N]
+            end   = torch.sigmoid((t - trig_next.unsqueeze(-1)) / tau)   # [B,F,N]
+            w = (start - end).clamp_min_(0.0)                            # [B,F,N]
+            # normalize across frames so weights sum to 1 at each sample
+            w_sum = w.sum(dim=1, keepdim=True).clamp_min_(1e-12)
+            w = w / w_sum
+            # weighted sum of frames
+            out = torch.einsum('bfn,bfd->bnd', w, frames.to(self._dtype))  # [B,N,D]
+            return out
 
         if mode == "zoh":
             trig_int = triggers.to(torch.long)
@@ -550,11 +586,11 @@ class DiffKS(nn.Module):
         # ---------- coefficients -------------------------------------------
         if triggers is not None:
             loop_b_i = self._upsample_by_triggers(loop_b_frames_.to(dtype=self._dtype),
-                                             triggers, num_samples)
+                                             triggers, num_samples, mode=self.upsample_mode)
             loop_g_i = self._upsample_by_triggers(loop_g_frames_.to(dtype=self._dtype),
-                                             triggers, num_samples)
+                                             triggers, num_samples, mode=self.upsample_mode)
             exc_b_i = self._upsample_by_triggers(exc_b_frames_.to(dtype=self._dtype),
-                                            triggers, num_samples)
+                                            triggers, num_samples, mode=self.upsample_mode)
         else:
             raise NotImplementedError(f"support for no triggers not implemented")
 

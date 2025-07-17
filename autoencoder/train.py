@@ -8,6 +8,7 @@ from .model import AE_KarplusModel, MfccTimeDistributedRnnEncoder
 import argparse, os
 import multiprocessing as mp
 import psutil
+import matplotlib.pyplot as plt
 # from typing import Optional
 
 from paths import NSYNTH_PREPROCESSED_DIR
@@ -53,7 +54,7 @@ def parse_args():
 
     # ─── Onset fine‑tune schedule ─────────────────────────────────────────
     p.add_argument("--unfreeze_onset_after", type=int,
-                   default=int(env("UNFREEZE_ONSET_AFTER", 0)),
+                   default=int(env("UNFREEZE_ONSET_AFTER", 500)),
                    help="Global training step after which the ddc_onset sub‑modules will be unfrozen (0 = train from start).")
 
     # ─── Training mode ────────────────────────────────────────────────────
@@ -64,6 +65,35 @@ def parse_args():
     p.add_argument("--batches_per_epoch", type=int, default=int(env("BATCHES_PER_EPOCH", 100)))
 
     return p.parse_args()
+
+def plot_wave_with_triggers(wave_np, sr, trig_s, title=None):
+    """
+    wave_np: 1D numpy array audio samples
+    sr: sample rate (int)
+    trig_s: 1D numpy array of trigger times in seconds
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    t = np.arange(len(wave_np)) / float(sr)
+    # NOTE: we no longer draw vertical lines; red X markers are easier to see on WandB dark/light themes.
+    fig, ax = plt.subplots(figsize=(8, 2))
+    ax.plot(t, wave_np)
+    if trig_s is not None and len(trig_s) > 0:
+        # plot red X markers at the waveform value nearest each trigger time
+        trig_s = np.asarray(trig_s, dtype=float)
+        # clip in-range
+        trig_s = trig_s[(trig_s >= 0.0) & (trig_s <= t[-1])]
+        if trig_s.size > 0:
+            trig_idx = np.clip((trig_s * sr).astype(int), 0, len(wave_np) - 1)
+            trig_y = wave_np[trig_idx]
+            ax.plot(trig_s, trig_y, 'rx', markersize=5, mew=1.0)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Amp")
+    if title:
+        ax.set_title(title)
+    fig.tight_layout()
+    return fig
 
 def main():
     args = parse_args()
@@ -140,7 +170,7 @@ def main():
     # ─── Data ─────────────────────────────────────────────────────────────
     if not config["parameter_loss"]:
         dataset = NsynthDataset(root=NSYNTH_PREPROCESSED_DIR,
-                                split="test",
+                                split="train",
                                 pitch_mode=config["pitch_mode"],
                                 families=config["families"],
                                 sources=config["sources"], )
@@ -272,16 +302,12 @@ def main():
         if improved:
             torch.save(ckpt, os.path.join(config["save_dir"], f"best_model_{args.name}.pth"))
 
-        # ─── EARLY STOPPING ───────────────────────────────────────────────
-        if epochs_since_improve >= config["patience"]:
-            print(f"[STOP] Early stopping triggered after {config['patience']} epochs without ≥{config['min_delta']*100:.2f}% improvement.")
-            break
-
         # ─── AUDIO LOGS ──────────────────────────────────────────────────
         if epoch % config["eval_interval"] == 0:
             with torch.no_grad():
                 a, p, l = next(iter(val_loader))
                 a, p, l = a.to(device), p.to(device), l.to(device)
+                # forward pass (freeze schedule still respected)
                 rec = model(
                     pitch=p,
                     loudness=l,
@@ -289,25 +315,74 @@ def main():
                     audio_sr=config["sample_rate"],
                     unfreeze_onset_after=config["unfreeze_onset_after"],
                 )
-                rand_idx = np.random.choice(a.size(0), 5, replace=False)
+
+                # grab trigger times (seconds)
+                trig_times_s = model.last_trigger_times_s.detach().cpu().numpy()  # [B,K]
+
+                # choose up to 5 examples (avoid sampling more than batch size)
+                n_plot = min(a.size(0), 5)
+                rand_idx = np.random.choice(a.size(0), n_plot, replace=False)
 
                 media_log = {}
                 for k, idx in enumerate(rand_idx):
-                    sample = torch.cat([a[idx], rec[idx]]).cpu().numpy()
+                    # prepare concatenated waveform original||recon
+                    wave_orig = a[idx].cpu().numpy()
+                    wave_rec  = rec[idx].cpu().numpy()
+                    sample = np.concatenate([wave_orig, wave_rec], axis=0)
+
+                    # normalize copy for playback (avoid inaudibly small or clipped audio)
+                    peak = float(np.max(np.abs(sample))) if sample.size > 0 else 0.0
+                    if peak > 0:
+                        sample_play = sample / peak * 0.99
+                    else:
+                        sample_play = sample.copy()
+
+                    # write wav
                     wav_name = f"sample_e{epoch}_{k}.wav"
                     wav_path = os.path.join(config["save_dir"], wav_name)
                     sf.write(wav_path, sample, config["sample_rate"])
                     print(f"[AUDIO] wrote: {os.path.abspath(wav_path)}")
-                    if wandb.run is not None:
-                        media_log[f"audio_compare_{k}"] = wandb.Audio(
-                            sample,
-                            sample_rate=config["sample_rate"],
-                            caption=f"epoch {epoch} | sample {k} | original + recon",
-                        )
 
-                # log all 5 audio files in one WandB row tied to this epoch
+                    # overlay triggers on both segments
+                    if trig_times_s.ndim == 2 and idx < trig_times_s.shape[0]:
+                        trig_s = trig_times_s[idx]
+                        seg_dur_s = wave_orig.shape[0] / float(config["sample_rate"])
+                        trig_concat_s = np.concatenate([trig_s, trig_s + seg_dur_s])
+                    else:
+                        trig_concat_s = None
+
+                    # plot waveform + triggers
+                    fig = plot_wave_with_triggers(
+                        wave_np=sample,
+                        sr=config["sample_rate"],
+                        trig_s=trig_concat_s,
+                        title=f"epoch {epoch} sample {k}"
+                    )
+
+                    if wandb.run is not None:
+                        # log normalized audio and also the written wav file (for redundancy)
+                        media_log[f"audio_compare_{k}"] = wandb.Audio(
+                            sample_play,
+                            sample_rate=config["sample_rate"],
+                            caption=f"epoch {epoch} | sample {k} | orig+recon (norm)",
+                        )
+                        media_log[f"audio_file_{k}"] = wandb.Audio(
+                            wav_path,
+                            sample_rate=config["sample_rate"],
+                            caption=f"epoch {epoch} | sample {k} | raw file",
+                        )
+                        media_log[f"triggers_plot_{k}"] = wandb.Image(fig)
+
+                    print(f"[AUDIO LOG] sample {k}: peak={peak:.4f} len={sample.shape[0]} sr={config['sample_rate']}")
+                    plt.close(fig)
+
+                # log mean trigger count
+                if wandb.run is not None and trig_times_s.ndim == 2:
+                    media_log["trigger_count_mean"] = float(trig_times_s.shape[1])
+
+                # log all items together
                 if wandb.run is not None and len(media_log) > 0:
-                    wandb.log(media_log)
+                    wandb.log(media_log, commit=True)
 
         print(f"[E{epoch}] train={t_loss:.4f} val={v_loss:.4f} best={best_val_loss:.4f} (no-improve {epochs_since_improve}/{config['patience']})")
 
