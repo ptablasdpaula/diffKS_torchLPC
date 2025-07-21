@@ -11,6 +11,9 @@ import psutil
 import matplotlib.pyplot as plt
 # from typing import Optional
 
+# Global variable for internal sample rate used by plotting helpers
+MODEL_INTERNAL_SR = None  # set in main() after model construction; used by plotting helpers
+
 from paths import NSYNTH_PREPROCESSED_DIR
 from data.preprocess import NsynthDataset
 from utils import get_device, str2bool
@@ -84,6 +87,8 @@ def plot_wave_with_triggers(wave_np, sr, trig_s, title=None):
         trig_s = np.asarray(trig_s, dtype=float)
         # clip in-range
         trig_s = trig_s[(trig_s >= 0.0) & (trig_s <= t[-1])]
+        # drop duplicate trigger times so plots stay uncluttered
+        trig_s = np.unique(trig_s)  # ascending order, duplicates removed
         if trig_s.size > 0:
             trig_idx = np.clip((trig_s * sr).astype(int), 0, len(wave_np) - 1)
             trig_y = wave_np[trig_idx]
@@ -92,6 +97,54 @@ def plot_wave_with_triggers(wave_np, sr, trig_s, title=None):
     ax.set_ylabel("Amp")
     if title:
         ax.set_title(title)
+    fig.tight_layout()
+    return fig
+
+
+# Helper to plot loop and excitation coefficient trajectories, with optional trigger markers
+def plot_coeffs_with_triggers(loop_traj, exc_traj, sr_vis, trig_s=None, title=None):
+    """
+    loop_traj: [N, Lc] constrained loop coefficients at internal SR
+    exc_traj: [N, Ec] constrained excitation coefficients at internal SR
+    sr_vis: target sample-rate for x-axis (e.g. outer audio SR, 16 kHz)
+    trig_s: optional 1D array of trigger times in seconds (outer SR domain)
+    title: optional string
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    n = loop_traj.shape[0]
+    # Determine internal sample rate for seconds axis
+    sr_int = MODEL_INTERNAL_SR if MODEL_INTERNAL_SR is not None else sr_vis * (44100.0 / 16000.0)
+    t = np.arange(n) / float(sr_int)
+    fig, axs = plt.subplots(2, 1, figsize=(8, 3.5), sharex=True)
+    # Plot loop coefficients
+    lc = loop_traj.shape[1]
+    for i in range(lc):
+        axs[0].plot(t, loop_traj[:, i], label=f"loop[{i}]")
+    axs[0].set_ylabel("coeff")
+    axs[0].set_title("Loop coefficients")
+    # Plot excitation coefficients
+    ec = exc_traj.shape[1]
+    for i in range(ec):
+        axs[1].plot(t, exc_traj[:, i], label=f"exc[{i}]")
+    axs[1].set_ylabel("coeff")
+    axs[1].set_title("Excitation coefficients")
+    axs[1].set_xlabel("Time (s)")
+    # Add legends if number of traces is small
+    if lc <= 8:
+        axs[0].legend(loc="center left", bbox_to_anchor=(1.01, 0.5))
+    if ec <= 8:
+        axs[1].legend(loc="center left", bbox_to_anchor=(1.01, 0.5))
+    # Plot trigger markers if provided
+    if trig_s is not None and len(trig_s) > 0:
+        trig_s = np.asarray(trig_s, dtype=float)
+        trig_s = trig_s[(trig_s >= 0.0) & (trig_s <= t[-1])]
+        if trig_s.size > 0:
+            # For each trigger, place a red 'x' at y=0 on both axes
+            axs[0].plot(trig_s, np.zeros_like(trig_s), 'rx', markersize=5, mew=1.0)
+            axs[1].plot(trig_s, np.zeros_like(trig_s), 'rx', markersize=5, mew=1.0)
+    if title:
+        fig.suptitle(title)
     fig.tight_layout()
     return fig
 
@@ -170,7 +223,7 @@ def main():
     # ─── Data ─────────────────────────────────────────────────────────────
     if not config["parameter_loss"]:
         dataset = NsynthDataset(root=NSYNTH_PREPROCESSED_DIR,
-                                split="train",
+                                split="test",
                                 pitch_mode=config["pitch_mode"],
                                 families=config["families"],
                                 sources=config["sources"], )
@@ -200,6 +253,9 @@ def main():
         interpolation_type=config["interpolation_type"],
         z_encoder=MfccTimeDistributedRnnEncoder(),
     ).to(device)
+    # Set global for plotting helpers
+    global MODEL_INTERNAL_SR
+    MODEL_INTERNAL_SR = model.internal_sr
 
     optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
 
@@ -319,6 +375,25 @@ def main():
                 # grab trigger times (seconds)
                 trig_times_s = model.last_trigger_times_s.detach().cpu().numpy()  # [B,K]
 
+                # ---- Diagnostic: parameter-only forward to get constrained coeff frames and upsample to per-sample trajectories ----
+                with torch.no_grad():
+                    l_b_frames, exc_b_frames = model(
+                        pitch=p,
+                        loudness=l,
+                        audio=a,
+                        audio_sr=config["sample_rate"],
+                        unfreeze_onset_after=config["unfreeze_onset_after"],
+                        return_parameters=True,
+                    )
+                trig_n = (model.last_trigger_times_s * model.internal_sr).long()  # [B, Fmax]
+                n_internal = int(round(a.size(1) * model.internal_sr / config["sample_rate"]))
+                loop_traj = model.decoder._upsample_by_triggers(
+                    l_b_frames.to(model.decoder.device), trig_n.to(model.decoder.device), n_internal, mode=model.decoder.upsample_mode)
+                exc_traj = model.decoder._upsample_by_triggers(
+                    exc_b_frames.to(model.decoder.device), trig_n.to(model.decoder.device), n_internal, mode=model.decoder.upsample_mode)
+                loop_traj_np = loop_traj.detach().cpu().numpy()
+                exc_traj_np = exc_traj.detach().cpu().numpy()
+
                 # choose up to 5 examples (avoid sampling more than batch size)
                 n_plot = min(a.size(0), 5)
                 rand_idx = np.random.choice(a.size(0), n_plot, replace=False)
@@ -359,6 +434,17 @@ def main():
                         title=f"epoch {epoch} sample {k}"
                     )
 
+                    # coefficient trajectories figure (internal SR → seconds)
+                    loop_np_k = loop_traj_np[idx]
+                    exc_np_k  = exc_traj_np[idx]
+                    trig_s_coef = trig_times_s[idx] if trig_times_s.ndim == 2 else None
+                    fig_coef = plot_coeffs_with_triggers(
+                        loop_traj=loop_np_k,
+                        exc_traj=exc_np_k,
+                        sr_vis=config["sample_rate"],
+                        trig_s=trig_s_coef,
+                        title=f"coeffs e{epoch} sample {k}")
+
                     if wandb.run is not None:
                         # log normalized audio and also the written wav file (for redundancy)
                         media_log[f"audio_compare_{k}"] = wandb.Audio(
@@ -372,13 +458,17 @@ def main():
                             caption=f"epoch {epoch} | sample {k} | raw file",
                         )
                         media_log[f"triggers_plot_{k}"] = wandb.Image(fig)
+                        media_log[f"coeffs_plot_{k}"] = wandb.Image(fig_coef)
 
                     print(f"[AUDIO LOG] sample {k}: peak={peak:.4f} len={sample.shape[0]} sr={config['sample_rate']}")
                     plt.close(fig)
+                    plt.close(fig_coef)
 
-                # log mean trigger count
+                # --- log mean trigger count (deduplicated) -----------------------
                 if wandb.run is not None and trig_times_s.ndim == 2:
-                    media_log["trigger_count_mean"] = float(trig_times_s.shape[1])
+                    # remove duplicates per item (head clamp & tail pad)
+                    counts_unique = [len(np.unique(row)) for row in trig_times_s]
+                    media_log["trigger_count_mean"] = float(np.mean(counts_unique))
 
                 # log all items together
                 if wandb.run is not None and len(media_log) > 0:
