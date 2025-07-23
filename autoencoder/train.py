@@ -9,7 +9,6 @@ import argparse, os
 import multiprocessing as mp
 import psutil
 import matplotlib.pyplot as plt
-# from typing import Optional
 
 # Global variable for internal sample rate used by plotting helpers
 MODEL_INTERNAL_SR = None  # set in main() after model construction; used by plotting helpers
@@ -59,11 +58,6 @@ def parse_args():
     p.add_argument("--unfreeze_onset_after", type=int,
                    default=int(env("UNFREEZE_ONSET_AFTER", 500)),
                    help="Global training step after which the ddc_onset sub‑modules will be unfrozen (0 = train from start).")
-
-    # ─── Training mode ────────────────────────────────────────────────────
-    p.add_argument("--parameter_loss", action="store_true",
-                   default=str2bool(env("PARAMETER_LOSS", "false")),
-                   help="Use parameter-loss training instead of reconstruction loss")
 
     p.add_argument("--batches_per_epoch", type=int, default=int(env("BATCHES_PER_EPOCH", 100)))
 
@@ -169,13 +163,9 @@ def main():
         "interpolation_type": args.interpolation_type,
         "pitch_mode": args.pitch_mode,
         "unfreeze_onset_after": args.unfreeze_onset_after,
-        "parameter_loss": args.parameter_loss,
         "batches_per_epoch": args.batches_per_epoch,
     }
 
-    if args.parameter_loss:
-        print("[WARN] --parameter_loss mode is not supported with variable‑length triggers; falling back to reconstruction training.")
-        config["parameter_loss"] = False
 
     print("\n▶ Running with config:")
     for k, v in vars(args).items():
@@ -221,18 +211,15 @@ def main():
     print(f"Using save directory: {full_save_path}")
 
     # ─── Data ─────────────────────────────────────────────────────────────
-    if not config["parameter_loss"]:
-        dataset = NsynthDataset(root=NSYNTH_PREPROCESSED_DIR,
-                                split="test",
-                                pitch_mode=config["pitch_mode"],
-                                families=config["families"],
-                                sources=config["sources"], )
+    dataset = NsynthDataset(root=NSYNTH_PREPROCESSED_DIR,
+                            split="test",
+                            pitch_mode=config["pitch_mode"],
+                            families=config["families"],
+                            sources=config["sources"], )
 
-        train_loader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=True,
-                                  drop_last=True, pin_memory=True if device.type != "mps" else False,
-                                  num_workers=config["num_workers"])
-    else:
-        raise RuntimeError("parameter_loss mode disabled; see warning above.")
+    train_loader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=True,
+                              drop_last=True, pin_memory=True if device.type != "mps" else False,
+                              num_workers=config["num_workers"])
 
     val_dataset = NsynthDataset(root=NSYNTH_PREPROCESSED_DIR,
                                 split="test",
@@ -242,6 +229,10 @@ def main():
 
     val_loader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False,
                             drop_last=True, pin_memory=True if device.type != "mps" else False, num_workers=config["num_workers"])
+
+    # ---- Fixed batch for consistent logging across epochs ----
+    fixed_audio, fixed_pitch, fixed_loud = next(iter(val_loader))
+    n_plot = min(fixed_audio.size(0), 5)
 
     # ─── Start Model, optimizer & Loss ────────────────────────── #
     model = AE_KarplusModel(
@@ -281,7 +272,7 @@ def main():
 
         print(f"[RESUME] Starting at epoch {start_epoch} (best so far {best_val_loss:.4f})")
 
-    bpe = len(train_loader)
+    bpe = min(len(train_loader), config["batches_per_epoch"])
 
     # ─── Early-stopping bookkeeping ───────────────────────────── #
     epochs_since_improve = 0
@@ -291,9 +282,12 @@ def main():
     for epoch in range(start_epoch, config["max_epochs"]):
         model.train()
         t_loss = 0
+        batches_processed = 0
 
         # ─── Training step ───────────────────────────────────────────────
-        for audio, pitch, loud in tqdm(train_loader, desc=f"[E{epoch:03d} train]"):
+        for batch_idx, (audio, pitch, loud) in enumerate(tqdm(train_loader, desc=f"[E{epoch:03d} train]")):
+            if batch_idx >= config["batches_per_epoch"]:
+                break
             audio, pitch, loud = audio.to(device), pitch.to(device), loud.to(device)
             recon = model(
                 pitch=pitch,
@@ -308,8 +302,10 @@ def main():
             optimizer.step()
             log_train_batch(loss.item())
             t_loss += loss.item()
+            batches_processed += 1
 
-        t_loss /= len(train_loader)
+        if batches_processed > 0:
+            t_loss /= batches_processed
 
         # ─── VALID ───────────────────────────────────────────────────────
         if epoch % config["eval_interval"] == 0:
@@ -361,8 +357,8 @@ def main():
         # ─── AUDIO LOGS ──────────────────────────────────────────────────
         if epoch % config["eval_interval"] == 0:
             with torch.no_grad():
-                a, p, l = next(iter(val_loader))
-                a, p, l = a.to(device), p.to(device), l.to(device)
+                # Use the same validation batch every epoch for consistent media logging
+                a, p, l = fixed_audio.to(device), fixed_pitch.to(device), fixed_loud.to(device)
                 # forward pass (freeze schedule still respected)
                 rec = model(
                     pitch=p,
@@ -394,12 +390,11 @@ def main():
                 loop_traj_np = loop_traj.detach().cpu().numpy()
                 exc_traj_np = exc_traj.detach().cpu().numpy()
 
-                # choose up to 5 examples (avoid sampling more than batch size)
-                n_plot = min(a.size(0), 5)
-                rand_idx = np.random.choice(a.size(0), n_plot, replace=False)
+                # media logging: use the fixed batch, n_plot is already defined above
 
                 media_log = {}
-                for k, idx in enumerate(rand_idx):
+                for idx in range(n_plot):
+                    k = idx  # keep original naming for logging
                     # prepare concatenated waveform original||recon
                     wave_orig = a[idx].cpu().numpy()
                     wave_rec  = rec[idx].cpu().numpy()

@@ -11,7 +11,6 @@ from data.preprocess import E2_HZ
 from ddc_onset.spectral import SpectrogramExtractor
 from ddc_onset.cnn      import SpectrogramNormalizer, PlacementCNN
 from ddc_onset.constants import FRAME_RATE, Difficulty
-from ddc_onset import find_peaks, threshold_peaks
 import torch.nn.functional as F
 from typing import List
 
