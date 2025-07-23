@@ -236,6 +236,7 @@ class AE_KarplusModel(nn.Module):
         self.trigger_rel_thresh = trigger_rel_thresh
         self.trigger_mlp = TriggerMLP(hidden=trigger_hidden, context=trigger_context)
         self.register_buffer("last_trigger_probs", torch.zeros(1, 1), persistent=False)
+        self.register_buffer("last_trigger_mlp", torch.zeros(1, 1), persistent=False)
         self.register_buffer("last_trigger_times_s", torch.zeros(1, 1), persistent=False)
         self.register_buffer("last_trigger_counts", torch.zeros(1, dtype=torch.long), persistent=False)
 
@@ -316,6 +317,8 @@ class AE_KarplusModel(nn.Module):
         # learned refinement MLP
         logits = self.trigger_mlp(sal)  # [B,T]
         probs = torch.sigmoid(logits / self.trigger_temp)  # [B,T]
+        # cache refined MLP probabilities for later logging
+        self.last_trigger_mlp = probs.detach()
 
         # ----- per-item threshold & cap -----------------------------------
         trig_list = []

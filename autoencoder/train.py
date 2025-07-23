@@ -8,6 +8,7 @@ from .model import AE_KarplusModel, MfccTimeDistributedRnnEncoder
 import argparse, os
 import multiprocessing as mp
 import psutil
+from ddc_onset.constants import FRAME_RATE
 import matplotlib.pyplot as plt
 
 # Global variable for internal sample rate used by plotting helpers
@@ -36,7 +37,7 @@ def parse_args():
                    help="Minimum relative (fractional) validation-loss improvement to reset patience. 0.001 = 0.1 %")
 
     # ─── Data-loading ──────────────────────────────────────────────────────
-    p.add_argument("--batch_size", type=int, default=int(env("BATCH_SIZE", 8)))
+    p.add_argument("--batch_size", type=int, default=int(env("BATCH_SIZE", 1)))
     p.add_argument("--num_workers", type=int, default=int(env("NUM_WORKERS", 2)))
 
     # ─── Model size ────────────────────────────────────────────────────────
@@ -421,27 +422,78 @@ def main():
                     else:
                         trig_concat_s = None
 
-                    # plot waveform + triggers
-                    fig = plot_wave_with_triggers(
-                        wave_np=sample,
-                        sr=config["sample_rate"],
-                        trig_s=trig_concat_s,
-                        title=f"epoch {epoch} sample {k}"
-                    )
+                    # ---- Composite figure with waveform, reconstruction, inverse signal, and coefficients ----
+                    fig, axes = plt.subplots(5, 1, figsize=(10, 12))
 
-                    # coefficient trajectories figure (internal SR → seconds)
+                    # 1) Target waveform with salience & triggers
+                    t_wave = np.arange(wave_orig.shape[0]) / float(config["sample_rate"])
+                    axes[0].plot(t_wave, wave_orig, color="blue", linewidth=1.0, label="target waveform")
+                    if trig_concat_s is not None:
+                        trig_mask = (trig_concat_s >= 0) & (trig_concat_s <= t_wave[-1])
+                        axes[0].plot(trig_concat_s[trig_mask], np.zeros_like(trig_concat_s[trig_mask]),
+                                     'rx', markersize=4, label="triggers")
+
+                    # overlay salience + TriggerMLP output on twin axis
+                    ratio = model.internal_sr // FRAME_RATE
+                    pad_left_int = int(round(model.pad_left * model.internal_sr / config["sample_rate"]))
+                    sal = model.last_trigger_probs[idx].cpu().numpy()
+                    mlp_out = model.last_trigger_mlp[idx].cpu().numpy()
+                    t_sal = (np.arange(sal.shape[0]) * ratio - pad_left_int) / float(config["sample_rate"])
+                    mask = (t_sal >= 0) & (t_sal <= t_wave[-1])
+                    ax_twin = axes[0].twinx()
+                    if sal.max() > sal.min():
+                        sal_norm = (sal - sal.min()) / (sal.max() - sal.min())
+                    else:
+                        sal_norm = sal
+                    if mlp_out.max() > mlp_out.min():
+                        mlp_norm = (mlp_out - mlp_out.min()) / (mlp_out.max() - mlp_out.min())
+                    else:
+                        mlp_norm = mlp_out
+                    ax_twin.plot(t_sal[mask], sal_norm[mask], color="green", alpha=1.0, linewidth=2.0, label="salience")
+                    ax_twin.plot(t_sal[mask], mlp_norm[mask], color="pink", alpha=1.0, linewidth=2.0, label="trigger MLP")
+                    ax_twin.set_ylim(0, 1)
+
+                    # Combine legends from both y-axes
+                    lines_0, labels_0 = axes[0].get_legend_handles_labels()
+                    lines_1, labels_1 = ax_twin.get_legend_handles_labels()
+                    axes[0].legend(lines_0 + lines_1, labels_0 + labels_1, loc="upper right", fontsize="x-small")
+
+                    # 2) Reconstruction
+                    axes[1].plot(t_wave, wave_rec, label="recon")
+                    axes[1].set_ylabel("Amplitude")
+                    axes[1].legend(fontsize="x-small", loc="upper right")
+
+                    # 3) Inverse-filtered signal
+                    inv_sig_full = model.decoder.get_inverse_filtered_signal()[idx].cpu().numpy()
+                    inv_sig = inv_sig_full[:wave_orig.shape[0]]  # match length for plotting
+                    axes[2].plot(t_wave, inv_sig, label="inverse")
+                    axes[2].set_ylabel("Amplitude")
+                    axes[2].legend(fontsize="x-small", loc="upper right")
+
+                    # 4) Loop coefficients
                     loop_np_k = loop_traj_np[idx]
-                    exc_np_k  = exc_traj_np[idx]
-                    trig_s_coef = trig_times_s[idx] if trig_times_s.ndim == 2 else None
-                    fig_coef = plot_coeffs_with_triggers(
-                        loop_traj=loop_np_k,
-                        exc_traj=exc_np_k,
-                        sr_vis=config["sample_rate"],
-                        trig_s=trig_s_coef,
-                        title=f"coeffs e{epoch} sample {k}")
+                    t_loop = np.arange(loop_np_k.shape[0]) / float(model.internal_sr)
+                    for j in range(loop_np_k.shape[1]):
+                        axes[3].plot(t_loop, loop_np_k[:, j], label=f"loop[{j}]")
+                    axes[3].set_ylabel("loop coeffs")
+                    if loop_np_k.shape[1] <= 8:
+                        axes[3].legend(fontsize="x-small", ncol=2, loc="upper right")
+
+                    # 5) Excitation coefficients
+                    exc_np_k = exc_traj_np[idx]
+                    t_exc = np.arange(exc_np_k.shape[0]) / float(model.internal_sr)
+                    for j in range(exc_np_k.shape[1]):
+                        axes[4].plot(t_exc, exc_np_k[:, j], label=f"exc[{j}]")
+                    axes[4].set_ylabel("exc coeffs")
+                    axes[4].set_xlabel("Time (s)")
+                    if exc_np_k.shape[1] <= 8:
+                        axes[4].legend(fontsize="x-small", ncol=2, loc="upper right")
+
+                    fig.tight_layout()
 
                     if wandb.run is not None:
-                        # log normalized audio and also the written wav file (for redundancy)
+                        # log both the composite figure and the audio
+                        media_log[f"composite_plot_{k}"] = wandb.Image(fig)
                         media_log[f"audio_compare_{k}"] = wandb.Audio(
                             sample_play,
                             sample_rate=config["sample_rate"],
@@ -452,12 +504,8 @@ def main():
                             sample_rate=config["sample_rate"],
                             caption=f"epoch {epoch} | sample {k} | raw file",
                         )
-                        media_log[f"triggers_plot_{k}"] = wandb.Image(fig)
-                        media_log[f"coeffs_plot_{k}"] = wandb.Image(fig_coef)
 
-                    print(f"[AUDIO LOG] sample {k}: peak={peak:.4f} len={sample.shape[0]} sr={config['sample_rate']}")
                     plt.close(fig)
-                    plt.close(fig_coef)
 
                 # --- log mean trigger count (deduplicated) -----------------------
                 if wandb.run is not None and trig_times_s.ndim == 2:
