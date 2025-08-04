@@ -2,6 +2,7 @@ from tqdm import tqdm
 import numpy as np
 import soundfile as sf
 import torch, torch.optim as optim, wandb
+import torchaudio.functional as TAF
 from third_party.auraloss.auraloss.freq import MultiResolutionSTFTLoss
 from torch.utils.data import DataLoader
 from .model import AE_KarplusModel, MfccTimeDistributedRnnEncoder
@@ -9,7 +10,14 @@ import argparse, os
 import multiprocessing as mp
 import psutil
 from ddc_onset.constants import FRAME_RATE
+
 import matplotlib.pyplot as plt
+
+# ─── Training phase schedule ──────────────────────────────────────────────
+STAGE1_STEPS = 500    # freeze DDC
+STAGE2_STEPS = 2000   # unfreeze DDC, freeze coeffs
+LR_MAIN      = 1e-4   # base LR (overridden by CLI)
+LR_FINE      = 1e-5   # lower LR for fine‑tuning phases
 
 # Global variable for internal sample rate used by plotting helpers
 MODEL_INTERNAL_SR = None  # set in main() after model construction; used by plotting helpers
@@ -30,7 +38,7 @@ def parse_args():
                    help="Resume training from latest checkpoint for this --name")
 
     # ─── Optimisation hyper-parameters ─────────────────────────────────────
-    p.add_argument("--learning_rate", type=float, default=float(env("LEARNING_RATE", 1e-4)))
+    p.add_argument("--learning_rate", type=float, default=float(env("LEARNING_RATE", 1e-2)))
     p.add_argument("--max_epochs", type=int, default=int(env("MAX_EPOCHS", 330)))
     p.add_argument("--patience", type=int, default=int(env("PATIENCE", 20)))
     p.add_argument("--min_delta", type=float, default=float(env("MIN_DELTA", 0.001)),
@@ -62,89 +70,88 @@ def parse_args():
 
     p.add_argument("--batches_per_epoch", type=int, default=int(env("BATCHES_PER_EPOCH", 100)))
 
+    # Stage transition steps CLI arguments
+    p.add_argument("--stage1_steps", type=int, default=int(env("STAGE1_STEPS", 500)),
+                   help="Step to transition from stage 0 (DDC frozen) to stage 1 (DDC unfrozen)")
+    p.add_argument("--stage2_steps", type=int, default=int(env("STAGE2_STEPS", 2000)),
+                   help="Step to transition from stage 1 (coeff frozen) to stage 2 (all unfrozen, fine LR)")
+
     return p.parse_args()
 
-def plot_wave_with_triggers(wave_np, sr, trig_s, title=None):
-    """
-    wave_np: 1D numpy array audio samples
-    sr: sample rate (int)
-    trig_s: 1D numpy array of trigger times in seconds
-    """
-    import numpy as np
-    import matplotlib.pyplot as plt
-
-    t = np.arange(len(wave_np)) / float(sr)
-    # NOTE: we no longer draw vertical lines; red X markers are easier to see on WandB dark/light themes.
-    fig, ax = plt.subplots(figsize=(8, 2))
-    ax.plot(t, wave_np)
-    if trig_s is not None and len(trig_s) > 0:
-        # plot red X markers at the waveform value nearest each trigger time
-        trig_s = np.asarray(trig_s, dtype=float)
-        # clip in-range
-        trig_s = trig_s[(trig_s >= 0.0) & (trig_s <= t[-1])]
-        # drop duplicate trigger times so plots stay uncluttered
-        trig_s = np.unique(trig_s)  # ascending order, duplicates removed
-        if trig_s.size > 0:
-            trig_idx = np.clip((trig_s * sr).astype(int), 0, len(wave_np) - 1)
-            trig_y = wave_np[trig_idx]
-            ax.plot(trig_s, trig_y, 'rx', markersize=5, mew=1.0)
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Amp")
-    if title:
-        ax.set_title(title)
-    fig.tight_layout()
-    return fig
 
 
-# Helper to plot loop and excitation coefficient trajectories, with optional trigger markers
-def plot_coeffs_with_triggers(loop_traj, exc_traj, sr_vis, trig_s=None, title=None):
+# -----------------------------------------------------------------
+def build_optimizer(model, phase: int):
     """
-    loop_traj: [N, Lc] constrained loop coefficients at internal SR
-    exc_traj: [N, Ec] constrained excitation coefficients at internal SR
-    sr_vis: target sample-rate for x-axis (e.g. outer audio SR, 16 kHz)
-    trig_s: optional 1D array of trigger times in seconds (outer SR domain)
-    title: optional string
+    phase 0 : train **coefficient‑prediction network** (everything except placement_cnn) at LR_MAIN
+    phase 1 : train **placement_cnn (DDC onset CNN)** only at LR_MAIN
+    phase 2 : train **all** (coeff predictor + placement_cnn) jointly at LR_FINE
+
+    Decoder parameters (`decoder.*`) and spectrogram front‑end parameters
+    (`spec_extractor.*`, `spec_normalizer.*`) always remain frozen.
     """
-    import numpy as np
-    import matplotlib.pyplot as plt
-    n = loop_traj.shape[0]
-    # Determine internal sample rate for seconds axis
-    sr_int = MODEL_INTERNAL_SR if MODEL_INTERNAL_SR is not None else sr_vis * (44100.0 / 16000.0)
-    t = np.arange(n) / float(sr_int)
-    fig, axs = plt.subplots(2, 1, figsize=(8, 3.5), sharex=True)
-    # Plot loop coefficients
-    lc = loop_traj.shape[1]
-    for i in range(lc):
-        axs[0].plot(t, loop_traj[:, i], label=f"loop[{i}]")
-    axs[0].set_ylabel("coeff")
-    axs[0].set_title("Loop coefficients")
-    # Plot excitation coefficients
-    ec = exc_traj.shape[1]
-    for i in range(ec):
-        axs[1].plot(t, exc_traj[:, i], label=f"exc[{i}]")
-    axs[1].set_ylabel("coeff")
-    axs[1].set_title("Excitation coefficients")
-    axs[1].set_xlabel("Time (s)")
-    # Add legends if number of traces is small
-    if lc <= 8:
-        axs[0].legend(loc="center left", bbox_to_anchor=(1.01, 0.5))
-    if ec <= 8:
-        axs[1].legend(loc="center left", bbox_to_anchor=(1.01, 0.5))
-    # Plot trigger markers if provided
-    if trig_s is not None and len(trig_s) > 0:
-        trig_s = np.asarray(trig_s, dtype=float)
-        trig_s = trig_s[(trig_s >= 0.0) & (trig_s <= t[-1])]
-        if trig_s.size > 0:
-            # For each trigger, place a red 'x' at y=0 on both axes
-            axs[0].plot(trig_s, np.zeros_like(trig_s), 'rx', markersize=5, mew=1.0)
-            axs[1].plot(trig_s, np.zeros_like(trig_s), 'rx', markersize=5, mew=1.0)
-    if title:
-        fig.suptitle(title)
-    fig.tight_layout()
-    return fig
+    decoder_params     = []
+    placement_params   = []
+    spec_params        = []   # spec_extractor + spec_normalizer
+    other_params       = []
+    coeff_params       = []
+
+    for name, p in model.named_parameters():
+        if name.startswith("decoder."):
+            decoder_params.append(p)
+        elif name.startswith("placement_cnn."):
+            placement_params.append(p)
+        elif name.startswith(("spec_extractor.", "spec_normalizer.")):
+            spec_params.append(p)
+        elif name.startswith("coefficients."):
+            coeff_params.append(p)
+        else:
+            other_params.append(p)
+
+    # --- 1. Always freeze the decoder and spec_extractor/normalizer ------
+    for p in decoder_params + spec_params:
+        p.requires_grad = False
+
+    # --- 2. Phase‑specific rules -------------------------------------------
+    if phase == 0:
+        # Phase 0 – train the whole coefficient‑prediction network
+        # (z_encoder + in/out MLPs + GRU + coefficients head).
+        # Freeze placement_cnn.
+        for p in coeff_params + other_params:
+            p.requires_grad = True
+        for p in placement_params:
+            p.requires_grad = False
+        param_groups = [
+            {"params": coeff_params + other_params, "lr": LR_MAIN},
+        ]
+
+    elif phase == 1:
+        # Phase 1 – train the DDC onset CNN only; freeze coefficient network.
+        for p in placement_params:
+            p.requires_grad = True
+        for p in coeff_params + other_params:
+            p.requires_grad = False
+        param_groups = [
+            {"params": placement_params, "lr": LR_MAIN},
+        ]
+
+    else:
+        # Phase 2 – fine‑tune everything jointly (except decoder/spec) at LR_FINE
+        for p in coeff_params + placement_params + other_params:
+            p.requires_grad = True
+        param_groups = [
+            {"params": coeff_params + placement_params + other_params, "lr": LR_FINE},
+        ]
+
+    return optim.Adam(param_groups)
+# -----------------------------------------------------------------
 
 def main():
     args = parse_args()
+    # Override stage transition steps from CLI
+    global STAGE1_STEPS, STAGE2_STEPS
+    STAGE1_STEPS = args.stage1_steps
+    STAGE2_STEPS = args.stage2_steps
     config = {
         "hidden_size": args.hidden_size,
         "loop_order": args.l_order,
@@ -249,7 +256,9 @@ def main():
     global MODEL_INTERNAL_SR
     MODEL_INTERNAL_SR = model.internal_sr
 
-    optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
+    current_phase = 0  # start at phase 0 – coefficients only
+    optimizer = build_optimizer(model, current_phase)
+    global_step = 0
 
     mr_stft = MultiResolutionSTFTLoss(scale_invariance=True, perceptual_weighting=True,
                                       sample_rate=config["sample_rate"], device=device, )
@@ -285,8 +294,13 @@ def main():
         t_loss = 0
         batches_processed = 0
 
+        torch.autograd.set_detect_anomaly(True)
+
         # ─── Training step ───────────────────────────────────────────────
         for batch_idx, (audio, pitch, loud) in enumerate(tqdm(train_loader, desc=f"[E{epoch:03d} train]")):
+            for name, param in model.named_parameters():
+                print(f"{name}: requires_grad={param.requires_grad}")
+
             if batch_idx >= config["batches_per_epoch"]:
                 break
             audio, pitch, loud = audio.to(device), pitch.to(device), loud.to(device)
@@ -295,12 +309,34 @@ def main():
                 loudness=loud,
                 audio=audio,
                 audio_sr=config["sample_rate"],
-                unfreeze_onset_after=config["unfreeze_onset_after"],
             )
-            loss = mr_stft(recon.unsqueeze(1), audio.unsqueeze(1))
+            # Sanity‑check: recon must come back at the original sample‑rate
+            assert recon.shape[1] == audio.shape[1], (
+                f"Decoder returned {recon.shape[1]} samples, "
+                f"but target has {audio.shape[1]}. "
+                "This usually means an incorrect `audio_sr` was passed to the model."
+            )
+            stft_loss = mr_stft(recon.unsqueeze(1), audio.unsqueeze(1))
+            loss = stft_loss
             optimizer.zero_grad()
             loss.backward()
+            # Debug: print gradient mean for all parameters after backward
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    print(f"[DEBUG TRAIN LOOP] {name}: grad mean {param.grad.abs().mean().item():.6f}")
+                else:
+                    print(f"[DEBUG TRAIN LOOP] {name}: NO GRAD")
             optimizer.step()
+            global_step += 1
+            # ---- phase scheduler --------------------------------------------------
+            if current_phase == 0 and global_step >= STAGE1_STEPS:
+                current_phase = 1
+                optimizer = build_optimizer(model, current_phase)
+                print(f"[SCHED] Step {global_step}: phase 1 – now training DDC CNN only (coefficients frozen, LR={LR_MAIN})")
+            elif current_phase == 1 and global_step >= STAGE2_STEPS:
+                current_phase = 2
+                optimizer = build_optimizer(model, current_phase)
+                print(f"[SCHED] Step {global_step}: phase 2 – joint fine‑tuning (LR={LR_FINE})")
             log_train_batch(loss.item())
             t_loss += loss.item()
             batches_processed += 1
@@ -320,9 +356,15 @@ def main():
                         loudness=loud,
                         audio=audio,
                         audio_sr=config["sample_rate"],
-                        unfreeze_onset_after=config["unfreeze_onset_after"],
                     )
-                    batch_v = mr_stft(recon.unsqueeze(1), audio.unsqueeze(1)).item()
+                    # Sanity‑check: recon must come back at the original sample‑rate
+                    assert recon.shape[1] == audio.shape[1], (
+                        f"Decoder returned {recon.shape[1]} samples, "
+                        f"but target has {audio.shape[1]}. "
+                        "This usually means an incorrect `audio_sr` was passed to the model."
+                    )
+                    stft_v = mr_stft(recon.unsqueeze(1), audio.unsqueeze(1))
+                    batch_v = stft_v.item()
                     v_losses.append(batch_v)
             v_loss = float(np.mean(v_losses))
         else:
@@ -360,36 +402,52 @@ def main():
             with torch.no_grad():
                 # Use the same validation batch every epoch for consistent media logging
                 a, p, l = fixed_audio.to(device), fixed_pitch.to(device), fixed_loud.to(device)
+                # use model.last_salience computed in forward (already in [B, T_sal] at 100 Hz)
                 # forward pass (freeze schedule still respected)
                 rec = model(
                     pitch=p,
                     loudness=l,
                     audio=a,
                     audio_sr=config["sample_rate"],
-                    unfreeze_onset_after=config["unfreeze_onset_after"],
+                )
+                # Sanity‑check: rec must come back at the original sample‑rate
+                assert rec.shape[1] == a.shape[1], (
+                    f"Decoder returned {rec.shape[1]} samples, "
+                    f"but target has {a.shape[1]}. "
+                    "This usually means an incorrect `audio_sr` was passed to the model."
                 )
 
-                # grab trigger times (seconds)
-                trig_times_s = model.last_trigger_times_s.detach().cpu().numpy()  # [B,K]
+                # grab *active* trigger times (weights > 0.5)
+                trig_times_s = model.last_true_trigger_times_s.detach().cpu().numpy()  # [B,K_true]
 
                 # ---- Diagnostic: parameter-only forward to get constrained coeff frames and upsample to per-sample trajectories ----
                 with torch.no_grad():
+                    # constrained, encoder‑frame‑rate coefficients
                     l_b_frames, exc_b_frames = model(
                         pitch=p,
                         loudness=l,
                         audio=a,
                         audio_sr=config["sample_rate"],
-                        unfreeze_onset_after=config["unfreeze_onset_after"],
                         return_parameters=True,
                     )
-                trig_n = (model.last_trigger_times_s * model.internal_sr).long()  # [B, Fmax]
+
                 n_internal = int(round(a.size(1) * model.internal_sr / config["sample_rate"]))
-                loop_traj = model.decoder._upsample_by_triggers(
-                    l_b_frames.to(model.decoder.device), trig_n.to(model.decoder.device), n_internal, mode=model.decoder.upsample_mode)
-                exc_traj = model.decoder._upsample_by_triggers(
-                    exc_b_frames.to(model.decoder.device), trig_n.to(model.decoder.device), n_internal, mode=model.decoder.upsample_mode)
+
+                _, loop_traj, _, exc_traj = model.decoder.get_upsampled_parameters(
+                    p.squeeze(-1),
+                    n_internal,
+                    l_b=l_b_frames.to(model.decoder.device),
+                    l_g=torch.ones_like(l_b_frames),
+                    exc_b=exc_b_frames.to(model.decoder.device),
+                )
+
                 loop_traj_np = loop_traj.detach().cpu().numpy()
                 exc_traj_np = exc_traj.detach().cpu().numpy()
+
+                # Helper: interpolate a 1‑D signal onto the 16kHz time grid used by the waveforms
+                def _interp_to_t_wave(sig_1d, orig_sr, target_t):
+                    t_orig = np.arange(sig_1d.shape[0]) / float(orig_sr)
+                    return np.interp(target_t, t_orig, sig_1d)
 
                 # media logging: use the fixed batch, n_plot is already defined above
 
@@ -418,104 +476,180 @@ def main():
                     if trig_times_s.ndim == 2 and idx < trig_times_s.shape[0]:
                         trig_s = trig_times_s[idx]
                         seg_dur_s = wave_orig.shape[0] / float(config["sample_rate"])
-                        trig_concat_s = np.concatenate([trig_s, trig_s + seg_dur_s])
+                        # only triggers inside the original segment
+                        trig_concat_s = trig_s
                     else:
                         trig_concat_s = None
 
                     # ---- Composite figure with waveform, reconstruction, inverse signal, and coefficients ----
-                    fig, axes = plt.subplots(5, 1, figsize=(10, 12))
+                    fig, axes = plt.subplots(7, 1, figsize=(10, 16))
 
                     # 1) Target waveform with salience & triggers
                     t_wave = np.arange(wave_orig.shape[0]) / float(config["sample_rate"])
-                    axes[0].plot(t_wave, wave_orig, color="blue", linewidth=1.0, label="target waveform")
-                    if trig_concat_s is not None:
-                        trig_mask = (trig_concat_s >= 0) & (trig_concat_s <= t_wave[-1])
-                        axes[0].plot(trig_concat_s[trig_mask], np.zeros_like(trig_concat_s[trig_mask]),
-                                     'rx', markersize=4, label="triggers")
+                    axes[0].plot(t_wave, wave_orig, linewidth=1.0, label="target waveform")
+                    axes[0].set_ylim(-1, 1)
 
-                    # overlay salience + TriggerMLP output on twin axis
-                    ratio = model.internal_sr // FRAME_RATE
-                    pad_left_int = int(round(model.pad_left * model.internal_sr / config["sample_rate"]))
-                    sal = model.last_trigger_probs[idx].cpu().numpy()
-                    mlp_out = model.last_trigger_mlp[idx].cpu().numpy()
-                    t_sal = (np.arange(sal.shape[0]) * ratio - pad_left_int) / float(config["sample_rate"])
-                    mask = (t_sal >= 0) & (t_sal <= t_wave[-1])
+                    # twin y‑axis reserved for salience only
                     ax_twin = axes[0].twinx()
-                    if sal.max() > sal.min():
-                        sal_norm = (sal - sal.min()) / (sal.max() - sal.min())
-                    else:
-                        sal_norm = sal
-                    if mlp_out.max() > mlp_out.min():
-                        mlp_norm = (mlp_out - mlp_out.min()) / (mlp_out.max() - mlp_out.min())
-                    else:
-                        mlp_norm = mlp_out
-                    ax_twin.plot(t_sal[mask], sal_norm[mask], color="green", alpha=1.0, linewidth=2.0, label="salience")
-                    ax_twin.plot(t_sal[mask], mlp_norm[mask], color="pink", alpha=1.0, linewidth=2.0, label="trigger MLP")
-                    ax_twin.set_ylim(0, 1)
+                    ax_twin.set_ylim(-1, 1)
 
-                    # Combine legends from both y-axes
-                    lines_0, labels_0 = axes[0].get_legend_handles_labels()
-                    lines_1, labels_1 = ax_twin.get_legend_handles_labels()
-                    axes[0].legend(lines_0 + lines_1, labels_0 + labels_1, loc="upper right", fontsize="x-small")
+                    # === overlay raw post‑tanh salience (upsampled to 16 kHz) ===
+                    if hasattr(model, "last_salience"):
+                        sal_100 = model.last_salience[idx].cpu().numpy()           # (T_sal,)
+                        t_sal   = np.arange(sal_100.shape[0]) / FRAME_RATE         # seconds
+                        # use raw tanh output (already in −1..1): no normalization
+                        sal_up = np.interp(t_wave, t_sal, sal_100)                 # to 16 kHz grid
+                        ax_twin.plot(t_wave, sal_up, color="magenta", lw=1.5,
+                                     label="DDC salience")
+                        # draw the STEPeakPick threshold
+                        thr = model.trigger_temp
+                        ax_twin.axhline(thr, color="orange", ls="--", lw=1, alpha=0.8)
+                        ax_twin.set_ylim(-1, 1)
+
+                        # plot trigger dots only on FIRST half (original clip)
+                        if trig_s is not None:
+                            trig_mask = (trig_s >= 0.0) & (trig_s <= t_wave[-1])
+                            if trig_mask.any():
+                                sal_vals = np.interp(trig_s[trig_mask], t_wave, sal_up)
+                                ax_twin.scatter(trig_s[trig_mask], sal_vals,
+                                                color="red", marker="o", s=50,
+                                                label="triggers", zorder=6)
+
+                    # collect legend entries from both y‑axes
+                    h0, l0 = axes[0].get_legend_handles_labels()
+                    h1, l1 = ax_twin.get_legend_handles_labels()
+                    handles_all = h0 + h1
+                    labels_all  = l0 + l1
+
+                    keep_labels = ["DDC salience", "triggers"]   # desired entries
+                    filtered = [(h, l) for h, l in zip(handles_all, labels_all)
+                                if l in keep_labels]
+                    if filtered:
+                        h_keep, l_keep = zip(*filtered)
+                        axes[0].legend(h_keep, l_keep, loc="upper right",
+                                       fontsize="x-small")
 
                     # 2) Reconstruction
                     axes[1].plot(t_wave, wave_rec, label="recon")
+                    axes[1].set_ylim(-1, 1)
                     axes[1].set_ylabel("Amplitude")
                     axes[1].legend(fontsize="x-small", loc="upper right")
 
                     # 3) Inverse-filtered signal
-                    inv_sig_full = model.decoder.get_inverse_filtered_signal()[idx].cpu().numpy()
-                    inv_sig = inv_sig_full[:wave_orig.shape[0]]  # match length for plotting
-                    axes[2].plot(t_wave, inv_sig, label="inverse")
+                    # resample from internal_sr back to 16 kHz for alignment
+                    inv_sig_internal = model.decoder.get_inverse_filtered_signal()[idx].cpu()
+                    inv_sig_16k = TAF.resample(
+                        inv_sig_internal.unsqueeze(0),
+                        orig_freq=model.internal_sr,
+                        new_freq=config["sample_rate"]
+                    ).squeeze(0)
+                    inv_sig = inv_sig_16k.numpy()
+                    t_inv = np.arange(inv_sig.shape[0]) / float(config["sample_rate"])
+                    axes[2].plot(t_inv, inv_sig, label="inverse")
+                    axes[2].set_ylim(-1, 1)
                     axes[2].set_ylabel("Amplitude")
                     axes[2].legend(fontsize="x-small", loc="upper right")
 
-                    # 4) Loop coefficients
-                    loop_np_k = loop_traj_np[idx]
-                    t_loop = np.arange(loop_np_k.shape[0]) / float(model.internal_sr)
-                    for j in range(loop_np_k.shape[1]):
-                        axes[3].plot(t_loop, loop_np_k[:, j], label=f"loop[{j}]")
+                    # --- Loop coefficients (resampled to 16kHz) ---
+                    loop_np_k = loop_traj_np[idx]  # [N_int, L+1]
+                    loop_np_k_16k = np.stack([
+                        _interp_to_t_wave(loop_np_k[:, j], model.internal_sr, t_wave)
+                        for j in range(loop_np_k.shape[1])
+                    ], axis=1)  # [T_wave, L+1]
+                    for j in range(loop_np_k_16k.shape[1]):
+                        axes[3].plot(t_wave, loop_np_k_16k[:, j], label=f"loop[{j}]")
                     axes[3].set_ylabel("loop coeffs")
-                    if loop_np_k.shape[1] <= 8:
+                    if loop_np_k_16k.shape[1] <= 8:
                         axes[3].legend(fontsize="x-small", ncol=2, loc="upper right")
 
-                    # 5) Excitation coefficients
-                    exc_np_k = exc_traj_np[idx]
-                    t_exc = np.arange(exc_np_k.shape[0]) / float(model.internal_sr)
-                    for j in range(exc_np_k.shape[1]):
-                        axes[4].plot(t_exc, exc_np_k[:, j], label=f"exc[{j}]")
+                    # --- Excitation coefficients (resampled to 16kHz) ---
+                    exc_np_k = exc_traj_np[idx]  # [N_int, E+1]
+                    exc_np_k_16k = np.stack([
+                        _interp_to_t_wave(exc_np_k[:, j], model.internal_sr, t_wave)
+                        for j in range(exc_np_k.shape[1])
+                    ], axis=1)  # [T_wave, E+1]
+                    for j in range(exc_np_k_16k.shape[1]):
+                        axes[4].plot(t_wave, exc_np_k_16k[:, j], label=f"exc[{j}]")
                     axes[4].set_ylabel("exc coeffs")
                     axes[4].set_xlabel("Time (s)")
-                    if exc_np_k.shape[1] <= 8:
+                    if exc_np_k_16k.shape[1] <= 8:
                         axes[4].legend(fontsize="x-small", ncol=2, loc="upper right")
+
+                    # 6) Raw loop‑coefficient frames (pre‑trigger)
+                    raw_loop = model.last_loop_coeff_frames[idx].cpu().numpy()    # [T_enc, L+1]
+                    t_frames = np.linspace(0, t_wave[-1], raw_loop.shape[0])      # align with clip duration
+                    for j in range(raw_loop.shape[1]):
+                        axes[5].plot(t_frames, raw_loop[:, j], label=f"loop_raw[{j}]")
+                    raw_loop_gain = model.last_loop_gain_frames[idx].cpu().numpy()  # [T_enc, 1]
+                    axes[5].plot(t_frames, raw_loop_gain[:, 0], linestyle='--', linewidth=2.0, label='loop_gain')
+                    axes[5].set_ylabel("raw loop")
+                    if raw_loop.shape[1] <= 8:
+                        axes[5].legend(fontsize="x-small", ncol=2, loc="upper right")
+
+                    # 7) Raw excitation‑coefficient frames (pre‑trigger)
+                    raw_exc = model.last_exc_coeff_frames[idx].cpu().numpy()      # [T_enc, E+1]
+                    for j in range(raw_exc.shape[1]):
+                        if j == 0:
+                            axes[6].plot(t_frames, raw_exc[:, j], linestyle='--', linewidth=2.0, label='exc_gain')
+                        else:
+                            axes[6].plot(t_frames, raw_exc[:, j], label=f"exc_raw[{j}]")
+                    axes[6].set_ylabel("raw exc")
+                    axes[6].set_xlabel("Time (s)")
+                    if raw_exc.shape[1] <= 8:
+                        axes[6].legend(fontsize="x-small", ncol=2, loc="upper right")
 
                     fig.tight_layout()
 
                     if wandb.run is not None:
-                        # log both the composite figure and the audio
+                        # log the composite figure and the normalized audio comparison only
                         media_log[f"composite_plot_{k}"] = wandb.Image(fig)
                         media_log[f"audio_compare_{k}"] = wandb.Audio(
                             sample_play,
                             sample_rate=config["sample_rate"],
                             caption=f"epoch {epoch} | sample {k} | orig+recon (norm)",
                         )
-                        media_log[f"audio_file_{k}"] = wandb.Audio(
-                            wav_path,
-                            sample_rate=config["sample_rate"],
-                            caption=f"epoch {epoch} | sample {k} | raw file",
-                        )
 
                     plt.close(fig)
 
+                    # Separate plot: resonator matrix taps
+                    R = model.decoder.resonator_matrix[idx].cpu().numpy()  # [N_int, D]
+                    t_R = np.arange(R.shape[0]) / float(MODEL_INTERNAL_SR)
+                    fig_res, ax_res = plt.subplots(figsize=(10, 4))
+                    color_cycle = plt.cm.tab10(np.linspace(0, 1, R.shape[1]))
+                    non_zero_labels = []
+                    for d in range(R.shape[1]):
+                        if np.allclose(R[:, d], 0.0):
+                            continue  # skip all‑zero taps
+                        lbl = f"tap {d}"
+                        ax_res.plot(t_R, R[:, d],
+                                    lw=1.2,
+                                    color=color_cycle[d % 10],
+                                    label=lbl)
+                        non_zero_labels.append(lbl)
+
+                    if non_zero_labels:
+                        ax_res.legend(fontsize="x-small", ncol=4, loc="upper right")
+                    ax_res.set_title(f"Resonator matrix taps sample {idx}")
+                    ax_res.set_xlabel("Time (s)")
+                    ax_res.set_ylabel("Coefficient value")
+                    fig_res.tight_layout()
+                    if wandb.run is not None:
+                        media_log[f"resonator_matrix_{idx}"] = wandb.Image(fig_res)
+                    plt.close(fig_res)
+
                 # --- log mean trigger count (deduplicated) -----------------------
                 if wandb.run is not None and trig_times_s.ndim == 2:
-                    # remove duplicates per item (head clamp & tail pad)
-                    counts_unique = [len(np.unique(row)) for row in trig_times_s]
+                    # Only count triggers within the original clip duration
+                    dur = fixed_audio.shape[1] / float(config["sample_rate"])
+                    counts_unique = [
+                        len(np.unique(row[(row >= 0.0) & (row <= dur)]))
+                        for row in trig_times_s
+                    ]
                     media_log["trigger_count_mean"] = float(np.mean(counts_unique))
 
-                # log all items together
-                if wandb.run is not None and len(media_log) > 0:
-                    wandb.log(media_log, commit=True)
+                    # log all items together
+                    if wandb.run is not None and len(media_log) > 0:
+                        wandb.log(media_log, commit=True)
 
         print(f"[E{epoch}] train={t_loss:.4f} val={v_loss:.4f} best={best_val_loss:.4f} (no-improve {epochs_since_improve}/{config['patience']})")
 

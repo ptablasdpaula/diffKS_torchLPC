@@ -3,101 +3,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchlpc import sample_wise_lpc
-import torchaudio.functional as TAF
-from torchcubicspline import natural_cubic_spline_coeffs, NaturalCubicSpline
 from utils import get_device
 
+from dsp import kaiser_resample, invert_lpc, spline_upsample
+from ml import STEUpsampleFirstPeak
+
 LAGRANGE_ORDER = 5
-
-def kaiser_resample(x, sr_in: int, sr_out: int,
-                    width: int = 32, beta: float = 14.0,
-                    rolloff: float = 0.9475937167399596):
-    """
-    Linear-phase Kaiser-windowed sinc resampler, as used in DDSP (Engel., et al).
-
-    Args
-    ----
-    x        : (..., time) tensor
-    sr_in    : original sample-rate
-    sr_out   : target   sample-rate
-    width    : low-pass filter width (taps per phase)
-    beta     : Kaiser β; 14 ≈ >90 dB stop-band
-    rolloff  : pass-band edge / Nyquist (DDSP uses 0.94759371674)
-    """
-    orig_dev = x.device
-    # if on MPS, do the actual resampling on CPU
-    if orig_dev.type == "mps":
-        x = x.cpu()
-    y = TAF.resample(
-        x, sr_in, sr_out,
-        lowpass_filter_width=width,
-        rolloff=rolloff,
-        resampling_method="sinc_interp_kaiser",
-        beta=beta
-    )
-    # move back to the original device only if we fell back
-    return y.to(orig_dev) if orig_dev.type == "mps" else y
-
-def spline_upsample(x: torch.Tensor,  # shape [B, Frames, D]
-                    num_samples) -> torch.Tensor:  # shape [B, Samples, D]
-    frames = x.size(1)
-    t_in = torch.linspace(0, 1, steps=frames, device=x.device)
-    t_out = torch.linspace(0, 1, steps=num_samples, device=x.device)
-    spline_fit = natural_cubic_spline_coeffs(t_in, x)
-    return NaturalCubicSpline(spline_fit).evaluate(t_out)
-
-class InvertLPC(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, y, A, zi):
-        B, T = y.shape
-        N = A.shape[2]
-
-        if zi is not None:
-            initial = zi.flip(dims=[1])
-        else:
-            initial = y.new_zeros(B, N, device=y.device)
-
-        y_padded = torch.cat([initial, y], dim=1)
-        x = y.clone()
-
-        # Precompute all shifted versions in one go
-        shifts = torch.stack([y_padded[:, N - k:N - k + T] for k in range(1, N + 1)], dim=2)
-        x += (A * shifts).sum(dim=2)
-
-        ctx.save_for_backward(A, shifts, y_padded)
-        return x
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        A, shifts, y_padded = ctx.saved_tensors
-        B, T, N = A.shape
-        grad_y = grad_A = grad_zi = None
-
-        # Gradient for y (input signal)
-        if ctx.needs_input_grad[0]:
-            grad_y = grad_output.clone()
-            for k in range(1, N + 1):
-                grad_shifted = F.pad(grad_output, (k, 0))[:, :-k] * A[:, :, k - 1]
-                grad_y += grad_shifted
-
-        # Gradient for A (coefficients)
-        if ctx.needs_input_grad[1]:
-            grad_A = grad_output.unsqueeze(2) * shifts
-
-        # Gradient for zi (initial conditions)
-        if ctx.needs_input_grad[2]:
-            grad_zi = torch.zeros_like(y_padded[:, :N])
-            for k in range(1, N + 1):
-                grad_zi[:, N - k] = (grad_output[:, :k] * A[:, :k, k - 1]).sum(dim=1)
-            grad_zi = grad_zi.flip(dims=[1])
-
-        return grad_y, grad_A, grad_zi
-
-
-def invert_lpc(y: torch.Tensor, # [B, N],
-               A: torch.Tensor, # [B, N, D], where D is order
-               zi: torch.Tensor = None) -> torch.Tensor:
-    return InvertLPC.apply(y, A, zi)
 
 class DiffKS(nn.Module):
     """
@@ -115,8 +26,6 @@ class DiffKS(nn.Module):
         exc_length_s : float = 0.025,
         interp_type: str = "linear",
         use_double_precision: bool = False,
-        upsample_mode: str = "zoh",
-        soft_zoh_tau: float = 5.0,
         device: torch.device = get_device(),
     ):
         super().__init__()
@@ -128,10 +37,6 @@ class DiffKS(nn.Module):
         self.device = device
         self._dtype = torch.float64 if use_double_precision else torch.float32
         self.min_f0_hz = min_f0_hz
-        # upsampling mode for parameter frames ('zoh', 'spline', or 'soft')
-        self.upsample_mode = upsample_mode
-        # softness (in *samples*) of the rising/falling sigmoid edges used in soft ZOH
-        self.soft_zoh_tau = float(soft_zoh_tau)
 
         # ====== Excitation Filter ======================
         self.exc_order = exc_order
@@ -161,6 +66,7 @@ class DiffKS(nn.Module):
         # ====== Analysis Buffers =======================
         self.register_buffer("excitation_filter_out", torch.empty(batch_size, self.exc_length_n), persistent=False)
         self.register_buffer("ks_inverse_signal", torch.zeros(batch_size, self.exc_length_n), persistent=False)
+        self.register_buffer("resonator_matrix", None, persistent=False)
 
         # ====== METADATA table for inner shapes (no batch)
         self._param_meta = {
@@ -257,22 +163,15 @@ class DiffKS(nn.Module):
                 loop_coefficients: Optional[torch.Tensor] = None,  # [batch_size, F, loop_n_coefficients]
                 loop_gain: Optional[torch.Tensor] = None,  # [batch_size, F, 1]
                 exc_coefficients: Optional[torch.Tensor] = None,  # [batch_size, F, exc_order]
-                constrain_coefficients: bool = True,
                 triggers: Optional[torch.Tensor] = None, # [batch_size, loop_n_frames]
                 ) -> torch.Tensor:  # [batch_size, n_samples]
 
         assert f0_frames.dim() == 2, f"f0_frames must have 2 dimensions, got shape {f0_frames.shape}"
         assert input.dim() == 2, f"target must have 2 dimensions (batch, samples), got shape {input.shape}"
 
-
-        if constrain_coefficients:
-            l_b = self._prepare("loop_coefficients", loop_coefficients)
-            l_g = self._prepare("loop_gain", loop_gain)
-            exc_b = self._prepare("exc_coefficients", exc_coefficients)
-        else:
-            l_b = loop_coefficients
-            l_g = loop_gain
-            exc_b = exc_coefficients
+        l_b = self._prepare("loop_coefficients", loop_coefficients)
+        l_g = self._prepare("loop_gain", loop_gain)
+        exc_b = self._prepare("exc_coefficients", exc_coefficients)
 
         f0_frames = self.internal_sr / f0_frames # Convert from Hz to samples
 
@@ -284,21 +183,10 @@ class DiffKS(nn.Module):
         f0, l_b, l_g, exc_b = self.get_upsampled_parameters(
             f0_frames, n_samples,
             l_b=l_b, l_g=l_g, exc_b=exc_b,
-            triggers=triggers,
         )
 
-        if constrain_coefficients:
-            l_b = self.get_constrained_l_coefficients(l_b=l_b, l_g=l_g)
-
-            exc_b = self.get_constrained_exc_coefficients(exc_b=exc_b)
-        else:
-            # make sure interpolation didn't produce out of range values
-            l_b = l_b.clamp(min=0.0, max=1.0)
-            l_g = l_g.clamp(min=0.0, max=1.0)
-            exc_b = exc_b.clamp(min=0.0, max=1.0)
-
-            # Apply gain to the loop coefficients
-            l_b = l_b * l_g
+        l_b = self.get_constrained_l_coefficients(l_b=l_b, l_g=l_g)
+        exc_b = self.get_constrained_exc_coefficients(exc_b=exc_b)
 
         A, x = self.compute_resonator_matrix(f0=f0,
                                              loop_coefficients=l_b,
@@ -389,29 +277,33 @@ class DiffKS(nn.Module):
         else:
             raise NotImplementedError(f"Interpolation type {self.interp_type} not implemented")
 
+        self.resonator_matrix = A
+
         return A, x
 
-    def _inversed_windowed_lpc(
-            self,
-            x: torch.Tensor,          # [B, N]
-            b: torch.Tensor,          # [B, N, O]
-            triggers: torch.Tensor,   # [B, F]
-    ):
-        n_samples = x.size(1)
+    def _inversed_windowed_lpc(self, x, b, triggers):
+        """
+        Windowed inverse LPC with a straight-through soft mask.
+        """
+        N = x.size(1)                       # sample‑rate length
+        L = self.exc_length_n               # window length (samples)
 
-        proc = invert_lpc(x, b)                               # ← [B, N]
+        # 1) Invert the LPC filter at sample rate
+        inv = invert_lpc(x, b)              # shape [B, N]
 
-        idx = torch.arange(n_samples, device=x.device)                # [N]
-        idx = idx.view(1, 1, -1)                                      # [1,1,N]
+        # 2) Upsample triggers to sample rate (straight‑through)
+        trig = STEUpsampleFirstPeak.apply(triggers, N)  # [B, N] float ∈{0,1}
 
-        win_start = triggers.to(torch.long).unsqueeze(-1)             # [B,F,1]
-        win_end   = win_start + self.exc_length_n                     # [B,F,1]
+        # 3) Build a *fading* window kernel (Hann)
+        hann = torch.hann_window(L, periodic=False, device=x.device, dtype=inv.dtype)
+        kernel = hann.view(1, 1, L)                     # [1,1,L]
 
-        mask = (idx >= win_start) & (idx < win_end)                   # [B,F,N]
-        mask = mask.any(dim=1)                                        # [B,N]
+        # 4) Convolve to paint a Hann window after each trigger
+        padded = F.pad(trig.unsqueeze(1), (L - 1, 0))   # pad left only
+        win = F.conv1d(padded, kernel).squeeze(1)       # [B, N], smooth 0‑1
 
-        out = torch.where(mask, proc, torch.zeros_like(proc))
-        return out
+        # 5) Apply the soft window (fully differentiable)
+        return inv * win
 
     def get_constrained_exc_coefficients(
             self,
@@ -448,117 +340,6 @@ class DiffKS(nn.Module):
         result = (sigmoid_b / sum_b) * (self.get_gain(l_g))
         return result.to(self.device)
 
-    def _upsample_by_triggers(
-            self,
-            frames: torch.Tensor,        # [B, F, D]
-            triggers: torch.Tensor,      # [B, F] (sample indices @ internal‑SR)
-            n_samples: int,              # total output length
-            mode: str = "soft",        # "spline" (default), "zoh", or "soft"
-    ) -> torch.Tensor:                  # [B, n_samples, D]
-        """
-        Interpolate the *frames* timeline according to *triggers*.
-
-        • **mode="spline"          – natural cubic spline between frames,
-          then zero‑order held after the last trigger.
-
-        • **mode="zoh"** – pure zero‑order hold; hard, non‑differentiable w.r.t. trigger times.
-
-        • **mode="soft"** – *differentiable* soft zero‑order hold: each frame owns a
-          soft rectangular window defined by adjacent trigger positions; edges are
-          smoothed by sigmoids of width `self.soft_zoh_tau` samples so gradients flow
-          back to the trigger times.
-
-        Frames and triggers may disagree on length; extra frames are truncated,
-        missing ones repeat the last frame.
-        """
-        if mode not in ("spline", "zoh", "soft"):
-            raise ValueError("mode must be 'spline' or 'zoh' or 'soft'")
-
-        B, F_coef, D = frames.shape
-        B_t, F_trig  = triggers.shape
-        if B != B_t:
-            raise ValueError("batch mismatch between frames and triggers")
-
-        # ----- 1. ensure |frames| == |triggers| ------------------------------
-        if F_coef > F_trig:                                # too many frames
-            frames = frames[:, :F_trig, :]
-        elif F_coef < F_trig:                              # too few  → pad
-            pad = frames[:, -1:, :].expand(-1, F_trig - F_coef, -1)
-            frames = torch.cat([frames, pad], dim=1)
-
-        if mode == "soft":
-            # ----- differentiable soft ZOH ------------------------------------
-            # We approximate a rectangular ownership window for each trigger with
-            # smooth sigmoid edges so gradients can flow to trigger locations.
-            # frames: [B,F,D]; triggers: [B,F] (floatable); returns [B,N,D]
-            trig_f = triggers.to(dtype=self._dtype)
-            device = frames.device
-            N = n_samples
-            # build "next trigger" tensor by concatenating last index = N-1
-            last = torch.full((B,1), float(N-1), device=device, dtype=self._dtype)
-            trig_next = torch.cat([trig_f[:,1:], last], dim=1)
-            # time axis
-            t = torch.arange(N, device=device, dtype=self._dtype).view(1,1,-1)  # [1,1,N]
-            # softness
-            tau = torch.tensor(self.soft_zoh_tau, device=device, dtype=self._dtype)
-            # rising edge at current trigger; falling edge at next trigger
-            start = torch.sigmoid((t - trig_f.unsqueeze(-1)) / tau)      # [B,F,N]
-            end   = torch.sigmoid((t - trig_next.unsqueeze(-1)) / tau)   # [B,F,N]
-            w = (start - end).clamp_min_(0.0)                            # [B,F,N]
-            # normalize across frames so weights sum to 1 at each sample
-            w_sum = w.sum(dim=1, keepdim=True).clamp_min_(1e-12)
-            w = w / w_sum
-            # weighted sum of frames
-            out = torch.einsum('bfn,bfd->bnd', w, frames.to(self._dtype))  # [B,N,D]
-            return out
-
-        if mode == "zoh":
-            trig_int = triggers.to(torch.long)
-            # --- safety: enforce non‑decreasing, in‑range trigger timeline ----
-            # triggers may contain padded or unsorted values (e.g., from batching)
-            trig_int = torch.clamp(trig_int, min=0, max=n_samples - 1)
-            # ensure monotonic non‑decreasing: cumulative maximum along time axis
-            trig_int = torch.cummax(trig_int, dim=1).values
-            segs     = []
-            for b in range(B):
-                tb = trig_int[b]  # [F_trig]
-                if F_trig == 1:
-                    seg_len = torch.tensor([n_samples], device=frames.device, dtype=torch.long)
-                else:
-                    first = tb[1]                                       # samples from 0→t1
-                    inner = tb[2:] - tb[1:-1]
-                    last  = n_samples - tb[-1]
-                    seg_len = torch.cat([first.unsqueeze(0), inner, last.unsqueeze(0)])
-                # guard against any residual negatives due to numerical drift
-                seg_len = torch.clamp(seg_len, min=0)
-                segs.append(seg_len)
-            out = []
-            for b in range(B):
-                out_b = torch.repeat_interleave(frames[b], segs[b], dim=0)
-                out.append(out_b)
-            return torch.stack(out, dim=0)                              # [B,N,D]
-
-        # ------------------- spline mode -------------------------------------
-        device   = frames.device
-        t_out    = torch.arange(n_samples, device=device,
-                                dtype=self._dtype)        # [N]
-        outs = []
-        for b in range(B):
-            t_in     = triggers[b].to(self._dtype)             # [F]
-            y_in     = frames[b]                               # [F, D]
-            # normalise to 0‑1 for torchcubicspline
-            t_norm   = t_in / (n_samples - 1)
-            t_out_n  = t_out / (n_samples - 1)
-
-            coeffs   = natural_cubic_spline_coeffs(t_norm, y_in)
-            y_interp = NaturalCubicSpline(coeffs).evaluate(t_out_n)  # [N, D]
-
-            # hold last value after final trigger
-            after_last = t_out > t_in[-1]
-            y_interp[after_last] = y_in[-1]
-            outs.append(y_interp)
-        return torch.stack(outs, dim=0)                         # [B, N, D]
-
     def get_upsampled_parameters(
             self,
             f0: torch.Tensor, # [batches, f_0_frames,]
@@ -566,35 +347,41 @@ class DiffKS(nn.Module):
             l_b: Optional[torch.Tensor] = None, # [batches, frames, loop_n_coefficients]
             l_g: Optional[torch.Tensor] = None, # [batches, frames, 1]
             exc_b: Optional[torch.Tensor] = None, # [batches, frames, exc_order]
-            triggers: Optional[torch.Tensor] = None, # [B, loop_frames]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
-        loop_b_frames_ = l_b if l_b is not None else self.loop_coefficients
-        loop_g_frames_ = l_g if l_g is not None else self.loop_gain
-        exc_b_frames_ = exc_b if exc_b is not None else self.exc_coefficients
+        # ---------- coefficients -------------------------------------------
+        l_b = l_b if l_b is not None else self.loop_coefficients
+        l_g = l_g if l_g is not None else self.loop_gain
+        exc_b = exc_b if exc_b is not None else self.exc_coefficients
 
-        batch_size = f0.size(0)
-        f0_n_frames = f0.size(1)
+        def upsample_coeff(frames: torch.Tensor) -> torch.Tensor:
+            # frames: [B, T, D] → permute → interp → permute back
+            return (
+                F.interpolate(
+                    frames.permute(0, 2, 1),
+                    size=num_samples,
+                    mode="linear",
+                    align_corners=False
+                )
+                .permute(0, 2, 1)
+            )
+
+        l_b = upsample_coeff(l_b)
+        l_g = upsample_coeff(l_g)
+        exc_b = upsample_coeff(exc_b)
 
         # ---------- F0  -----------------------------------------------------
-        if f0_n_frames == 1:
-            f0_i = f0.expand(batch_size, num_samples)
-        else:
-            f0_reshaped = f0.unsqueeze(-1).to(dtype=self._dtype)
-            f0_i = spline_upsample(f0_reshaped, num_samples).squeeze(-1)
+        B = f0.size(0)
 
-        # ---------- coefficients -------------------------------------------
-        if triggers is not None:
-            loop_b_i = self._upsample_by_triggers(loop_b_frames_.to(dtype=self._dtype),
-                                             triggers, num_samples, mode=self.upsample_mode)
-            loop_g_i = self._upsample_by_triggers(loop_g_frames_.to(dtype=self._dtype),
-                                             triggers, num_samples, mode=self.upsample_mode)
-            exc_b_i = self._upsample_by_triggers(exc_b_frames_.to(dtype=self._dtype),
-                                            triggers, num_samples, mode=self.upsample_mode)
+        if f0.size(1) == 1:
+            f0_i = f0.expand(B, num_samples)
         else:
-            raise NotImplementedError(f"support for no triggers not implemented")
+            f0_i = (
+                spline_upsample(f0.unsqueeze(-1).to(self._dtype), num_samples)
+                .squeeze(-1)
+            )
 
-        return f0_i.to(self.device), loop_b_i.to(self.device), loop_g_i.to(self.device), exc_b_i.to(self.device)
+        return f0_i.to(self.device), l_b.to(self.device), l_g.to(self.device), exc_b.to(self.device)
 
     def get_inverse_filtered_signal(self):
         return self.ks_inverse_signal
