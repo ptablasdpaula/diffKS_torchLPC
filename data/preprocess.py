@@ -10,7 +10,8 @@ import penn
 from paths import NSYNTH_DIR, NSYNTH_PREPROCESSED_DIR
 import argparse
 
-from utils import get_device, midi_to_hz
+from utils.misc import get_device
+from utils.dsp import midi_to_hz
 
 # --------------------------
 # Globals

@@ -29,7 +29,7 @@ numba==0.61.2
 numpy==2.2.5
 oauthlib==3.2.2
 packaging==25.0
-penn==1.0.0
+penn==0.0.14
 pillow==11.2.1
 platformdirs==4.3.7
 protobuf==6.30.2
@@ -52,7 +52,6 @@ soundfile==0.13.1
 sympy==1.14.0
 tensorboard==2.19.0
 tensorboard-data-server==0.7.2
-torbi==1.1.0
 torch==2.7.0
 torchaudio==2.7.0
 torchcubicspline @ git+https://github.com/patrick-kidger/torchcubicspline.git@d16c6bf5b63d03dbf2977c70e19a320653b5e4a8
