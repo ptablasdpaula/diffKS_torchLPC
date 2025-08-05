@@ -3,10 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchlpc import sample_wise_lpc
-from utils import get_device
-
-from dsp import kaiser_resample, invert_lpc, spline_upsample
-from ml import STEUpsampleFirstPeak
+from utils.misc import get_device
+from utils.dsp import kaiser_resample, invert_lpc, spline_upsample
 
 LAGRANGE_ORDER = 5
 
@@ -23,7 +21,6 @@ class DiffKS(nn.Module):
         min_f0_hz: float = 27.5,
         loop_order: int = 1,
         exc_order: int = 5,
-        exc_length_s : float = 0.025,
         interp_type: str = "linear",
         use_double_precision: bool = False,
         device: torch.device = get_device(),
@@ -41,14 +38,11 @@ class DiffKS(nn.Module):
         # ====== Excitation Filter ======================
         self.exc_order = exc_order
         self.exc_n_coefficients = exc_order + 1 # To account for exc_g
-        self.exc_length_n = int (exc_length_s * internal_sr)
-
         self.exc_coefficients = nn.Parameter(torch.rand(batch_size, 1, self.exc_n_coefficients, dtype=self._dtype))
 
         # ====== Loop Filter ============================
         self.loop_order = loop_order
         self.loop_n_coefficients = loop_order + 1  # To account for DC coefficient
-
         self.loop_coefficients = nn.Parameter(torch.rand(batch_size, 1, self.loop_n_coefficients,
                                                  dtype=self._dtype).uniform_(-2, 0))
         self.loop_gain = nn.Parameter(torch.rand(batch_size, 1, 1, dtype=self._dtype))
@@ -64,8 +58,7 @@ class DiffKS(nn.Module):
                              torch.where(self.lagrange_mask, self.lagrange_denom, 1))
 
         # ====== Analysis Buffers =======================
-        self.register_buffer("excitation_filter_out", torch.empty(batch_size, self.exc_length_n), persistent=False)
-        self.register_buffer("ks_inverse_signal", torch.zeros(batch_size, self.exc_length_n), persistent=False)
+        self.register_buffer("excitation", None, persistent=False)
         self.register_buffer("resonator_matrix", None, persistent=False)
 
         # ====== METADATA table for inner shapes (no batch)
@@ -163,7 +156,6 @@ class DiffKS(nn.Module):
                 loop_coefficients: Optional[torch.Tensor] = None,  # [batch_size, F, loop_n_coefficients]
                 loop_gain: Optional[torch.Tensor] = None,  # [batch_size, F, 1]
                 exc_coefficients: Optional[torch.Tensor] = None,  # [batch_size, F, exc_order]
-                triggers: Optional[torch.Tensor] = None, # [batch_size, loop_n_frames]
                 ) -> torch.Tensor:  # [batch_size, n_samples]
 
         assert f0_frames.dim() == 2, f"f0_frames must have 2 dimensions, got shape {f0_frames.shape}"
@@ -194,10 +186,10 @@ class DiffKS(nn.Module):
 
         if not direct:
             loop_inv = invert_lpc(x, A)
-            ks_inv_signal = self._inversed_windowed_lpc(loop_inv, exc_b, triggers=triggers)
-            self.ks_inverse_signal = ks_inv_signal.detach().clone()
+            excitation = invert_lpc(loop_inv, exc_b)
+            self.excitation = excitation
 
-        exc_filter_out = sample_wise_lpc(ks_inv_signal if not direct else x, exc_b)
+        exc_filter_out = sample_wise_lpc(excitation if not direct else x, exc_b)
 
         self.exc_filter_out = exc_filter_out
 
@@ -281,30 +273,6 @@ class DiffKS(nn.Module):
 
         return A, x
 
-    def _inversed_windowed_lpc(self, x, b, triggers):
-        """
-        Windowed inverse LPC with a straight-through soft mask.
-        """
-        N = x.size(1)                       # sample‑rate length
-        L = self.exc_length_n               # window length (samples)
-
-        # 1) Invert the LPC filter at sample rate
-        inv = invert_lpc(x, b)              # shape [B, N]
-
-        # 2) Upsample triggers to sample rate (straight‑through)
-        trig = STEUpsampleFirstPeak.apply(triggers, N)  # [B, N] float ∈{0,1}
-
-        # 3) Build a *fading* window kernel (Hann)
-        hann = torch.hann_window(L, periodic=False, device=x.device, dtype=inv.dtype)
-        kernel = hann.view(1, 1, L)                     # [1,1,L]
-
-        # 4) Convolve to paint a Hann window after each trigger
-        padded = F.pad(trig.unsqueeze(1), (L - 1, 0))   # pad left only
-        win = F.conv1d(padded, kernel).squeeze(1)       # [B, N], smooth 0‑1
-
-        # 5) Apply the soft window (fully differentiable)
-        return inv * win
-
     def get_constrained_exc_coefficients(
             self,
             exc_b: Optional[torch.Tensor] = None  # [B, samples, exc_order+1]
@@ -382,9 +350,3 @@ class DiffKS(nn.Module):
             )
 
         return f0_i.to(self.device), l_b.to(self.device), l_g.to(self.device), exc_b.to(self.device)
-
-    def get_inverse_filtered_signal(self):
-        return self.ks_inverse_signal
-
-    def get_excitation_filter_out(self):
-        return self.excitation_filter_out

@@ -2,16 +2,10 @@ import torch
 import torch.nn as nn
 import torchaudio.transforms as T
 
-from utils import get_device
-from ml import STEPeakPick, mlp, gru
-from diffKS import DiffKS, kaiser_resample
+from utils.misc import get_device
+from utils.ml import mlp, gru
+from diffKS import DiffKS
 from data.preprocess import E2_HZ
-
-from ddc_onset import SpectrogramExtractor, SpectrogramNormalizer, PlacementCNN
-from ddc_onset.constants import Difficulty
-
-DDC_FRAME_RATE = 100
-DDC_SAMPLE_RATE = 44100
 
 class ZEncoder(nn.Module):
     def __init__(self, input_keys=None):
@@ -157,14 +151,6 @@ class AE_KarplusModel(nn.Module):
         # Create a buffer for GRU state
         self.register_buffer("cache_gru", torch.zeros(1, 1, hidden_size))
 
-        # ---- Analysis buffers
-        self.trigger_temp = trigger_temp
-        self.register_buffer("last_trigger_times_s", torch.zeros(1, 1), persistent=False)
-        self.register_buffer("last_trigger_counts", torch.zeros(1, dtype=torch.long), persistent=False)
-        self.register_buffer("last_true_trigger_times_s", torch.zeros(1, 1), persistent=False)
-        self.register_buffer("last_salience", torch.zeros(1, 1), persistent=False)
-        self.register_buffer("step", torch.tensor(0, dtype=torch.long))
-
         # ----------  differentiable KS decoder  ----------
         self.decoder = DiffKS(
             batch_size = batch_size,
@@ -180,24 +166,6 @@ class AE_KarplusModel(nn.Module):
         for p in self.decoder.parameters():
             p.requires_grad = False
 
-        # instantiate DDC CNN components for salience
-        self.spec_extractor   = SpectrogramExtractor()
-        self.spec_normalizer  = SpectrogramNormalizer()
-        self.placement_cnn    = PlacementCNN()
-
-        # spec_extractor and spec_normalizer remain frozen
-        for p in self.spec_extractor.parameters():
-            p.requires_grad = False
-        for p in self.spec_normalizer.parameters():
-            p.requires_grad = False
-        for p in self.placement_cnn.parameters():
-            p.requires_grad = False if freeze_ddc else True
-
-        # Freeze or unfreeze unified coefficient MLP based on constructor flag
-        if freeze_coefficients:
-            for p in self.coefficients.parameters():
-                p.requires_grad = False
-
     def get_hidden(self, pitch, loudness, audio):
         z = self.z_encoder(audio, f0_scaled=pitch)
 
@@ -208,102 +176,6 @@ class AE_KarplusModel(nn.Module):
         hidden = torch.cat([self.gru(hidden)[0], pitch, loudness, z], -1)
         hidden = self.out_mlp(hidden)
         return hidden.mean(dim=1, keepdim=True)
-
-    def compute_triggers(
-            self,
-            audio,
-            audio_sr
-    ):
-        B = audio.shape[0]
-
-        # --- Compute CNN salience with STE (threshold 0.1) --------------
-        PAD_SEC = 0.25  # 250ms
-        PAD_FRAMES = int(PAD_SEC * DDC_FRAME_RATE)  # ≈25 frames at 100Hz
-        PAD_NOISE_STD = 1e-4  # very quiet
-        PAD_N_SAMPLES = int(PAD_SEC * DDC_SAMPLE_RATE)  # 11025 samples (0.25 * 44100)
-
-        pad_noise = torch.randn((B, PAD_N_SAMPLES), device=audio.device) * PAD_NOISE_STD
-
-        # --- DDC uses 44100 sampling rate so audio needs upsampling ---
-        ddc_up_audio = kaiser_resample(audio, audio_sr, DDC_SAMPLE_RATE)
-        wav_pad = torch.cat([pad_noise, ddc_up_audio], dim=1)  # [B, T_pad]
-
-        # --- compute salience via DDC CNN directly in torch ----
-        spec = self.spec_extractor(wav_pad)  # [B, frames, mel, fft_lengths]
-        normed = self.spec_normalizer(spec)  # [B, frames, mel, fft_lengths]
-
-        # PlacementCNN currently expects a single example (frames, mel, fft) tensor,
-        # so we run it per‑batch element and stack the results.
-        logits_list = []
-        for i in range(B):
-            diff_tensor = torch.tensor([Difficulty.CHALLENGE.value], device=normed.device, dtype=torch.long)
-            logits_i = self.placement_cnn(normed[i], diff_tensor)
-            logits_list.append(logits_i)
-
-        logits = torch.stack(logits_list, dim=0)  # [B, frames]
-
-        # BEFORE tanh
-        if not torch.isfinite(logits).all(): bad = logits[~torch.isfinite(logits)]; raise RuntimeError(f"logits became non-finite: min={bad.min().item()} max={bad.max().item()}")
-        # Register hook only if logits will receive gradients
-        if logits.requires_grad: logits.register_hook(lambda g: (_ for _ in ()).throw(RuntimeError("NaN grad into tanh")) if not torch.isfinite(g).all() else None)
-
-        salience = torch.tanh(logits).squeeze(dim=1)
-
-        # Immediately AFTER tanh
-        if not torch.isfinite(salience).all(): raise RuntimeError("salience (after tanh) is non-finite")
-
-        # Un-pad
-        salience = salience[:, PAD_FRAMES:]  # [B, F_trig]
-
-        # collect for plotting
-        salience_list = [s.detach().cpu() for s in salience]
-
-        # Straight-through peak picking
-        trigger_mask = STEPeakPick.apply(salience, self.trigger_temp)          # [B, F_trig]
-
-        scaled_peak_lists_plot = [m.detach().cpu() for m in trigger_mask]
-
-        # assemble salience list into tensor and store
-        self.last_salience = salience  # keep graph attached
-
-        # Stack frame‑rate trigger masks (no further up‑sampling)
-        triggers = trigger_mask  # keep gradient path
-        # cache the frame‑rate binary trigger mask for diagnostic plots
-        self.last_triggers = triggers.detach()
-
-        # --- Debug: tensor-level hooks for trigger activations ---
-        def _hook_grad(name):
-            def hook_fn(grad):
-                print(f"[HOOK GRAD] {name}: grad mean={grad.abs().mean().item():.6f}, std={grad.std().item():.6f}")
-                return grad
-            return hook_fn
-
-        # Hook on raw salience tensor gradients
-        if hasattr(self, "last_salience") and self.last_salience.requires_grad:
-            self.last_salience.register_hook(_hook_grad("last_salience"))
-
-        # Hook on the continuous triggers tensor before padding
-        for idx, cont in enumerate(scaled_peak_lists_plot):
-            if cont.requires_grad:
-                cont.register_hook(_hook_grad(f"cont_triggers_batch{idx}"))
-
-        # Hook on the final padded triggers tensor
-        if triggers.requires_grad:
-            triggers.register_hook(_hook_grad("padded_triggers"))
-
-        self.last_trigger_counts = torch.tensor([len(p) for p in scaled_peak_lists_plot],
-                                                device=audio.device)
-        # Convert trigger‑frame indices → seconds (use DDC_FRAME_RATE, not internal_sr)
-        frame_idx = torch.arange(triggers.size(1), device=triggers.device)        # [F_trig]
-        frame_idx = frame_idx.unsqueeze(0).expand_as(triggers)                    # [B,F_trig]
-        self.last_true_trigger_times_s = (frame_idx.float() / DDC_FRAME_RATE) * triggers
-        # --- safety check: ensure every example has at least one detected trigger ---
-        assert torch.all(self.last_trigger_counts > 0), (
-            "AE_KarplusModel: no triggers detected for at least one sample in the batch. "
-            "Verify salience threshold/padding or audio preprocessing."
-        )
-
-        return triggers
 
     def forward(
             self,
@@ -331,8 +203,6 @@ class AE_KarplusModel(nn.Module):
         hidden = torch.cat([self.gru(hidden)[0], pitch, loudness, z], -1)
         hidden = self.out_mlp(hidden)  # [B, T, H]
 
-        trigger_mask = self.compute_triggers(audio, audio_sr)
-
         # ─── 2.  predict a coefficient frame *per* encoder step ──────────────────
         # Unified coefficient MLP → split into loop, exc, and gain
         coeff_all = self.coefficients(hidden)  # [B, T, (L+1)+(E+1)+1]
@@ -346,6 +216,7 @@ class AE_KarplusModel(nn.Module):
         self.last_loop_coeff_frames = loop_coeff_all.detach()
         self.last_exc_coeff_frames  = exc_coeff_all.detach()
         self.last_loop_gain_frames  = loop_gain_all.detach()
+        self.last_coefficients_frames = coeff_all
 
         if return_parameters:
             return self.decoder.get_constrained_l_coefficients(loop_coeff_all, loop_gain_all), self.decoder.get_constrained_exc_coefficients(exc_coeff_all)
@@ -358,10 +229,6 @@ class AE_KarplusModel(nn.Module):
             loop_coefficients=loop_coeff_all,
             loop_gain=loop_gain_all,
             exc_coefficients=exc_coeff_all,
-            triggers=trigger_mask,
         )
-
-        with torch.no_grad():
-            self.step += 1
 
         return out

@@ -9,22 +9,18 @@ from .model import AE_KarplusModel, MfccTimeDistributedRnnEncoder
 import argparse, os
 import multiprocessing as mp
 import psutil
-from ddc_onset.constants import FRAME_RATE
 
 import matplotlib.pyplot as plt
 
 # ─── Training phase schedule ──────────────────────────────────────────────
-STAGE1_STEPS = 500    # freeze DDC
-STAGE2_STEPS = 2000   # unfreeze DDC, freeze coeffs
 LR_MAIN      = 1e-4   # base LR (overridden by CLI)
-LR_FINE      = 1e-5   # lower LR for fine‑tuning phases
 
 # Global variable for internal sample rate used by plotting helpers
 MODEL_INTERNAL_SR = None  # set in main() after model construction; used by plotting helpers
 
 from paths import NSYNTH_PREPROCESSED_DIR
 from data.preprocess import NsynthDataset
-from utils import get_device, str2bool
+from utils.misc import get_device, str2bool
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -39,6 +35,7 @@ def parse_args():
 
     # ─── Optimisation hyper-parameters ─────────────────────────────────────
     p.add_argument("--learning_rate", type=float, default=float(env("LEARNING_RATE", 1e-2)))
+    p.add_argument("--batches_per_epoch", type=int, default=int(env("BATCHES_PER_EPOCH", 10000)))
     p.add_argument("--max_epochs", type=int, default=int(env("MAX_EPOCHS", 330)))
     p.add_argument("--patience", type=int, default=int(env("PATIENCE", 20)))
     p.add_argument("--min_delta", type=float, default=float(env("MIN_DELTA", 0.001)),
@@ -63,95 +60,40 @@ def parse_args():
     p.add_argument("--interpolation_type", type=str, default=env("INTERPOLATION_TYPE", "linear"))
     p.add_argument("--pitch_mode", type=str, default=env("PITCH_MODE", "meta"))
 
-    # ─── Onset fine‑tune schedule ─────────────────────────────────────────
-    p.add_argument("--unfreeze_onset_after", type=int,
-                   default=int(env("UNFREEZE_ONSET_AFTER", 500)),
-                   help="Global training step after which the ddc_onset sub‑modules will be unfrozen (0 = train from start).")
+    # ─── Losses weights ────────────────────────────────────────────────────
+    p.add_argument("--stft_weight", type=float, default=float(env("STFT_WEIGHT", 1.0)))
+    p.add_argument("--resonance_weight", type=float, default=float(env("RESONANCE_WEIGHT", 1.0)))
 
-    p.add_argument("--batches_per_epoch", type=int, default=int(env("BATCHES_PER_EPOCH", 100)))
-
-    # Stage transition steps CLI arguments
-    p.add_argument("--stage1_steps", type=int, default=int(env("STAGE1_STEPS", 500)),
-                   help="Step to transition from stage 0 (DDC frozen) to stage 1 (DDC unfrozen)")
-    p.add_argument("--stage2_steps", type=int, default=int(env("STAGE2_STEPS", 2000)),
-                   help="Step to transition from stage 1 (coeff frozen) to stage 2 (all unfrozen, fine LR)")
-
+    # ─── Testing mode ────────────────────────────────────────────────────
+    p.add_argument("--test", action="store_true",
+                   default=str2bool(env("TEST", "false")),
+                   help="If set, load the NSynth 'test' split for both training and validation")
     return p.parse_args()
 
-
-
 # -----------------------------------------------------------------
-def build_optimizer(model, phase: int):
+def build_optimizer(model):
     """
-    phase 0 : train **coefficient‑prediction network** (everything except placement_cnn) at LR_MAIN
-    phase 1 : train **placement_cnn (DDC onset CNN)** only at LR_MAIN
-    phase 2 : train **all** (coeff predictor + placement_cnn) jointly at LR_FINE
+    Freeze decoder/spec front‑end parameters and train everything else
+    jointly at LR_MAIN.
+    """
 
-    Decoder parameters (`decoder.*`) and spectrogram front‑end parameters
-    (`spec_extractor.*`, `spec_normalizer.*`) always remain frozen.
-    """
-    decoder_params     = []
-    placement_params   = []
-    spec_params        = []   # spec_extractor + spec_normalizer
-    other_params       = []
-    coeff_params       = []
+    trainable_params = []
 
     for name, p in model.named_parameters():
         if name.startswith("decoder."):
-            decoder_params.append(p)
-        elif name.startswith("placement_cnn."):
-            placement_params.append(p)
-        elif name.startswith(("spec_extractor.", "spec_normalizer.")):
-            spec_params.append(p)
-        elif name.startswith("coefficients."):
-            coeff_params.append(p)
+            p.requires_grad = False
         else:
-            other_params.append(p)
-
-    # --- 1. Always freeze the decoder and spec_extractor/normalizer ------
-    for p in decoder_params + spec_params:
-        p.requires_grad = False
-
-    # --- 2. Phase‑specific rules -------------------------------------------
-    if phase == 0:
-        # Phase 0 – train the whole coefficient‑prediction network
-        # (z_encoder + in/out MLPs + GRU + coefficients head).
-        # Freeze placement_cnn.
-        for p in coeff_params + other_params:
             p.requires_grad = True
-        for p in placement_params:
-            p.requires_grad = False
-        param_groups = [
-            {"params": coeff_params + other_params, "lr": LR_MAIN},
-        ]
+            trainable_params.append(p)
 
-    elif phase == 1:
-        # Phase 1 – train the DDC onset CNN only; freeze coefficient network.
-        for p in placement_params:
-            p.requires_grad = True
-        for p in coeff_params + other_params:
-            p.requires_grad = False
-        param_groups = [
-            {"params": placement_params, "lr": LR_MAIN},
-        ]
-
-    else:
-        # Phase 2 – fine‑tune everything jointly (except decoder/spec) at LR_FINE
-        for p in coeff_params + placement_params + other_params:
-            p.requires_grad = True
-        param_groups = [
-            {"params": coeff_params + placement_params + other_params, "lr": LR_FINE},
-        ]
-
-    return optim.Adam(param_groups)
+    return optim.Adam([{"params": trainable_params, "lr": LR_MAIN}])
 # -----------------------------------------------------------------
 
 def main():
     args = parse_args()
-    # Override stage transition steps from CLI
-    global STAGE1_STEPS, STAGE2_STEPS
-    STAGE1_STEPS = args.stage1_steps
-    STAGE2_STEPS = args.stage2_steps
+    # If --test is enabled, override splits to use the NSynth 'test' subset
+    split_train = "test" if args.test else "train"
+    split_val   = "test" if args.test else "valid"
     config = {
         "hidden_size": args.hidden_size,
         "loop_order": args.l_order,
@@ -170,8 +112,9 @@ def main():
         "num_workers": args.num_workers,
         "interpolation_type": args.interpolation_type,
         "pitch_mode": args.pitch_mode,
-        "unfreeze_onset_after": args.unfreeze_onset_after,
         "batches_per_epoch": args.batches_per_epoch,
+        "stft_weight": args.stft_weight,
+        "resonance_weight": args.resonance_weight,
     }
 
 
@@ -220,7 +163,7 @@ def main():
 
     # ─── Data ─────────────────────────────────────────────────────────────
     dataset = NsynthDataset(root=NSYNTH_PREPROCESSED_DIR,
-                            split="test",
+                            split=split_train,
                             pitch_mode=config["pitch_mode"],
                             families=config["families"],
                             sources=config["sources"], )
@@ -230,7 +173,7 @@ def main():
                               num_workers=config["num_workers"])
 
     val_dataset = NsynthDataset(root=NSYNTH_PREPROCESSED_DIR,
-                                split="test",
+                                split=split_val,
                                 pitch_mode=config["pitch_mode"],
                                 families=config["families"],
                                 sources=config["sources"], )
@@ -256,11 +199,10 @@ def main():
     global MODEL_INTERNAL_SR
     MODEL_INTERNAL_SR = model.internal_sr
 
-    current_phase = 0  # start at phase 0 – coefficients only
-    optimizer = build_optimizer(model, current_phase)
+    optimizer = build_optimizer(model)
     global_step = 0
 
-    mr_stft = MultiResolutionSTFTLoss(scale_invariance=True, perceptual_weighting=True,
+    mr_stft = MultiResolutionSTFTLoss(scale_invariance=False, perceptual_weighting=True,
                                       sample_rate=config["sample_rate"], device=device, )
 
     # ─── Resume from checkpoint if requested ──────────────────────────────
@@ -288,7 +230,6 @@ def main():
     epochs_since_improve = 0
 
     # ───────────────────────── training epochs ───────────────────────────
-    print(f"[INFO] Training with variable‑length triggers; ddc_onset unfrozen after step {config['unfreeze_onset_after']}.")
     for epoch in range(start_epoch, config["max_epochs"]):
         model.train()
         t_loss = 0
@@ -298,8 +239,6 @@ def main():
 
         # ─── Training step ───────────────────────────────────────────────
         for batch_idx, (audio, pitch, loud) in enumerate(tqdm(train_loader, desc=f"[E{epoch:03d} train]")):
-            for name, param in model.named_parameters():
-                print(f"{name}: requires_grad={param.requires_grad}")
 
             if batch_idx >= config["batches_per_epoch"]:
                 break
@@ -316,27 +255,15 @@ def main():
                 f"but target has {audio.shape[1]}. "
                 "This usually means an incorrect `audio_sr` was passed to the model."
             )
-            stft_loss = mr_stft(recon.unsqueeze(1), audio.unsqueeze(1))
-            loss = stft_loss
+
+            stft_loss = mr_stft(recon.unsqueeze(1), audio.unsqueeze(1)) * args.stft_weight
+            resonance_loss = model.decoder.excitation.abs().mean() * args.resonance_weight
+            print(f"resonance_loss {resonance_loss} stft_loss {stft_loss}")
+            loss = stft_loss + resonance_loss
             optimizer.zero_grad()
             loss.backward()
-            # Debug: print gradient mean for all parameters after backward
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    print(f"[DEBUG TRAIN LOOP] {name}: grad mean {param.grad.abs().mean().item():.6f}")
-                else:
-                    print(f"[DEBUG TRAIN LOOP] {name}: NO GRAD")
             optimizer.step()
             global_step += 1
-            # ---- phase scheduler --------------------------------------------------
-            if current_phase == 0 and global_step >= STAGE1_STEPS:
-                current_phase = 1
-                optimizer = build_optimizer(model, current_phase)
-                print(f"[SCHED] Step {global_step}: phase 1 – now training DDC CNN only (coefficients frozen, LR={LR_MAIN})")
-            elif current_phase == 1 and global_step >= STAGE2_STEPS:
-                current_phase = 2
-                optimizer = build_optimizer(model, current_phase)
-                print(f"[SCHED] Step {global_step}: phase 2 – joint fine‑tuning (LR={LR_FINE})")
             log_train_batch(loss.item())
             t_loss += loss.item()
             batches_processed += 1
@@ -417,9 +344,6 @@ def main():
                     "This usually means an incorrect `audio_sr` was passed to the model."
                 )
 
-                # grab *active* trigger times (weights > 0.5)
-                trig_times_s = model.last_true_trigger_times_s.detach().cpu().numpy()  # [B,K_true]
-
                 # ---- Diagnostic: parameter-only forward to get constrained coeff frames and upsample to per-sample trajectories ----
                 with torch.no_grad():
                     # constrained, encoder‑frame‑rate coefficients
@@ -472,62 +396,14 @@ def main():
                     sf.write(wav_path, sample, config["sample_rate"])
                     print(f"[AUDIO] wrote: {os.path.abspath(wav_path)}")
 
-                    # overlay triggers on both segments
-                    if trig_times_s.ndim == 2 and idx < trig_times_s.shape[0]:
-                        trig_s = trig_times_s[idx]
-                        seg_dur_s = wave_orig.shape[0] / float(config["sample_rate"])
-                        # only triggers inside the original segment
-                        trig_concat_s = trig_s
-                    else:
-                        trig_concat_s = None
-
                     # ---- Composite figure with waveform, reconstruction, inverse signal, and coefficients ----
                     fig, axes = plt.subplots(7, 1, figsize=(10, 16))
 
-                    # 1) Target waveform with salience & triggers
+                    # 1) Target waveform
                     t_wave = np.arange(wave_orig.shape[0]) / float(config["sample_rate"])
                     axes[0].plot(t_wave, wave_orig, linewidth=1.0, label="target waveform")
                     axes[0].set_ylim(-1, 1)
-
-                    # twin y‑axis reserved for salience only
-                    ax_twin = axes[0].twinx()
-                    ax_twin.set_ylim(-1, 1)
-
-                    # === overlay raw post‑tanh salience (upsampled to 16 kHz) ===
-                    if hasattr(model, "last_salience"):
-                        sal_100 = model.last_salience[idx].cpu().numpy()           # (T_sal,)
-                        t_sal   = np.arange(sal_100.shape[0]) / FRAME_RATE         # seconds
-                        # use raw tanh output (already in −1..1): no normalization
-                        sal_up = np.interp(t_wave, t_sal, sal_100)                 # to 16 kHz grid
-                        ax_twin.plot(t_wave, sal_up, color="magenta", lw=1.5,
-                                     label="DDC salience")
-                        # draw the STEPeakPick threshold
-                        thr = model.trigger_temp
-                        ax_twin.axhline(thr, color="orange", ls="--", lw=1, alpha=0.8)
-                        ax_twin.set_ylim(-1, 1)
-
-                        # plot trigger dots only on FIRST half (original clip)
-                        if trig_s is not None:
-                            trig_mask = (trig_s >= 0.0) & (trig_s <= t_wave[-1])
-                            if trig_mask.any():
-                                sal_vals = np.interp(trig_s[trig_mask], t_wave, sal_up)
-                                ax_twin.scatter(trig_s[trig_mask], sal_vals,
-                                                color="red", marker="o", s=50,
-                                                label="triggers", zorder=6)
-
-                    # collect legend entries from both y‑axes
-                    h0, l0 = axes[0].get_legend_handles_labels()
-                    h1, l1 = ax_twin.get_legend_handles_labels()
-                    handles_all = h0 + h1
-                    labels_all  = l0 + l1
-
-                    keep_labels = ["DDC salience", "triggers"]   # desired entries
-                    filtered = [(h, l) for h, l in zip(handles_all, labels_all)
-                                if l in keep_labels]
-                    if filtered:
-                        h_keep, l_keep = zip(*filtered)
-                        axes[0].legend(h_keep, l_keep, loc="upper right",
-                                       fontsize="x-small")
+                    axes[0].legend(fontsize="x-small", loc="upper right")
 
                     # 2) Reconstruction
                     axes[1].plot(t_wave, wave_rec, label="recon")
@@ -537,7 +413,7 @@ def main():
 
                     # 3) Inverse-filtered signal
                     # resample from internal_sr back to 16 kHz for alignment
-                    inv_sig_internal = model.decoder.get_inverse_filtered_signal()[idx].cpu()
+                    inv_sig_internal = model.decoder.excitation[idx].detach().cpu()
                     inv_sig_16k = TAF.resample(
                         inv_sig_internal.unsqueeze(0),
                         orig_freq=model.internal_sr,
@@ -637,19 +513,9 @@ def main():
                         media_log[f"resonator_matrix_{idx}"] = wandb.Image(fig_res)
                     plt.close(fig_res)
 
-                # --- log mean trigger count (deduplicated) -----------------------
-                if wandb.run is not None and trig_times_s.ndim == 2:
-                    # Only count triggers within the original clip duration
-                    dur = fixed_audio.shape[1] / float(config["sample_rate"])
-                    counts_unique = [
-                        len(np.unique(row[(row >= 0.0) & (row <= dur)]))
-                        for row in trig_times_s
-                    ]
-                    media_log["trigger_count_mean"] = float(np.mean(counts_unique))
-
-                    # log all items together
-                    if wandb.run is not None and len(media_log) > 0:
-                        wandb.log(media_log, commit=True)
+                # log all items together
+                if wandb.run is not None and len(media_log) > 0:
+                    wandb.log(media_log, commit=True)
 
         print(f"[E{epoch}] train={t_loss:.4f} val={v_loss:.4f} best={best_val_loss:.4f} (no-improve {epochs_since_improve}/{config['patience']})")
 

@@ -13,9 +13,6 @@ def get_device():
 def str2bool(x: str) -> bool:
     return str(x).lower() in {"1", "true", "t", "yes", "y"}
 
-def midi_to_hz(midi : torch.Tensor) -> torch.Tensor:
-    return 440 * 2 ** ((midi - 69) / 12)
-
 def load_config():
     project_root = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(project_root, "config.json")
@@ -56,31 +53,3 @@ def resize_tensor_dim(tensor, size, dim=0, pad_value=0):
         result[tuple(idx_dst)] = tensor
 
     return result
-
-
-def noise_burst(
-        sample_rate: int,
-        length_s: float,
-        burst_width_s: float,
-        normalize: bool = False,
-        batch_size: int = 1,
-        generator: torch.Generator = None
-) -> torch.Tensor: # [batch_size, samples]
-    """
-    Generate a single-channel noise burst and zero-pad it.
-    """
-    burst_width_n = int(sample_rate * burst_width_s)
-    total_length_n = int(sample_rate * length_s)
-
-    if total_length_n < burst_width_n:
-        raise ValueError(
-            f"Requested total length {length_s:.3f}s < noise burst width {burst_width_s:.3f}s."
-        )
-
-    burst = torch.rand((batch_size, burst_width_n), generator=generator, device=get_device()) - 0.5
-
-    if normalize:
-        burst = burst - burst.mean()
-        burst = burst / burst.abs().max()
-
-    return resize_tensor_dim(burst, total_length_n, 1)
