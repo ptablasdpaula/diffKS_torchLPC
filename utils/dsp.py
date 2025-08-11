@@ -2,37 +2,9 @@ import torch
 import torch.nn.functional as F
 import torchaudio.functional as TAF
 from torchcubicspline import natural_cubic_spline_coeffs, NaturalCubicSpline
-from .misc import get_device, resize_tensor_dim
 
 def midi_to_hz(midi : torch.Tensor) -> torch.Tensor:
     return 440 * 2 ** ((midi - 69) / 12)
-
-def noise_burst(
-        sample_rate: int,
-        length_s: float,
-        burst_width_s: float,
-        normalize: bool = False,
-        batch_size: int = 1,
-        generator: torch.Generator = None
-) -> torch.Tensor: # [batch_size, samples]
-    """
-    Generate a single-channel noise burst and zero-pad it.
-    """
-    burst_width_n = int(sample_rate * burst_width_s)
-    total_length_n = int(sample_rate * length_s)
-
-    if total_length_n < burst_width_n:
-        raise ValueError(
-            f"Requested total length {length_s:.3f}s < noise burst width {burst_width_s:.3f}s."
-        )
-
-    burst = torch.rand((batch_size, burst_width_n), generator=generator, device=get_device()) - 0.5
-
-    if normalize:
-        burst = burst - burst.mean()
-        burst = burst / burst.abs().max()
-
-    return resize_tensor_dim(burst, total_length_n, 1)
 
 def kaiser_resample(x, sr_in: int, sr_out: int,
                     width: int = 32, beta: float = 14.0,
