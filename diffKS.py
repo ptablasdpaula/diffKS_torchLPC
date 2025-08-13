@@ -24,7 +24,7 @@ class DiffKS(nn.Module):
         loop_order: int = 2,
         loop_n_frames: int = 250,
         interp_type: str = "linear",
-        use_double_precision: bool = False,
+        use_double_precision: bool = True,
         device: torch.device = get_device(),
     ):
         super().__init__()
@@ -41,6 +41,10 @@ class DiffKS(nn.Module):
         self.loop_n_frames = loop_n_frames
         self.loop_order = loop_order
         self.loop_n_coefficients = loop_order + 1  # To account for DC coefficient
+
+        # Modal-aware normalization hyper-parameters (weight long-lag taps more)
+        self.modal_beta = 2.0   # strength of weighting
+        self.modal_power = 2.0  # exponent on (k / L)
 
         self.loop_coefficients = nn.Parameter(
             torch.rand(
@@ -171,6 +175,9 @@ class DiffKS(nn.Module):
         input: torch.Tensor,  # [batch_size, n_samples]
         input_sr: int,
         loop_coefficients: Optional[torch.Tensor] = None,  # [batch_size, F, loop_n_coefficients]
+        fc: Optional[torch.Tensor] = None,
+        rt60: Optional[torch.Tensor] = None,
+        invert = False,
     ) -> torch.Tensor:  # [batch_size, n_samples]
 
         assert f0_frames.dim() == 2, f"f0_frames must have 2 dimensions, got shape {f0_frames.shape}"
@@ -188,10 +195,21 @@ class DiffKS(nn.Module):
             l_b=l_b,
         )
 
-        l_b = self.get_constrained_l_coefficients(l_b=l_b)
+        if fc is not None and rt60 is not None:
+            l_b = self.design_loop(
+                f0=f0,
+                fc=fc,
+                rt60=rt60,
+            )
+        else:
+            l_b = self.get_constrained_l_coefficients(
+                l_b=l_b,
+                f0=f0
+            )
+
         A, x = self.compute_resonator_matrix(f0=f0, loop_coefficients=l_b, input=input)
 
-        y_out = sample_wise_lpc(x, A)
+        y_out = sample_wise_lpc(x, A) if invert is False else invert_lpc(x, A)
         return kaiser_resample(y_out, sr_in=self.internal_sr, sr_out=input_sr).to(torch.float32)
 
     def compute_resonator_matrix(
@@ -272,18 +290,61 @@ class DiffKS(nn.Module):
 
     def get_constrained_l_coefficients(
             self,
-            l_b : torch.Tensor,  # [batches, samples, loop_n_coefficients]
-    ) -> torch.Tensor : # [batches, samples, loop_n_coefficients]
-
+            l_b: torch.Tensor,  # [B, N, 1+loop_order]  (b0 followed by taps)
+            f0: torch.Tensor | None = None  # [B, N] delay length L in *samples* (internal SR)
+    ) -> torch.Tensor:
+        """
+        Constrain loop coefficients so the feedback magnitude stays < 1.
+        - b0 (=gain) is in (0.9, 1.0) via sigmoid mapping.
+        - taps are tanh-mapped then *scaled* so that the worst-case modal peak
+          (DC, Nyquist, fundamental ω0 = 2π/L) fits under the remaining budget (1 - b0).
+        Falls back to an L1-based bound if f0_samples is None.
+        """
+        # Split logits
         gain_logits = l_b[..., :1]  # [B, N, 1]
-        taps_logits = l_b[..., 1:]  # [B, N, loop_order]
+        taps_logits = l_b[..., 1:]  # [B, N, K], K=loop_order
 
-        taps = torch.tanh(taps_logits).clone()                      # ∈ (-1, 1)
-        gain_target = torch.sigmoid(gain_logits) * 0.1 + 0.9        # [B, N, 1] # ∈ (0.9, 1)
-        tap_sum_total = 1.0 + taps.abs().sum(dim=-1, keepdim=True)  # 1 (DC) + sum |b_i|
-        gain = gain_target / tap_sum_total                          # 0 < tap_sum_total * gain < 1)
+        # Map to valid ranges
+        gain = torch.sigmoid(gain_logits) * 0.1 + 0.9  # b0 ∈ (0.9, 1.0)
+        taps = torch.tanh(taps_logits)  # each tap ∈ (-1, 1)
 
-        return torch.cat([torch.ones_like(gain), taps], dim=-1) * gain
+        # --- Modal-aware bound: evaluate |H(ω)| at DC, Nyquist, and ω0 = 2π/L
+        # H(ω) = Σ_k b_k e^{-j ω k} for FIR taps {b_k}; here "taps" excludes b0.
+        B, N, K = taps.shape
+        dtype = taps.dtype
+        device = taps.device
+
+        # DC peak (ω = 0): sum of taps
+        H_dc = torch.abs(taps.sum(dim=-1, keepdim=True))  # [B, N, 1]
+
+        # Nyquist peak (ω = π): alternating sum
+        n_idx = torch.arange(K, device=device)  # [K]
+        alt = ((n_idx % 2) * -2 + 1).to(dtype).view(1, 1, -1)  # [1,1,K] = [+1,-1,+1,...]
+        H_nyq = torch.abs((taps * alt).sum(dim=-1, keepdim=True))  # [B, N, 1]
+
+        # Fundamental peak (ω0 = 2π/L)
+        # L = f0_samples (already in samples/period); guard small values
+        L = torch.clamp(f0, min=1.0)  # [B, N]
+        omega0 = (2.0 * torch.pi) / L  # [B, N]
+        n = n_idx.to(dtype).view(1, 1, -1)  # [1,1,K]
+        cos_term = torch.cos(omega0.unsqueeze(-1) * n)  # [B, N, K]
+        sin_term = torch.sin(omega0.unsqueeze(-1) * n)  # [B, N, K]
+        H_re = (taps * cos_term).sum(dim=-1, keepdim=True)  # [B, N, 1]
+        H_im = -(taps * sin_term).sum(dim=-1, keepdim=True)  # [B, N, 1]
+        H_f = torch.sqrt(H_re * H_re + H_im * H_im + 1e-20)  # [B, N, 1]
+
+        # Worst of the three modal checks
+        H_max = torch.maximum(H_dc, torch.maximum(H_nyq, H_f))  # [B, N, 1]
+
+        # Budget for taps is (1 - gain); scale taps to satisfy gain + |H| <= 1
+        # (Use a conservative min with 1.0 to avoid up-scaling.)
+        scale = torch.minimum(
+            torch.ones_like(H_max),
+            (1.0 - gain) / (H_max + 1e-12)
+        )  # [B, N, 1]
+        taps_scaled = taps * scale
+
+        return torch.cat([gain, taps_scaled], dim=-1)
 
     def get_upsampled_parameters(
             self,

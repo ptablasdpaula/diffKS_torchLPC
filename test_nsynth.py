@@ -22,8 +22,8 @@ from utils.misc import get_device
 
 hp = {
     "use_A_weighing": True,
-    "epochs": 1,
-    "lr": 5e-2,
+    "epochs": 150,
+    "lr": 0.1,
 }
 
 mp = {
@@ -374,7 +374,7 @@ def main() -> None:
 
         print (f"this is the size of l_b: {model_opt.loop_coefficients.shape}")
 
-        l_b_c_t = model_opt.get_constrained_l_coefficients(l_b=l_b_u)       # [1, T_int, loop_n]
+        l_b_c_t = model_opt.get_constrained_l_coefficients(f0=_f0_i, l_b=l_b_u)       # [1, T_int, loop_n]
 
         # For plotting as before
         l_b_c = l_b_c_t[0].detach().cpu().numpy()

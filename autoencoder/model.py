@@ -1,11 +1,12 @@
 import torch
 import torch.nn as nn
 import torchaudio.transforms as T
+import numpy as np
 
-from utils.misc import get_device
 from utils.ml import mlp, gru
 from diffKS import DiffKS
 from data.preprocess import E2_HZ
+from core import make_onset_noise, detect_onsets_librosa, StaticShelf, DualShelfController
 
 class ZEncoder(nn.Module):
     def __init__(self, input_keys=None):
@@ -126,27 +127,67 @@ class AE_KarplusModel(nn.Module):
                  hidden_size,
                  batch_size,
                  loop_order,
-                 exc_order,
                  internal_sr,
                  interpolation_type,
                  z_encoder,
-                 trigger_temp: float = 0.25,
-                 freeze_coefficients: bool = True,
-                 freeze_ddc: bool = True):
+                 loudness_mu=None, loudness_std=None
+                 ):
         super().__init__()
         self.internal_sr = internal_sr
         self.loop_order = loop_order
-        self.exc_order = exc_order
-
         self.z_encoder = z_encoder
 
-        # Neural network components
-        self.in_mlps = nn.ModuleList([mlp(1, hidden_size, 3)] * 2)
-        self.gru = gru(2, hidden_size)
-        self.out_mlp = mlp(hidden_size + 2 + z_encoder.z_dims, hidden_size, 3)
+        # Three separate 3‑layer MLPs as in the original DDSP decoder
+        self.mlp_f = mlp(1, hidden_size, 3)          # f(t)
+        self.mlp_l = mlp(1, hidden_size, 3)          # l(t)
+        self.mlp_z = mlp(z_encoder.z_dims, hidden_size, 3)  # z(t)
+        self.gru = gru(3, hidden_size)
 
-        # Output projections
-        self.coefficients = nn.Linear(hidden_size, loop_order + exc_order + 3)  # B, T, *
+        # Concatenate GRU output with f‑ and l‑MLP outputs (z is **not** appended, per paper)
+        self.out_mlp = mlp(hidden_size * 3, hidden_size, 3)
+
+        # Heads
+        self.shelf_head = nn.Linear(hidden_size, 6) # shelves: [low_fc, low_Q, low_g, high_fc, high_Q, high_g]
+        self.coefficients_head = nn.Linear(hidden_size, loop_order + 1)  # loop filter taps + 1 (gain)
+        # Initialize coefficients_head bias and weight so that gain=1, others=0
+        #with torch.no_grad():
+        #    self.coefficients_head.weight.zero_()
+        #    self.coefficients_head.bias.zero_()
+        #    self.coefficients_head.bias[0] = 2.197
+
+        # Store loudness z-score stats
+        mu = 0.0 if loudness_mu is None else float(loudness_mu)
+        sd = 1.0 if loudness_std is None else float(loudness_std)
+        self.register_buffer("loudness_mu", torch.tensor(mu))
+        self.register_buffer("loudness_std", torch.tensor(sd))
+
+        # Excitation shaping: learnable shelves
+        self.sample_rate = 16000  # set to your dataset SR
+        self.low_shelf = StaticShelf(
+            which="low",
+            sample_rate=self.sample_rate,
+            init_fc_hz=120.0,
+            fmin_hz=20.0,
+            fmax_hz=self.sample_rate / 2 - 200.0,
+            init_Q=0.707,
+            init_gain_db=-3.0,
+        )
+        self.high_shelf = StaticShelf(
+            which="high",
+            sample_rate=self.sample_rate,
+            init_fc_hz=3000.0,
+            fmin_hz=30.0,
+            fmax_hz=self.sample_rate / 2 - 200.0,
+            init_Q=0.707,
+            init_gain_db=-1.5,
+        )
+        # Controller that maps AE shelf logits → physically valid shelf params
+        self.shelf_ctrl = DualShelfController(
+            fs=self.sample_rate,
+            fmin=20.0,
+            fmax=self.sample_rate / 2 - 200.0,
+            max_gain_db=12.0,
+        )
 
         # Create a buffer for GRU state
         self.register_buffer("cache_gru", torch.zeros(1, 1, hidden_size))
@@ -156,26 +197,15 @@ class AE_KarplusModel(nn.Module):
             batch_size = batch_size,
             internal_sr = internal_sr,
             loop_order = loop_order,
-            exc_order = exc_order,
+            loop_n_frames = z_encoder.z_time_steps if hasattr(z_encoder, 'z_time_steps') else 250,
             interp_type = interpolation_type,
-            use_double_precision = True if get_device() != torch.device('mps') else False,
+            use_double_precision = True,
             min_f0_hz = E2_HZ - 10,
         )
 
         # Decoder parameters are frozen, since it obtains its values from the autoencoder
         for p in self.decoder.parameters():
             p.requires_grad = False
-
-    def get_hidden(self, pitch, loudness, audio):
-        z = self.z_encoder(audio, f0_scaled=pitch)
-
-        hidden = torch.cat([
-            self.in_mlps[0](pitch),
-            self.in_mlps[1](loudness),
-        ], -1)
-        hidden = torch.cat([self.gru(hidden)[0], pitch, loudness, z], -1)
-        hidden = self.out_mlp(hidden)
-        return hidden.mean(dim=1, keepdim=True)
 
     def forward(
             self,
@@ -194,41 +224,121 @@ class AE_KarplusModel(nn.Module):
         Returns:
             Tensor of shape [batch_size, n_samples] - Synthesized audio
         """
-        # Vectorized salience & trigger extraction for full batch
-
         # ─── build the full‑resolution hidden sequence ───────────────────────
         z = self.z_encoder(audio, f0_scaled=pitch)  # [B, T, z_dim]
-        hidden = torch.cat([self.in_mlps[0](pitch),
-                            self.in_mlps[1](loudness)], -1)  # [B, T, 2×H]
-        hidden = torch.cat([self.gru(hidden)[0], pitch, loudness, z], -1)
-        hidden = self.out_mlp(hidden)  # [B, T, H]
+        x_f = self.mlp_f(pitch)                      # [B, T, H]
+        x_l = self.mlp_l(loudness)                   # [B, T, H]
+        x_z = self.mlp_z(z)                          # [B, T, H]
+
+        gru_in  = torch.cat([x_f, x_l, x_z], -1)     # [B, T, 3H]
+        gru_out = self.gru(gru_in)[0]               # [B, T, H]
+
+        hidden  = torch.cat([gru_out, x_f, x_l], -1) # [B, T, 3H]
+        hidden  = self.out_mlp(hidden)               # [B, T, H]
+
+        # --- Predict shelf parameters from hidden; pool across time to make them static per example
+        h_pool = hidden.mean(dim=1)               # [B, H]
+        shelf_raw = self.shelf_head(h_pool)       # [B, 6] = [l_fc_r, l_Q_r, l_g_r, h_fc_r, h_Q_r, h_g_r]
+        # Map to ordered & constrained params (f_high > f_low, Q>0, gains bounded)
+        (l_fc, l_Q, l_gdb), (h_fc, h_Q, h_gdb) = self.shelf_ctrl(shelf_raw)
 
         # ─── 2.  predict a coefficient frame *per* encoder step ──────────────────
-        # Unified coefficient MLP → split into loop, exc, and gain
-        coeff_all = self.coefficients(hidden)  # [B, T, (L+1)+(E+1)+1]
-        L1 = self.loop_order + 1
-        L2 = self.exc_order + 1
-        loop_coeff_all = coeff_all[:, :, :L1]              # [B, T, L+1]
-        exc_coeff_all  = coeff_all[:, :, L1:L1+L2]         # [B, T, E+1]
-        loop_gain_all  = coeff_all[:, :, L1+L2:]           # [B, T, 1]
+        coefficients_raw = self.coefficients_head(hidden)              # [B, T, L+1]
 
-        # Cache raw (per‑encoder‑frame) coefficient predictions for plotting
-        self.last_loop_coeff_frames = loop_coeff_all.detach()
-        self.last_exc_coeff_frames  = exc_coeff_all.detach()
-        self.last_loop_gain_frames  = loop_gain_all.detach()
-        self.last_coefficients_frames = coeff_all
+        # ─── 3. Onset-based excitation (DiffKS) ────────────────────────────────
+        B, N = audio.shape
+        T = pitch.size(1)  # number of pitch frames
+
+        # De-normalize incoming A-weighted log-power loudness (z-scored) back to log-power
+        logpow_all = loudness.squeeze(-1) * self.loudness_std + self.loudness_mu  # [B, T]
+
+        # (No inversion) — detect onsets directly on the target audio
+        # We intentionally skip any inverse-filtering path and let KS handle amplitude
+        # shaping. Shelves are applied later to the excitation only.
+        onset_list = []
+        for b in range(B):
+            on_b = detect_onsets_librosa(
+                audio[b], sr=audio_sr, pad_ms=50.0, hop_length=512, backtrack=True
+            )
+            if on_b.size == 0:
+                on_b = np.array([0], dtype=int)
+            onset_list.append(on_b)
+
+        # Helper: map sample index → pitch frame index
+        def sample_to_frame_idx(s: int) -> int:
+            # linear mapping with clamp
+            idx = int(round(s * T / max(1, N)))
+            return max(0, min(T - 1, idx))
+
+        # Build bursts per item with per-onset length derived from local pitch,
+        # apply per-onset RMS scaling to match the target audio for each burst
+        raw_noise_rows = []
+        exc_rows = []
+        for b in range(B):
+            raw_b = torch.zeros(1, N, device=audio.device, dtype=audio.dtype)
+            exc_b = torch.zeros(1, N, device=audio.device, dtype=audio.dtype)
+            for s in onset_list[b]:
+                s = int(s)
+                f_idx = sample_to_frame_idx(s)
+                f0_loc = float(torch.clamp(pitch[b, f_idx, 0], min=E2_HZ).item())
+                L_loc = int(round(float(audio_sr) / max(f0_loc, 1e-6)))
+
+                # Generate a single-burst noise at this onset (unscaled reference)
+                nb = make_onset_noise(
+                    onset_samples=np.array([s], dtype=int),
+                    num_samples=N,
+                    sample_rate=audio_sr,
+                    batch_size=1,
+                    device=audio.device,
+                    dtype=audio.dtype,
+                    burst_len_samples=L_loc,
+                )  # [1, N]
+                raw_b = raw_b + nb
+
+                # Use de-normalized A-weighted log-power loudness at this pitch frame
+                logpow = logpow_all[b, f_idx]
+                A_rms = torch.exp(logpow * 0.5).view(1, 1) * 10 # [1,1]
+
+                burst_start = s
+                burst_end   = min(burst_start + L_loc, N)
+                seg_noi     = nb[:, burst_start:burst_end]  # [1, L]
+
+                # Current burst RMS (avoid divide-by-zero)
+                seg_rms = torch.sqrt(torch.clamp((seg_noi ** 2).mean(dim=-1, keepdim=True), min=1e-12))  # [1,1]
+                gain = A_rms / (seg_rms + 1e-12)
+
+                nb_scaled = nb.clone()
+                nb_scaled[:, burst_start:burst_end] = seg_noi * gain
+                exc_b = exc_b + nb_scaled
+            raw_noise_rows.append(raw_b)
+            exc_rows.append(exc_b)
+
+        raw_noise = torch.cat(raw_noise_rows, dim=0)  # [B, N]
+        excitation = torch.cat(exc_rows, dim=0)       # [B, N]
+
+        # Shelf shaping (learnable); AE can override via raw heads elsewhere
+        excitation = self.low_shelf(
+            excitation,
+            fc_hz=l_fc, Q=l_Q, gain_db=l_gdb,
+            from_raw=False,
+        )
+        excitation = self.high_shelf(
+            excitation,
+            fc_hz=h_fc, Q=h_Q, gain_db=h_gdb,
+            from_raw=False,
+        )
 
         if return_parameters:
-            return self.decoder.get_constrained_l_coefficients(loop_coeff_all, loop_gain_all), self.decoder.get_constrained_exc_coefficients(exc_coeff_all)
+            loop_coeffs_c = self.decoder.get_constrained_l_coefficients(f0=pitch.squeeze(-1), l_b=coefficients_raw)
+            low_params  = {"fc_hz": l_fc,  "Q": l_Q,  "gain_db": l_gdb}
+            high_params = {"fc_hz": h_fc, "Q": h_Q, "gain_db": h_gdb}
+            return loop_coeffs_c, low_params, high_params
 
-        # ─── 5.  call DiffKS with the *selected* frames + triggers ───────────────
         out = self.decoder(
             f0_frames=pitch.squeeze(2),
-            input=audio,
+            input=excitation,
             input_sr=audio_sr,
-            loop_coefficients=loop_coeff_all,
-            loop_gain=loop_gain_all,
-            exc_coefficients=exc_coeff_all,
+            loop_coefficients=coefficients_raw,
         )
 
         return out
