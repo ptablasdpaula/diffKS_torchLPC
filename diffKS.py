@@ -175,8 +175,6 @@ class DiffKS(nn.Module):
         input: torch.Tensor,  # [batch_size, n_samples]
         input_sr: int,
         loop_coefficients: Optional[torch.Tensor] = None,  # [batch_size, F, loop_n_coefficients]
-        fc: Optional[torch.Tensor] = None,
-        rt60: Optional[torch.Tensor] = None,
         invert = False,
     ) -> torch.Tensor:  # [batch_size, n_samples]
 
@@ -184,7 +182,7 @@ class DiffKS(nn.Module):
         assert input.dim() == 2, f"target must have 2 dimensions (batch, samples), got shape {input.shape}"
 
         l_b = loop_coefficients if loop_coefficients is not None else self.loop_coefficients
-        assert l_b.shape == (self.batch_size, self.loop_n_frames, self.loop_n_coefficients)
+        assert l_b.shape == (self.batch_size, self.loop_n_frames, self.loop_n_coefficients), f"Invalid loop coefficients shape: {l_b.shape}"
 
         f0_frames = self.internal_sr / f0_frames # Convert from Hz to samples
 
@@ -195,17 +193,10 @@ class DiffKS(nn.Module):
             l_b=l_b,
         )
 
-        if fc is not None and rt60 is not None:
-            l_b = self.design_loop(
-                f0=f0,
-                fc=fc,
-                rt60=rt60,
-            )
-        else:
-            l_b = self.get_constrained_l_coefficients(
-                l_b=l_b,
-                f0=f0
-            )
+        l_b = self.design_loop(
+            f0=f0,
+            l_b=l_b,
+        )
 
         A, x = self.compute_resonator_matrix(f0=f0, loop_coefficients=l_b, input=input)
 
@@ -288,19 +279,10 @@ class DiffKS(nn.Module):
 
         return A, x
 
-    def get_constrained_l_coefficients(
-            self,
-            l_b: torch.Tensor,  # [B, N, 1+loop_order]  (b0 followed by taps)
-            f0: torch.Tensor | None = None  # [B, N] delay length L in *samples* (internal SR)
-    ) -> torch.Tensor:
-        """
-        Constrain loop coefficients so the feedback magnitude stays < 1.
-        - b0 (=gain) is in (0.9, 1.0) via sigmoid mapping.
-        - taps are tanh-mapped then *scaled* so that the worst-case modal peak
-          (DC, Nyquist, fundamental ω0 = 2π/L) fits under the remaining budget (1 - b0).
-        Falls back to an L1-based bound if f0_samples is None.
-        """
-        # Split logits
+    def design_loop(self,
+                    l_b: torch.Tensor, # [B, F, 3] with entries [g, b1, b2] (safe g)
+                    f0: torch.Tensor,  # [B, F]  (safe L)
+                    ):
         gain_logits = l_b[..., :1]  # [B, N, 1]
         taps_logits = l_b[..., 1:]  # [B, N, K], K=loop_order
 
@@ -324,7 +306,7 @@ class DiffKS(nn.Module):
 
         # Fundamental peak (ω0 = 2π/L)
         # L = f0_samples (already in samples/period); guard small values
-        L = torch.clamp(f0, min=1.0)  # [B, N]
+        L = f0  # [B, N]
         omega0 = (2.0 * torch.pi) / L  # [B, N]
         n = n_idx.to(dtype).view(1, 1, -1)  # [1,1,K]
         cos_term = torch.cos(omega0.unsqueeze(-1) * n)  # [B, N, K]

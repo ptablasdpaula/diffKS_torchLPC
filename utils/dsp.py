@@ -39,6 +39,7 @@ def kaiser_resample(x, sr_in: int, sr_out: int,
     # move back to the original device only if we fell back
     return y.to(orig_dev) if orig_dev.type == "mps" else y
 
+
 def spline_upsample(
         x: torch.Tensor,  # [B, Frames, D]
         num_samples: int, # [Samples]
@@ -48,6 +49,7 @@ def spline_upsample(
     t_out = torch.linspace(0, 1, steps=num_samples, device=x.device)
     spline_fit = natural_cubic_spline_coeffs(t_in, x)
     return NaturalCubicSpline(spline_fit).evaluate(t_out)
+
 
 class InvertLPC(torch.autograd.Function):
     @staticmethod

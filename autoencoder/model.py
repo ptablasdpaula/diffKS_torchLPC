@@ -1,12 +1,16 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchaudio.transforms as T
 import numpy as np
 
 from utils.ml import mlp, gru
 from diffKS import DiffKS
 from data.preprocess import E2_HZ
-from core import make_onset_noise, detect_onsets_librosa, StaticShelf, DualShelfController
+from core import make_onset_noise, detect_onsets_librosa
+from flamo.auxiliary.eq import eq_freqs, geq as geq_sos
+
+import math
 
 class ZEncoder(nn.Module):
     def __init__(self, input_keys=None):
@@ -129,9 +133,7 @@ class AE_KarplusModel(nn.Module):
                  loop_order,
                  internal_sr,
                  interpolation_type,
-                 z_encoder,
-                 loudness_mu=None, loudness_std=None
-                 ):
+                 z_encoder):
         super().__init__()
         self.internal_sr = internal_sr
         self.loop_order = loop_order
@@ -147,47 +149,44 @@ class AE_KarplusModel(nn.Module):
         self.out_mlp = mlp(hidden_size * 3, hidden_size, 3)
 
         # Heads
-        self.shelf_head = nn.Linear(hidden_size, 6) # shelves: [low_fc, low_Q, low_g, high_fc, high_Q, high_g]
-        self.coefficients_head = nn.Linear(hidden_size, loop_order + 1)  # loop filter taps + 1 (gain)
-        # Initialize coefficients_head bias and weight so that gain=1, others=0
-        #with torch.no_grad():
-        #    self.coefficients_head.weight.zero_()
-        #    self.coefficients_head.bias.zero_()
-        #    self.coefficients_head.bias[0] = 2.197
-
-        # Store loudness z-score stats
-        mu = 0.0 if loudness_mu is None else float(loudness_mu)
-        sd = 1.0 if loudness_std is None else float(loudness_std)
-        self.register_buffer("loudness_mu", torch.tensor(mu))
-        self.register_buffer("loudness_std", torch.tensor(sd))
-
-        # Excitation shaping: learnable shelves
+        # GEQ (graphic EQ) gains head – size depends on chosen band layout
+        # Build GEQ band layout (one‑octave bands by default)
         self.sample_rate = 16000  # set to your dataset SR
-        self.low_shelf = StaticShelf(
-            which="low",
-            sample_rate=self.sample_rate,
-            init_fc_hz=120.0,
-            fmin_hz=20.0,
-            fmax_hz=self.sample_rate / 2 - 200.0,
-            init_Q=0.707,
-            init_gain_db=-3.0,
-        )
-        self.high_shelf = StaticShelf(
-            which="high",
-            sample_rate=self.sample_rate,
-            init_fc_hz=3000.0,
-            fmin_hz=30.0,
-            fmax_hz=self.sample_rate / 2 - 200.0,
-            init_Q=0.707,
-            init_gain_db=-1.5,
-        )
-        # Controller that maps AE shelf logits → physically valid shelf params
-        self.shelf_ctrl = DualShelfController(
-            fs=self.sample_rate,
-            fmin=20.0,
-            fmax=self.sample_rate / 2 - 200.0,
-            max_gain_db=12.0,
-        )
+        cf, sh = eq_freqs(interval=1)
+        # Clamp bands to be valid for our SR (avoid > Nyquist)
+        nyq = self.sample_rate * 0.5
+        cf = torch.as_tensor(cf, dtype=torch.float32)
+        cf = cf[cf <= (nyq * 0.98)]
+        self.geq_centers = cf  # tensor of center frequencies (Hz)
+        # shelving crossovers as tensor of length 2 (low & high)
+        sh = torch.as_tensor(sh, dtype=torch.float32)
+        sh = torch.stack([torch.clamp(sh[0], min=20.0), torch.clamp(sh[1], max=nyq * 0.98)])
+        self.geq_shelves = sh
+        # Two shelves + one peak per center frequency
+        self.n_geq = int(self.geq_centers.numel() + 3)
+        self.max_gain_db = 12.0
+
+        # MLP head to predict per‑band dB gains
+        self.geq_head = nn.Linear(hidden_size, self.n_geq)
+
+        # Per‑frame loop design parameters (g, b1, b2) – raw logits, linear head
+        self.coefficients_head = nn.Linear(hidden_size, 3)  # [g_logit, b1_logit, b2_logit]
+        with torch.no_grad():
+            if isinstance(self.coefficients_head, nn.Linear):
+                self.coefficients_head.weight.zero_()
+                self.coefficients_head.bias.zero_()
+
+        # Time‑varying gain head (applied to excitation before GEQ)
+        self.gain_head = nn.Linear(hidden_size, 1)
+        # Initialize to 0 so g_db(0) = 0 dB (neutral)
+        with torch.no_grad():
+            self.gain_head.weight.zero_()
+            self.gain_head.bias.zero_()
+
+        with torch.no_grad():
+            # GEQ: start at 0 dB on every band
+            self.geq_head.weight.zero_()
+            self.geq_head.bias.zero_()
 
         # Create a buffer for GRU state
         self.register_buffer("cache_gru", torch.zeros(1, 1, hidden_size))
@@ -207,13 +206,15 @@ class AE_KarplusModel(nn.Module):
         for p in self.decoder.parameters():
             p.requires_grad = False
 
+
     def forward(
             self,
             pitch,
             loudness,
             audio,
             audio_sr,
-            return_parameters=False):
+            return_parameters=False
+    ):
         """
         Forward pass of the neural Karplus-Strong model.
 
@@ -222,7 +223,12 @@ class AE_KarplusModel(nn.Module):
             loudness: Tensor of shape [batch_size, frames, 1] - Loudness values
 
         Returns:
-            Tensor of shape [batch_size, n_samples] - Synthesized audio
+            If `return_parameters` is False:
+                Tensor of shape [batch_size, n_samples] — synthesized audio.
+            If `return_parameters` is True:
+                Tuple (loop_coeffs_c, geq_info) where:
+                    loop_coeffs_c: Tensor [B, T, 3] of raw loop coefficients logits [g, b1, b2].
+                    geq_info: dict with keys "centers_hz", "shelves_hz", and "gains_db".
         """
         # ─── build the full‑resolution hidden sequence ───────────────────────
         z = self.z_encoder(audio, f0_scaled=pitch)  # [B, T, z_dim]
@@ -236,25 +242,15 @@ class AE_KarplusModel(nn.Module):
         hidden  = torch.cat([gru_out, x_f, x_l], -1) # [B, T, 3H]
         hidden  = self.out_mlp(hidden)               # [B, T, H]
 
-        # --- Predict shelf parameters from hidden; pool across time to make them static per example
+        # --- Predict GEQ gains from hidden; pool across time to make them static per example
         h_pool = hidden.mean(dim=1)               # [B, H]
-        shelf_raw = self.shelf_head(h_pool)       # [B, 6] = [l_fc_r, l_Q_r, l_g_r, h_fc_r, h_Q_r, h_g_r]
-        # Map to ordered & constrained params (f_high > f_low, Q>0, gains bounded)
-        (l_fc, l_Q, l_gdb), (h_fc, h_Q, h_gdb) = self.shelf_ctrl(shelf_raw)
-
-        # ─── 2.  predict a coefficient frame *per* encoder step ──────────────────
-        coefficients_raw = self.coefficients_head(hidden)              # [B, T, L+1]
+        geq_logits = self.geq_head(h_pool)        # [B, K] – K = self.n_geq
+        gains_db   = self.max_gain_db * torch.tanh(geq_logits)  # clamp to ±max_gain_db
 
         # ─── 3. Onset-based excitation (DiffKS) ────────────────────────────────
         B, N = audio.shape
         T = pitch.size(1)  # number of pitch frames
-
-        # De-normalize incoming A-weighted log-power loudness (z-scored) back to log-power
-        logpow_all = loudness.squeeze(-1) * self.loudness_std + self.loudness_mu  # [B, T]
-
-        # (No inversion) — detect onsets directly on the target audio
-        # We intentionally skip any inverse-filtering path and let KS handle amplitude
-        # shaping. Shelves are applied later to the excitation only.
+        # (No inversion) — detect onsets directly on the target audio (moved earlier for segment attention)
         onset_list = []
         for b in range(B):
             on_b = detect_onsets_librosa(
@@ -270,12 +266,12 @@ class AE_KarplusModel(nn.Module):
             idx = int(round(s * T / max(1, N)))
             return max(0, min(T - 1, idx))
 
+        # Per-frame head (simple MLP projection)
+        l_b_frames = self.coefficients_head(hidden)  # [B, T, 3]
+
         # Build bursts per item with per-onset length derived from local pitch,
-        # apply per-onset RMS scaling to match the target audio for each burst
-        raw_noise_rows = []
         exc_rows = []
         for b in range(B):
-            raw_b = torch.zeros(1, N, device=audio.device, dtype=audio.dtype)
             exc_b = torch.zeros(1, N, device=audio.device, dtype=audio.dtype)
             for s in onset_list[b]:
                 s = int(s)
@@ -293,52 +289,128 @@ class AE_KarplusModel(nn.Module):
                     dtype=audio.dtype,
                     burst_len_samples=L_loc,
                 )  # [1, N]
-                raw_b = raw_b + nb
-
-                # Use de-normalized A-weighted log-power loudness at this pitch frame
-                logpow = logpow_all[b, f_idx]
-                A_rms = torch.exp(logpow * 0.5).view(1, 1) * 10 # [1,1]
 
                 burst_start = s
                 burst_end   = min(burst_start + L_loc, N)
                 seg_noi     = nb[:, burst_start:burst_end]  # [1, L]
 
-                # Current burst RMS (avoid divide-by-zero)
-                seg_rms = torch.sqrt(torch.clamp((seg_noi ** 2).mean(dim=-1, keepdim=True), min=1e-12))  # [1,1]
-                gain = A_rms / (seg_rms + 1e-12)
-
                 nb_scaled = nb.clone()
-                nb_scaled[:, burst_start:burst_end] = seg_noi * gain
+                nb_scaled[:, burst_start:burst_end] = seg_noi #* gain
                 exc_b = exc_b + nb_scaled
-            raw_noise_rows.append(raw_b)
             exc_rows.append(exc_b)
 
-        raw_noise = torch.cat(raw_noise_rows, dim=0)  # [B, N]
         excitation = torch.cat(exc_rows, dim=0)       # [B, N]
 
-        # Shelf shaping (learnable); AE can override via raw heads elsewhere
-        excitation = self.low_shelf(
-            excitation,
-            fc_hz=l_fc, Q=l_Q, gain_db=l_gdb,
-            from_raw=False,
-        )
-        excitation = self.high_shelf(
-            excitation,
-            fc_hz=h_fc, Q=h_Q, gain_db=h_gdb,
-            from_raw=False,
+        # --- Time‑varying gain applied to bursts before GEQ ---
+        # Asymmetric dB mapping: [-inf, +12] dB (no cap on attenuation, +12 dB max boost)
+        # g_db(x) = 12 - (12/ln 2) * softplus(x); g_db(0)=0 dB, g_db→12 dB as x→-inf, g_db→-inf as x→+inf
+        g_logits = self.gain_head(hidden)  # [B, T, 1]
+        g_db = 12.0 - (12.0 / math.log(2.0)) * F.softplus(g_logits)
+
+        gain_frames = torch.pow(10.0, g_db / 20.0)  # dB → linear; (0, 10^(12/20)]
+        # Numerical floor to avoid exact zeros that can kill gradients
+        gain_frames = torch.clamp(gain_frames, min=1e-6)
+
+        gain_up = F.interpolate(gain_frames.transpose(1, 2), size=N, mode="linear", align_corners=False).squeeze(1)
+        excitation = excitation * gain_up
+
+        # Graphic‑EQ shaping (learnable dB gains) in frequency domain
+        excitation = self._apply_geq_fd(
+            excitation,   # [B, N]
+            gains_db=gains_db,  # [B, K]
+            sr=audio_sr,
         )
 
         if return_parameters:
-            loop_coeffs_c = self.decoder.get_constrained_l_coefficients(f0=pitch.squeeze(-1), l_b=coefficients_raw)
-            low_params  = {"fc_hz": l_fc,  "Q": l_Q,  "gain_db": l_gdb}
-            high_params = {"fc_hz": h_fc, "Q": h_Q, "gain_db": h_gdb}
-            return loop_coeffs_c, low_params, high_params
+            loop_coeffs_c = self.decoder.design_loop(f0= pitch.squeeze(2), l_b=l_b_frames)  # [B, T, 3] = [g_logit, b1_logit, b2_logit]
+            geq_info = {
+                "centers_hz": self.geq_centers.detach().cpu(),
+                "shelves_hz": self.geq_shelves.detach().cpu(),
+                "gains_db":    gains_db.detach().cpu(),
+            }
+            return loop_coeffs_c, geq_info
 
         out = self.decoder(
             f0_frames=pitch.squeeze(2),
             input=excitation,
             input_sr=audio_sr,
-            loop_coefficients=coefficients_raw,
+            loop_coefficients=l_b_frames,  # feed raw logits [g, b1, b2] directly (no upsampling)
         )
 
         return out
+
+    def _apply_geq_fd(self, x: torch.Tensor, gains_db: torch.Tensor, sr: int) -> torch.Tensor:
+        """Apply FLAMO GEQ as a cascade of SOS in the frequency domain.
+        x: [B, N] time‑domain mono
+        gains_db: [B, K] where K = 2 + len(self.geq_centers) – ordering assumed
+                  [low_shelf, centers..., high_shelf].
+        Returns: [B, N]
+        """
+        B, N = x.shape
+        # FFT size: power‑of‑two >= N for decent speed
+        nfft = 1
+        while nfft < N:
+            nfft <<= 1
+        # Precompute rfft frequency grid once
+        # Shape [nfft//2+1]
+        w = 2.0 * math.pi * torch.arange(0, nfft // 2 + 1, device=x.device, dtype=x.dtype) / float(nfft)
+        z1 = torch.exp(-1j * w)
+        z2 = torch.exp(-2j * w)
+
+        y_list = []
+        # Build tensors for flamo.geq()
+        cf = self.geq_centers.to(device=x.device, dtype=x.dtype)
+        sh = self.geq_shelves.to(device=x.device, dtype=x.dtype)
+        R  = torch.tensor(2.7, device=x.device, dtype=x.dtype)  # resonance used by FLAMO GEQ
+
+        for b in range(B):
+            gdb = gains_db[b]  # [K]
+            # Sanity: if user supplied head dimension matches K exactly, use as is
+            # If K differs by one (due to library layout), truncate/pad gracefully
+            K_needed = int(cf.numel() + 3)
+            if gdb.numel() != K_needed:
+                if gdb.numel() > K_needed:
+                    gdb = gdb[:K_needed]
+                else:
+                    pad = torch.zeros(K_needed - gdb.numel(), device=gdb.device, dtype=gdb.dtype)
+                    gdb = torch.cat([gdb, pad], dim=0)
+
+            b_sos, a_sos = geq_sos(
+                center_freq=cf,
+                shelving_freq=sh,
+                R=R,
+                gain_db=gdb,  # length = len(cf) + 3
+                fs=float(sr),
+                device=x.device
+            )
+            # b_sos, a_sos expected shapes [3, S] where S = number of SOS
+            # Compute section responses and multiply
+            b0, b1, b2 = b_sos[0], b_sos[1], b_sos[2]
+            a0, a1, a2 = a_sos[0], a_sos[1], a_sos[2]
+            # Normalize to a0 = 1 if needed
+            a0_safe = a0 + 1e-12
+            b0, b1, b2 = b0 / a0_safe, b1 / a0_safe, b2 / a0_safe
+            a1, a2     = a1 / a0_safe, a2 / a0_safe
+
+            # Shape broadcasting: each section against frequency grid
+            # Section response: (b0 + b1 z^{-1} + b2 z^{-2}) / (1 + a1 z^{-1} + a2 z^{-2})
+            num = b0.view(-1, 1) + b1.view(-1, 1) * z1 + b2.view(-1, 1) * z2
+            den = 1.0 + a1.view(-1, 1) * z1 + a2.view(-1, 1) * z2
+            H_sections = num / (den + 1e-30)
+            H = torch.prod(H_sections, dim=0)  # [nfft//2+1]
+
+            X = torch.fft.rfft(x[b], n=nfft)
+            H = H.to(dtype=X.dtype)
+            Y = X * H
+            # Time-domain signal after EQ
+            y = torch.fft.irfft(Y, n=nfft).real[:N]
+
+            # --- Make-up gain: preserve overall RMS loudness of excitation ---
+            pre_rms  = torch.sqrt(torch.clamp((x[b] ** 2).mean(), min=1e-12))
+            post_rms = torch.sqrt(torch.clamp((y    ** 2).mean(), min=1e-12))
+            makeup   = pre_rms / (post_rms + 1e-12)
+            y = y * makeup
+
+            y_list.append(y.to(dtype=x.dtype))
+
+        return torch.stack(y_list, dim=0)
