@@ -14,21 +14,24 @@ LAGRANGE_ORDER = 5
 class DiffKS(nn.Module):
     """
     A differentiable Karplus–Strong model with time-varying fractional delay
-    and configurable-order filter with normalized coefficients.
+    and order-1 loop filter (IIR or FIR) in series with Lagrange fractional delay.
     """
     def __init__(
         self,
         batch_size: int = 1,
         internal_sr: int = 16000,
         min_f0_hz: float = 27.5,
-        loop_order: int = 2,
+        loop_order: int = 1,
         loop_n_frames: int = 250,
         interp_type: str = "linear",
         use_double_precision: bool = True,
         device: torch.device = get_device(),
+        loop_filter_kind: str = "fir",
     ):
         super().__init__()
-        assert loop_order >= 1, "Filter order must be at least 1"
+        assert loop_order == 1, "This implementation supports only order-1 loop filters."
+        assert loop_filter_kind in ("iir", "fir"), "loop_filter_kind must be 'iir' or 'fir'"
+        self.loop_filter_kind = loop_filter_kind
 
         # ====== General ================================
         self.batch_size = batch_size
@@ -40,11 +43,7 @@ class DiffKS(nn.Module):
         # ====== Loop Filter ============================
         self.loop_n_frames = loop_n_frames
         self.loop_order = loop_order
-        self.loop_n_coefficients = loop_order + 1  # To account for DC coefficient
-
-        # Modal-aware normalization hyper-parameters (weight long-lag taps more)
-        self.modal_beta = 2.0   # strength of weighting
-        self.modal_power = 2.0  # exponent on (k / L)
+        self.loop_n_coefficients = loop_order + 1  # gain and first tap
 
         self.loop_coefficients = nn.Parameter(
             torch.rand(
@@ -56,13 +55,6 @@ class DiffKS(nn.Module):
 
         # ====== Interpolation Settings ==================
         self.interp_type = interp_type
-
-        self.register_buffer("lagrange_denom",
-                             torch.arange(LAGRANGE_ORDER, -1, -1).view(-1, 1) -
-                             torch.arange(LAGRANGE_ORDER + 1).view(1, -1))
-        self.register_buffer("lagrange_mask", self.lagrange_denom != 0)
-        self.register_buffer("lagrange_denom_masked",
-                             torch.where(self.lagrange_mask, self.lagrange_denom, 1))
 
         # ====== Analysis Buffers =======================
         self.register_buffer("excitation", None, persistent=False)
@@ -169,6 +161,39 @@ class DiffKS(nn.Module):
         # finally detach, move to CPU and store
         setattr(self, name, tensor.detach().cpu())
 
+    def tune_f0(
+        self,
+        f0: torch.Tensor,        # [B, N] in samples/period
+        b0: torch.Tensor,        # [B, N]
+        a1: torch.Tensor,        # [B, N]
+    ) -> torch.Tensor:
+        """Phase-correct the fractional period based on the loop filter kind.
+        Returns f0 (in samples). Also clamps to valid index range.
+        """
+        omega = 2 * torch.pi / f0
+        cosw = torch.cos(omega)
+        sinw = torch.sin(omega)
+        if self.loop_filter_kind == "iir":
+            # p_a = angle(1 - a1 e^{-jω}) / ω
+            real1 = 1.0 - a1 * cosw
+            imag1 = a1 * sinw
+            phase1 = torch.atan2(imag1, real1)
+            p_a = phase1 / (omega + 1e-12)
+        elif self.loop_filter_kind == "fir":
+            # B(e^{jω}) = b0 + a1 e^{-jω}; p_a = -angle(B)/ω
+            fir_real = b0 + a1 * cosw
+            fir_imag = -a1 * sinw
+            fir_phase = torch.atan2(fir_imag, fir_real)
+            p_a = -fir_phase / (omega + 1e-12)
+        else:
+            raise NotImplementedError(f"Unknown loop_filter_kind: {self.loop_filter_kind}")
+
+        f0_corrected = f0 - (1 + p_a)
+        # Clamp to valid integer-delay range to avoid OOB indices
+        max_int_delay = self.coeff_vector_size - self.num_active_indexes
+        f0_corrected = f0_corrected.clamp_(min=0.0, max=max_int_delay - 1e-6)
+        return f0_corrected
+
     def forward(
         self,
         f0_frames: torch.Tensor,  # [batch_size, n_frames]
@@ -198,6 +223,7 @@ class DiffKS(nn.Module):
             l_b=l_b,
         )
 
+        f0 = self.tune_f0(f0=f0, b0=l_b[..., 0], a1=l_b[..., 1])
         A, x = self.compute_resonator_matrix(f0=f0, loop_coefficients=l_b, input=input)
 
         y_out = sample_wise_lpc(x, A) if invert is False else invert_lpc(x, A)
@@ -205,17 +231,18 @@ class DiffKS(nn.Module):
 
     def compute_resonator_matrix(
             self,
-            f0: torch.Tensor,  # [batch_size, n_samples]
+            f0: torch.Tensor,  # [batch_size, n_samples] phase-corrected fractional delay (in samples)
             loop_coefficients: torch.Tensor,  # [batch_size, n_samples, loop_n_coefficients]
             input: torch.Tensor, # [batch_size, n_samples]
     ) -> Tuple[
         torch.Tensor, torch.Tensor]:  # Returns A [batch_size, n_samples, coeff_vector_size], x [batch_size, n_samples]
         """
-        Computes the coefficient matrix for a resonator with fractional delay.
+        Computes the coefficient matrix for a resonator with **given corrected fractional delay** and order-1 loop filter (IIR or FIR) in series with the Lagrange fractional delay inside the loop.
 
         Args:
-            f0: Fundamental frequency in samples [batch_size, n_samples]
+            f0: Phase-corrected delay (samples) [batch_size, n_samples]
             loop_coefficients: Filter coefficients [batch_size, n_samples, loop_n_coefficients]
+                (interpreted as [b0, a1])
             input: Input excitation signal [batch_size, n_samples]
 
         Returns:
@@ -226,35 +253,25 @@ class DiffKS(nn.Module):
 
         x = input
         b = loop_coefficients  # [batch_size, n_samples, loop_n_coefficients]
+        assert b.shape[-1] == self.loop_n_coefficients, (
+            f"loop_coefficients last dim {b.shape[-1]} != expected {self.loop_n_coefficients}")
 
-        # Calculate phase adjustment
-        omega = 2 * torch.pi / f0  # [batch_size, n_samples]
-        coeff_range = torch.arange(self.loop_n_coefficients, device=self.device).view(1, 1, -1)
+        # === Order-1 loop filter: numerator b0, AR/FIR tap a1 ===
+        b0 = b[..., 0]
+        a1 = b[..., 1]
 
-        if self.device == torch.device("mps"):
-            cos_k = torch.cos(omega.unsqueeze(-1) * coeff_range)
-            sin_k = torch.sin(omega.unsqueeze(-1) * coeff_range)
-            real_sum = (b * cos_k).sum(dim=-1)
-            imag_sum = -(b * sin_k).sum(dim=-1)
-            phase = torch.atan2(imag_sum, real_sum)
-            p_a = -phase / omega
-        else:
-            zs = torch.exp(1j * omega.view(batch_size, n_samples, 1)) ** -coeff_range
-            p_a = -torch.angle(torch.sum(b * zs, dim=-1)) / omega
+        z_l = torch.floor(f0).to(dtype=torch.long)  # [B, N] int64
+        alfa = f0 - z_l  # [B, N] 0 ≤ α < 1
 
-        f0_corrected = f0 - (1 + p_a)
-
-        max_int_delay = self.coeff_vector_size - self.num_active_indexes
-
-        needs_clamp = (f0_corrected < 0.0) | (f0_corrected > max_int_delay - 1e-6)
-        f0_corrected = f0_corrected.clamp_(min=0.0, max=max_int_delay - 1e-6)
-
-        if torch.any(needs_clamp):
-            print("[KS] some delays were clamped to the valid range "
-                  f"[0, {max_int_delay - 1e-6:g}]")
-
-        z_l = torch.floor(f0_corrected).to(dtype=torch.long)  # [B, N] int64
-        alfa = f0_corrected - z_l  # [B, N] 0 ≤ α < 1
+        # Premultiply input only for IIR
+        if self.loop_filter_kind == "iir":
+            x_prime = x.clone()
+            # n=0
+            x_prime[:, 0] = x[:, 0] * (1.0 - a1[:, 0])
+            # n>=1
+            if n_samples > 1:
+                x_prime[:, 1:] = x[:, 1:] - a1[:, 1:] * x[:, :-1]
+            x = x_prime
 
         A = torch.zeros((batch_size, n_samples, self.coeff_vector_size), device=self.device, dtype=self._dtype)
 
@@ -263,70 +280,90 @@ class DiffKS(nn.Module):
         sample_indices = torch.arange(n_samples, device=self.device).view(1, -1).expand(batch_size, -1)
 
         if self.interp_type == "linear":
-            indices = z_l
-            A[batch_indices, sample_indices, indices] = -(1 - alfa) * b[..., 0]
-
-            for i in range(1, self.loop_n_coefficients):
-                indices = z_l + i
-                A[batch_indices, sample_indices, indices] = -(alfa * b[..., i - 1] + (1 - alfa) * b[..., i])
-
-            indices = z_l + self.num_active_indexes - 1
-            A[batch_indices, sample_indices, indices] = -alfa * b[..., -1]
+            if self.loop_filter_kind == "iir":
+                # IIR: place b0 at z_l and z_l+1, add AR term at 1
+                A[batch_indices, sample_indices, z_l]     = -(1 - alfa) * b0
+                A[batch_indices, sample_indices, z_l + 1] = -alfa * b0
+                # AR(1) term
+                A[batch_indices, sample_indices, 1] += -a1
+            elif self.loop_filter_kind == "fir":
+                # FIR: classic 2-tap crossfade
+                # idxs: [L, L+1, L+2]
+                A[batch_indices, sample_indices, z_l]     = -(1 - alfa) * b0
+                A[batch_indices, sample_indices, z_l + 1] = -(alfa * b0 + (1 - alfa) * a1)
+                A[batch_indices, sample_indices, z_l + 2] = -alfa * a1
+        elif self.interp_type == "lagrange":
+            # === Lagrange interpolation ===
+            z_center = torch.floor(f0).to(torch.long) - (LAGRANGE_ORDER // 2)
+            alfa = f0 - z_center.to(dtype=self._dtype)
+            u = alfa.view(batch_size, n_samples, 1)
+            j = torch.arange(LAGRANGE_ORDER + 1, device=self.device, dtype=self._dtype).view(1, 1, -1)
+            num = u - j
+            k = torch.arange(LAGRANGE_ORDER, -1, -1, device=self.device, dtype=self._dtype).view(-1, 1)
+            j_full = torch.arange(LAGRANGE_ORDER + 1, device=self.device, dtype=self._dtype).view(1, -1)
+            denom = (k - j_full).unsqueeze(0).unsqueeze(0)
+            num = num.unsqueeze(-2).expand(-1, -1, LAGRANGE_ORDER + 1, -1)
+            mask = (k - j_full) != 0
+            mask = mask.unsqueeze(0).unsqueeze(0)
+            num = torch.where(mask, num, torch.ones_like(num))
+            denom = torch.where(mask, denom, torch.ones_like(denom))
+            weights = (num / denom).prod(dim=-1)
+            BN = batch_size * n_samples
+            b0e_flat = b0.reshape(BN, 1).unsqueeze(0)
+            w_flat = weights.reshape(BN, LAGRANGE_ORDER + 1).unsqueeze(1)
+            if self.device.type == "mps":
+                b0e_flat = b0e_flat.to(torch.float32)
+                w_flat = w_flat.to(torch.float32)
+                b0_w = F.conv1d(b0e_flat, w_flat, padding=LAGRANGE_ORDER, groups=BN).to(self._dtype)
+            else:
+                b0_w = F.conv1d(b0e_flat, w_flat, padding=LAGRANGE_ORDER, groups=BN)
+            b0_w = b0_w.squeeze(0).reshape(batch_size, n_samples, -1)
+            if self.loop_filter_kind == "iir":
+                # IIR: just b0_w, pad to (M+2)
+                b_conv_total = F.pad(b0_w, (0, 1))
+                block_len = b_conv_total.size(-1)
+                idxs = [z_center + i for i in range(block_len)]
+                assert torch.all(idxs[-1] < self.coeff_vector_size), "Delay index exceeds the buffer size"
+                for i in range(block_len):
+                    A[batch_indices, sample_indices, idxs[i]] = -b_conv_total[..., i]
+                # AR(1) term
+                A[batch_indices, sample_indices, 1] += -a1
+            elif self.loop_filter_kind == "fir":
+                # FIR: build 2-tap result by adding +1 shifted copy scaled by a1
+                b_conv_total = F.pad(b0_w, (0, 1)) + (a1.unsqueeze(-1) * F.pad(b0_w, (1, 0)))
+                block_len = b_conv_total.size(-1)
+                idxs = [z_center + i for i in range(block_len)]
+                assert torch.all(idxs[-1] < self.coeff_vector_size), "Delay index exceeds the buffer size"
+                for i in range(block_len):
+                    A[batch_indices, sample_indices, idxs[i]] = -b_conv_total[..., i]
         else:
             raise NotImplementedError(f"Interpolation type {self.interp_type} not implemented")
 
         self._store_buffer(A, "resonator_matrix", "sequential")
-
         return A, x
 
     def design_loop(self,
-                    l_b: torch.Tensor, # [B, F, 3] with entries [g, b1, b2] (safe g)
-                    f0: torch.Tensor,  # [B, F]  (safe L)
-                    ):
-        gain_logits = l_b[..., :1]  # [B, N, 1]
-        taps_logits = l_b[..., 1:]  # [B, N, K], K=loop_order
+                    l_b: torch.Tensor,  # [B, N, 2] -> logits for [gain, mix]
+                    f0: torch.Tensor,  # [B, N]
+                    ) -> torch.Tensor:  # [B, N, 2] -> [b0, a1]
+        """
+        Designs an order‑1 loop filter using a shared L1 budget g∈(0.9,1.0) and a 2‑way logits mix.
+        Returns [b0, a1], both nonnegative, with b0 + a1 = g.
+        In IIR mode: a1 is the pole coefficient. In FIR mode: a1 is the first FIR tap.
+        """
+        gain_logits = l_b[..., 0]
+        mix_logits  = l_b[..., 1]
 
-        # Map to valid ranges
-        gain = torch.sigmoid(gain_logits) * 0.1 + 0.9  # b0 ∈ (0.9, 1.0)
-        taps = torch.tanh(taps_logits)  # each tap ∈ (-1, 1)
+        g = torch.sigmoid(gain_logits) * 0.1 + 0.9  # (0.9, 1.0)
+        p = torch.sigmoid(mix_logits)               # (0, 1)
 
-        # --- Modal-aware bound: evaluate |H(ω)| at DC, Nyquist, and ω0 = 2π/L
-        # H(ω) = Σ_k b_k e^{-j ω k} for FIR taps {b_k}; here "taps" excludes b0.
-        B, N, K = taps.shape
-        dtype = taps.dtype
-        device = taps.device
+        b0 = g * (1.0 - p)
+        a1 = g * p
 
-        # DC peak (ω = 0): sum of taps
-        H_dc = torch.abs(taps.sum(dim=-1, keepdim=True))  # [B, N, 1]
+        taps = torch.stack([b0, a1], dim=-1)
+        assert torch.abs(taps).sum(dim=-1).max() < 1.0, "Loop filter |taps| sum must be < 1"
+        return taps
 
-        # Nyquist peak (ω = π): alternating sum
-        n_idx = torch.arange(K, device=device)  # [K]
-        alt = ((n_idx % 2) * -2 + 1).to(dtype).view(1, 1, -1)  # [1,1,K] = [+1,-1,+1,...]
-        H_nyq = torch.abs((taps * alt).sum(dim=-1, keepdim=True))  # [B, N, 1]
-
-        # Fundamental peak (ω0 = 2π/L)
-        # L = f0_samples (already in samples/period); guard small values
-        L = f0  # [B, N]
-        omega0 = (2.0 * torch.pi) / L  # [B, N]
-        n = n_idx.to(dtype).view(1, 1, -1)  # [1,1,K]
-        cos_term = torch.cos(omega0.unsqueeze(-1) * n)  # [B, N, K]
-        sin_term = torch.sin(omega0.unsqueeze(-1) * n)  # [B, N, K]
-        H_re = (taps * cos_term).sum(dim=-1, keepdim=True)  # [B, N, 1]
-        H_im = -(taps * sin_term).sum(dim=-1, keepdim=True)  # [B, N, 1]
-        H_f = torch.sqrt(H_re * H_re + H_im * H_im + 1e-20)  # [B, N, 1]
-
-        # Worst of the three modal checks
-        H_max = torch.maximum(H_dc, torch.maximum(H_nyq, H_f))  # [B, N, 1]
-
-        # Budget for taps is (1 - gain); scale taps to satisfy gain + |H| <= 1
-        # (Use a conservative min with 1.0 to avoid up-scaling.)
-        scale = torch.minimum(
-            torch.ones_like(H_max),
-            (1.0 - gain) / (H_max + 1e-12)
-        )  # [B, N, 1]
-        taps_scaled = taps * scale
-
-        return torch.cat([gain, taps_scaled], dim=-1)
 
     def get_upsampled_parameters(
             self,

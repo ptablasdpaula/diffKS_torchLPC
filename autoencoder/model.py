@@ -150,10 +150,11 @@ class AE_KarplusModel(nn.Module):
 
         # Heads
         # GEQ (graphic EQ) gains head – size depends on chosen band layout
-        # Build GEQ band layout (one‑octave bands by default)
+        # Build GEQ band layout (one‑third‑octave bands)
         self.sample_rate = 16000  # set to your dataset SR
-        cf, sh = eq_freqs(interval=1)
+        cf, sh = eq_freqs(interval=3)
         # Clamp bands to be valid for our SR (avoid > Nyquist)
+        nyq = self.sample_rate * 0.5
         nyq = self.sample_rate * 0.5
         cf = torch.as_tensor(cf, dtype=torch.float32)
         cf = cf[cf <= (nyq * 0.98)]
@@ -162,31 +163,18 @@ class AE_KarplusModel(nn.Module):
         sh = torch.as_tensor(sh, dtype=torch.float32)
         sh = torch.stack([torch.clamp(sh[0], min=20.0), torch.clamp(sh[1], max=nyq * 0.98)])
         self.geq_shelves = sh
-        # Two shelves + one peak per center frequency
-        self.n_geq = int(self.geq_centers.numel() + 3)
+        # Two shelves + one peak per 1/3‑octave center
+        self.n_geq = int(self.geq_centers.numel() + 3)  # two shelves + one peak per 1/3‑octave center
         self.max_gain_db = 12.0
 
         # MLP head to predict per‑band dB gains
         self.geq_head = nn.Linear(hidden_size, self.n_geq)
 
         # Per‑frame loop design parameters (g, b1, b2) – raw logits, linear head
-        self.coefficients_head = nn.Linear(hidden_size, 3)  # [g_logit, b1_logit, b2_logit]
-        with torch.no_grad():
-            if isinstance(self.coefficients_head, nn.Linear):
-                self.coefficients_head.weight.zero_()
-                self.coefficients_head.bias.zero_()
+        self.coefficients_head = nn.Linear(hidden_size, loop_order + 1)  # [g_logit, b1_logit, b2_logit]
 
         # Time‑varying gain head (applied to excitation before GEQ)
         self.gain_head = nn.Linear(hidden_size, 1)
-        # Initialize to 0 so g_db(0) = 0 dB (neutral)
-        with torch.no_grad():
-            self.gain_head.weight.zero_()
-            self.gain_head.bias.zero_()
-
-        with torch.no_grad():
-            # GEQ: start at 0 dB on every band
-            self.geq_head.weight.zero_()
-            self.geq_head.bias.zero_()
 
         # Create a buffer for GRU state
         self.register_buffer("cache_gru", torch.zeros(1, 1, hidden_size))
@@ -198,7 +186,7 @@ class AE_KarplusModel(nn.Module):
             loop_order = loop_order,
             loop_n_frames = z_encoder.z_time_steps if hasattr(z_encoder, 'z_time_steps') else 250,
             interp_type = interpolation_type,
-            use_double_precision = True,
+            use_double_precision = False,
             min_f0_hz = E2_HZ - 10,
         )
 

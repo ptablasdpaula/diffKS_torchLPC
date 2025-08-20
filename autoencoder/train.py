@@ -346,6 +346,7 @@ def main():
         model.train()
         t_loss = 0
         batches_processed = 0
+        nan_or_inf_detected = False
 
         # Accumulators for per-component gradient means across the epoch
         comp_grad_sums = defaultdict(float)
@@ -370,6 +371,14 @@ def main():
 
             stft_loss = mr_stft(recon.unsqueeze(1), audio.unsqueeze(1)) * args.stft_weight
             loss = stft_loss
+            # Abort early if loss is NaN or Inf
+            if not torch.isfinite(loss):
+                print(f"[ABORT] Non-finite loss detected at epoch {epoch}, batch {batch_idx}: {loss.item()}")
+                if wandb.run is not None:
+                    wandb.log({"nonfinite_loss_detected": True, "epoch": epoch, "batch": batch_idx})
+                    wandb.run.summary["nonfinite_loss"] = True
+                nan_or_inf_detected = True
+                break
             optimizer.zero_grad()
             loss.backward()
             if batch_idx == 0:
@@ -398,6 +407,22 @@ def main():
 
             t_loss += loss.item()
             batches_processed += 1
+
+        # If a non-finite loss was detected, save a checkpoint and stop training.
+        if nan_or_inf_detected:
+            ckpt = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "best_val_loss": best_val_loss,
+                "wandb_id": wandb_id,
+            }
+            abort_ckpt = os.path.join(config["save_dir"], f"nan_abort_{args.name}.pth")
+            torch.save(ckpt, abort_ckpt)
+            print(f"[ABORT] Saved checkpoint to {abort_ckpt}")
+            if wandb.run is not None:
+                wandb.finish()
+            return
 
         if batches_processed > 0:
             t_loss /= batches_processed
