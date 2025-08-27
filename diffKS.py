@@ -167,31 +167,39 @@ class DiffKS(nn.Module):
         b0: torch.Tensor,        # [B, N]
         a1: torch.Tensor,        # [B, N]
     ) -> torch.Tensor:
-        """Phase-correct the fractional period based on the loop filter kind.
-        Returns f0 (in samples). Also clamps to valid index range.
+        """Phase‑correct the fractional period based on the loop filter kind.
+        Returns f0 (in samples).
+
+        Notes:
+          • `c` is defined internally here (empirical alignment constant).
+          • We use **phase delay** p_a(ω) = −∠H(ω)/ω for the loop contribution:
+              IIR:  H_den(ω) = 1 − a1 e^{−jω}  →  p_a =  ∠H_den / ω
+              FIR:  H_num(ω) = b0 + a1 e^{−jω} →  p_a = −∠H_num / ω
+          • The corrected delay placed into the index arithmetic is:
+              f0_corr = f0 − (c + p_a)
         """
+        # Frequency grid at ω = 2π / f0
         omega = 2 * torch.pi / f0
         cosw = torch.cos(omega)
         sinw = torch.sin(omega)
+
         if self.loop_filter_kind == "iir":
             # p_a = angle(1 - a1 e^{-jω}) / ω
             real1 = 1.0 - a1 * cosw
             imag1 = a1 * sinw
             phase1 = torch.atan2(imag1, real1)
-            p_a = phase1 / (omega + 1e-12)
+            p_a = phase1 / omega
         elif self.loop_filter_kind == "fir":
-            # B(e^{jω}) = b0 + a1 e^{-jω}; p_a = -angle(B)/ω
+            # p_a = -angle(b0 + a1 e^{-jω}) / ω
             fir_real = b0 + a1 * cosw
             fir_imag = -a1 * sinw
             fir_phase = torch.atan2(fir_imag, fir_real)
-            p_a = -fir_phase / (omega + 1e-12)
+            p_a = -fir_phase / omega
         else:
             raise NotImplementedError(f"Unknown loop_filter_kind: {self.loop_filter_kind}")
 
-        f0_corrected = f0 - (1 + p_a)
-        # Clamp to valid integer-delay range to avoid OOB indices
-        max_int_delay = self.coeff_vector_size - self.num_active_indexes
-        f0_corrected = f0_corrected.clamp_(min=0.0, max=max_int_delay - 1e-6)
+        c = 1.0  # internal alignment constant
+        f0_corrected = f0 - (c + p_a)
         return f0_corrected
 
     def forward(
@@ -207,7 +215,7 @@ class DiffKS(nn.Module):
         assert input.dim() == 2, f"target must have 2 dimensions (batch, samples), got shape {input.shape}"
 
         l_b = loop_coefficients if loop_coefficients is not None else self.loop_coefficients
-        assert l_b.shape == (self.batch_size, self.loop_n_frames, self.loop_n_coefficients), f"Invalid loop coefficients shape: {l_b.shape}"
+        assert l_b.shape == (self.batch_size, self.loop_n_frames, self.loop_n_coefficients), f"Invalid loop coefficients shape: {l_b.shape} when it should be {self.batch_size, self.loop_n_frames, self.loop_n_coefficients}"
 
         f0_frames = self.internal_sr / f0_frames # Convert from Hz to samples
 
@@ -344,25 +352,69 @@ class DiffKS(nn.Module):
 
     def design_loop(self,
                     l_b: torch.Tensor,  # [B, N, 2] -> logits for [gain, mix]
-                    f0: torch.Tensor,  # [B, N]
+                    f0: torch.Tensor,   # [B, N]
+                    return_gain: bool = False,
                     ) -> torch.Tensor:  # [B, N, 2] -> [b0, a1]
         """
-        Designs an order‑1 loop filter using a shared L1 budget g∈(0.9,1.0) and a 2‑way logits mix.
-        Returns [b0, a1], both nonnegative, with b0 + a1 = g.
-        In IIR mode: a1 is the pole coefficient. In FIR mode: a1 is the first FIR tap.
+        Designs an order‑1 loop filter with a numerically safe softcap parameterization.
+
+        • `g` is mapped to (0.9, 1) but never equals 1 in finite precision.
+        • `p` is mapped to (eps_p, 1 - eps_p), keeping sums strictly < 1.
+
+        IIR: a1 = p, b0 = g * (1 - a1)
+        FIR: taps sum to g via b0 = (1 - p) * g, a1 = p * g
+
+        Returns [b0, a1] (or [b0, a1, g] if return_gain=True).
         """
         gain_logits = l_b[..., 0]
         mix_logits  = l_b[..., 1]
 
-        g = torch.sigmoid(gain_logits) * 0.1 + 0.9  # (0.9, 1.0)
-        p = torch.sigmoid(mix_logits)               # (0, 1)
+        # --- Helper: smooth map R -> (0, 1 - eps) that never touches 1 ---
+        def softcap01(z, eps: float = 1e-6, tau: float = 0.25, power: float = 2.0):
+            s = F.softplus(z / tau)
+            if power != 1.0:
+                s = s.pow(power)
+            return (1.0 - eps) * s / (1.0 + s)  # in (0, 1 - eps)
 
-        b0 = g * (1.0 - p)
-        a1 = g * p
+        # --- Explicit g in (0.9, 1) but never 1 ---
+        eps_g  = 1e-6
+        base   = 0.9
+        span   = 0.1 - eps_g                 # so upper bound is 1 - eps_g
+        g_unit = softcap01(gain_logits, eps=eps_g, tau=0.25, power=2.0)  # (0, 1 - eps_g)
+        g      = base + span * (g_unit / (1.0 - eps_g))                  # (0.9, 1 - eps_g)
+
+        # --- p in a strict open interval (eps_p, 1 - eps_p) ---
+        eps_p  = 1e-6
+        p_unit = softcap01(mix_logits, eps=eps_p, tau=0.25, power=1.5)   # (0, 1 - eps_p)
+        p      = eps_p + (1.0 - 2.0 * eps_p) * (p_unit / (1.0 - eps_p))  # (eps_p, 1 - eps_p)
+
+        if self.loop_filter_kind == "iir":
+            a1 = p
+            b0 = (1.0 - a1) * g
+        elif self.loop_filter_kind == "fir":
+            b0 = (1.0 - p) * g
+            a1 = p * g
+        else:
+            raise NotImplementedError("loop_filter_kind must be 'iir' or 'fir'")
 
         taps = torch.stack([b0, a1], dim=-1)
-        assert torch.abs(taps).sum(dim=-1).max() < 1.0, "Loop filter |taps| sum must be < 1"
-        return taps
+
+        # Debug safety check (should never trigger with the parameterization above)
+        sum_taps = torch.abs(taps).sum(dim=-1)
+        condition = sum_taps >= 1.0
+        assert not condition.any(), (
+            f"Loop filter |taps| sum must be < 1. Found {condition.sum().item()} instances where the sum is >= 1.0. "
+            f"The violating values are:"
+            f"\n  b0: {b0[condition].tolist()}"
+            f"\n  a1: {a1[condition].tolist()}"
+            f"\n  g: {g[condition].tolist()}"
+            f"\n  sum: {sum_taps[condition].tolist()}"
+        )
+
+        if return_gain is False:
+            return taps
+        else:
+            return torch.stack([b0, a1, g], dim=-1)
 
 
     def get_upsampled_parameters(

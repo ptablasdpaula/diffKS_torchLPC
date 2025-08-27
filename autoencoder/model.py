@@ -3,8 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio.transforms as T
 import numpy as np
-
-from utils.ml import mlp, gru
+from transformers import ASTModel
 from diffKS import DiffKS
 from data.preprocess import E2_HZ
 from core import make_onset_noise, detect_onsets_librosa
@@ -12,233 +11,248 @@ from flamo.auxiliary.eq import eq_freqs, geq as geq_sos
 
 import math
 
-class ZEncoder(nn.Module):
-    def __init__(self, input_keys=None):
-        super().__init__()
+# ========================================================================
+# ASTConditioner: Audio-Spectrogram-Transformer based conditioner
+# ========================================================================
 
-    def forward(self, audio, f0_scaled=None):
-        """Forward pass computing the z embedding."""
-        z = self.compute_z(audio)
-        if f0_scaled is not None:
-            time_steps = f0_scaled.shape[1]
-            z = self.expand_z(z, time_steps)
+class ASTConditioner(nn.Module):
+    """Audio-Spectrogram-Transformer style conditioner that predicts
+    per-frame parameters for the DDSP decoder (gain + loop coeffs)
+    and clip-global GEQ band gains.
 
-        return z
-
-    def expand_z(self, z, time_steps):
-        """Ensure z has same temporal resolution as other conditioning."""
-        if len(z.shape) == 2:
-            z = z.unsqueeze(1)
-
-        z_time_steps = z.shape[1]
-
-        if z_time_steps != time_steps:
-            z = z.transpose(1, 2)  # [batch, channels, time]
-            z = torch.nn.functional.interpolate(
-                z,
-                size=time_steps,
-                mode='linear',
-                align_corners=False
-            )
-            z = z.transpose(1, 2)  # [batch, time, channels]
-
-        return z
-
-    def compute_z(self, audio):
-        """Takes audio tensor and returns latent tensor z."""
-        raise NotImplementedError
-
-class MfccTimeDistributedRnnEncoder(ZEncoder):
-    """MFCC-based encoder with RNN processing."""
+    Differences vs. canonical AST:
+    - Matches AST: 16x16 patches, stride 10×10, 128-mel, 25 ms / 10 ms frontend.
+    - Log-mel normalization with configurable mean/std (AudioSet defaults).
+    """
     def __init__(self,
-                 rnn_channels=512,
-                 rnn_type='gru',
-                 z_dims=16,
-                 z_time_steps=250,
-                 sample_rate=16000):
+                   n_mels: int = 128,
+                   input_tdim: int = 401,
+                   sample_rate: int = 16000,
+                   embed_dim: int = 768,
+                   loop_order: int = 2,
+                   n_geq: int = 32,
+                   do_normalize: bool = True,
+                   norm_mean: float = -4.2677393,
+                   norm_std: float = 4.5689974):
         super().__init__()
         self.sample_rate = sample_rate
-        self.z_dims = z_dims
-        self.z_time_steps = z_time_steps
+        self.input_tdim = input_tdim
+        self.n_mels = n_mels
+        self.embed_dim = embed_dim
+        self.loop_order = loop_order
+        self.n_geq = n_geq
+        self.do_normalize = do_normalize
 
-        # Configure based on z_time_steps as in the original implementation
-        if z_time_steps == 63:
-            self.fft_size = 2048
-            self.overlap = 0.5
-        elif z_time_steps == 125:
-            self.fft_size = 1024
-            self.overlap = 0.5
-        elif z_time_steps == 250:
-            self.fft_size = 1024
-            self.overlap = 0.75
-        elif z_time_steps == 500:
-            self.fft_size = 512
-            self.overlap = 0.75
-        elif z_time_steps == 1000:
-            self.fft_size = 256
-            self.overlap = 0.75
-        else:
-            raise ValueError(
-                '`z_time_steps` currently limited to 63, 125, 250, 500 and 1000')
-
-        self.hop_length = int(self.fft_size * (1.0 - self.overlap))
-
-        # MFCC extraction
-        self.mfcc_transform = T.MFCC(
+        # Spectrogram frontend (AST defaults)
+        self.mel = T.MelSpectrogram(
             sample_rate=sample_rate,
-            n_mfcc=30,
-            melkwargs={
-                'n_mels': 128,
-                'f_min': 20.0,
-                'f_max': 8000.0,
-                'n_fft': self.fft_size,
-                'hop_length': self.hop_length,
-                'pad_mode': 'reflect'
-            }
+            n_fft=1024,
+            win_length=int(round(self.sample_rate * 0.025)),  # 25 ms window
+            hop_length=int(round(self.sample_rate * 0.01)),   # 10 ms hop
+            f_min=20.0,
+            f_max=8000.0,
+            n_mels=n_mels,
+            window_fn=torch.hamming_window,
+            power=2.0,
+            pad_mode='reflect'
+        )
+        self.ampl_to_db = T.AmplitudeToDB(stype='power')
+
+        # Normalization buffers (AudioSet defaults)
+        self.register_buffer('norm_mean', torch.tensor(norm_mean))
+        self.register_buffer('norm_std', torch.tensor(norm_std))
+
+        # Hugging Face AST backbone (pretrained). This includes the conv patch embed,
+        # learned 1D positional embeddings (with interpolation), and ViT encoder.
+        self.backbone = ASTModel.from_pretrained(
+            "MIT/ast-finetuned-audioset-10-10-0.4593",
+            ignore_mismatched_sizes=True,
         )
 
-        # Normalization layer
-        self.z_norm = nn.InstanceNorm1d(30)
+        # Mel-axis attention pooling (to collapse mel patches per time step)
+        self.mel_attn = nn.Linear(embed_dim, 1)
 
-        # RNN and output layers
-        if rnn_type.lower() == 'gru':
-            self.rnn = nn.GRU(30, rnn_channels, batch_first=True)
-        else:
-            raise ValueError(f"Unsupported RNN type: {rnn_type}")
+        # Heads
+        self.gain_head = nn.Linear(embed_dim, 1)                 # g_db[t]
+        self.loop_head = nn.Linear(embed_dim, loop_order + 1)    # raw logits per frame
+        self.geq_head  = nn.Linear(embed_dim, n_geq)             # clip-global from pooled token
 
-        self.dense_out = nn.Linear(rnn_channels, z_dims)
+    def set_heads(self, loop_order: int, n_geq: int):
+        self.loop_order = loop_order
+        self.n_geq = n_geq
+        self.loop_head = nn.Linear(self.embed_dim, loop_order + 1)
+        self.geq_head  = nn.Linear(self.embed_dim, n_geq)
 
-    def compute_z(self, audio):
-        """Compute z embedding from audio."""
-        # Extract MFCCs
-        mfccs = self.mfcc_transform(audio).transpose(1, 2)  # [batch, time, n_mfcc]
+    def _set_requires_grad(self, module: nn.Module, flag: bool) -> None:
+        for p in module.parameters():
+            p.requires_grad = flag
 
-        # Normalize
-        mfccs = mfccs.transpose(1, 2)  # [batch, n_mfcc, time]
-        mfccs = self.z_norm(mfccs)
-        mfccs = mfccs.transpose(1, 2)  # [batch, time, n_mfcc]
 
-        # Run RNN
-        rnn_out, _ = self.rnn(mfccs)
+    def freeze_backbone(self) -> None:
+        """Freeze the AST backbone; leave mel-attn and heads trainable."""
+        self._set_requires_grad(self.backbone, False)
+        self.backbone.eval()
+        # Ensure heads remain trainable
+        self._set_requires_grad(self.mel_attn, True)
+        self._set_requires_grad(self.gain_head, True)
+        self._set_requires_grad(self.loop_head, True)
+        self._set_requires_grad(self.geq_head, True)
 
-        # Dense projection
-        z = self.dense_out(rnn_out)
+    def unfreeze_all(self) -> None:
+        """Unfreeze the entire conditioner (backbone + mel-attn + heads)."""
+        self._set_requires_grad(self.backbone, True)
+        self._set_requires_grad(self.mel_attn, True)
+        self._set_requires_grad(self.gain_head, True)
+        self._set_requires_grad(self.loop_head, True)
+        self._set_requires_grad(self.geq_head, True)
+        self.backbone.train()
 
-        return z
+    def _logmel(self, audio: torch.Tensor) -> torch.Tensor:
+        """Return normalized log-mel [B, M, Tm]."""
+        mel = self.mel(audio)
+        logmel = self.ampl_to_db(mel + 1e-10)
+        if self.do_normalize:
+            logmel = (logmel - self.norm_mean) / (self.norm_std + 1e-6)
+        return logmel
 
-class AE_KarplusModel(nn.Module):
+    def predict_parameters(self,
+                             audio: torch.Tensor,
+                             ):
+        """Predict (g_db[t], loop_logits[t], geq_logits) from audio."""
+
+        # 1) Log-mel
+        logmel = self._logmel(audio)        # [B, M, Tm]
+        Tm = logmel.shape[-1]
+
+        # 2) Pad/trim time axis to backbone config.max_length (AST expects fixed T)
+        T_target = int(getattr(self.backbone.config, "max_length", Tm))
+        if Tm < T_target:
+            pad_right = T_target - Tm
+            # pad last dimension (time) with zeros AFTER normalization (ASTFeatureExtractor uses 0.0)
+            logmel = F.pad(logmel, (0, pad_right), value=0.0)
+        elif Tm > T_target:
+            logmel = logmel[..., :T_target]
+
+        # 3) AST backbone: feed normalized log-mel as [B, T, M]
+        Bsz = logmel.size(0)
+        ast_out = self.backbone(input_values=logmel.transpose(1, 2))  # [B, special + patches, E]
+        mem_all = ast_out.last_hidden_state                           # includes CLS (+ distill, depending on backbone)
+
+        # Derive grid sizes from the backbone config to avoid hard-coding
+        cfg = self.backbone.config
+        pm = (int(cfg.num_mel_bins) - int(cfg.patch_size)) // int(cfg.frequency_stride) + 1
+        pt = (int(cfg.max_length)   - int(cfg.patch_size)) // int(cfg.time_stride)     + 1
+        expected_patches = pm * pt
+
+        # Keep only the patch tokens (drop 1 or 2 special tokens safely)
+        # Token order is [CLS][(distill?)][patches...], so we slice the last `expected_patches` tokens.
+        mem = mem_all[:, -expected_patches:, :]                       # [B, pm*pt, E]
+        L = mem.size(1)
+        assert L == expected_patches, (
+            f"Unexpected number of patch tokens: got {L}, expected {expected_patches} (pm={pm}, pt={pt})."
+        )
+        mem2d = mem.view(Bsz, pm, pt, self.embed_dim)                 # [B, pm, pt, E]
+        # --- Keep only the time tokens that correspond to the *actual* clip (pre-pad) ---
+        # Tm is the original mel-frame length before zero-padding to T_target.
+        # Compute effective time-patch count for content: pt_eff = floor((Tm - K) / s) + 1
+        Kt = int(cfg.patch_size)
+        st = int(cfg.time_stride)
+        T_valid = int(min(Tm, T_target))
+        pt_eff = max(1, min(pt, (T_valid - Kt) // st + 1))
+        mem2d = mem2d[:, :, :pt_eff, :]                                 # [B, pm, pt_eff, E]
+
+        # Pool over mel axis to get one token per *content* time step (no padded tail)
+        scores = self.mel_attn(mem2d).squeeze(-1)                        # [B, pm, pt_eff]
+        weights = torch.softmax(scores, dim=1)                           # softmax over mel axis
+        h_time = (weights.unsqueeze(-1) * mem2d).sum(dim=1)              # [B, pt_eff, E]
+
+        # 6) Heads directly on the native time base (no up/downsampling)
+        h_ds = h_time                                             # [B, pt, E]
+        g_db_frames = self.gain_head(h_ds)                        # [B, pt, 1]
+        loop_logits = self.loop_head(h_ds)                        # [B, pt, loop_order+1]
+        h_pool = h_ds.mean(dim=1)                                 # [B, E]
+        geq_logits = self.geq_head(h_pool)                        # [B, n_geq]
+        return g_db_frames, loop_logits, geq_logits
+
+class nnKarplusStrong(nn.Module):
     def __init__(self,
-                 hidden_size,
-                 batch_size,
-                 loop_order,
-                 internal_sr,
-                 interpolation_type,
-                 z_encoder):
+                   batch_size,
+                   loop_order,
+                   internal_sr,
+                   interpolation_type):
         super().__init__()
         self.internal_sr = internal_sr
         self.loop_order = loop_order
-        self.z_encoder = z_encoder
 
-        # Three separate 3‑layer MLPs as in the original DDSP decoder
-        self.mlp_f = mlp(1, hidden_size, 3)          # f(t)
-        self.mlp_l = mlp(1, hidden_size, 3)          # l(t)
-        self.mlp_z = mlp(z_encoder.z_dims, hidden_size, 3)  # z(t)
-        self.gru = gru(3, hidden_size)
-
-        # Concatenate GRU output with f‑ and l‑MLP outputs (z is **not** appended, per paper)
-        self.out_mlp = mlp(hidden_size * 3, hidden_size, 3)
-
-        # Heads
-        # GEQ (graphic EQ) gains head – size depends on chosen band layout
-        # Build GEQ band layout (one‑third‑octave bands)
-        self.sample_rate = 16000  # set to your dataset SR
+        # GEQ layout (one‑third‑octave bands)
+        self.sample_rate = internal_sr
         cf, sh = eq_freqs(interval=3)
-        # Clamp bands to be valid for our SR (avoid > Nyquist)
-        nyq = self.sample_rate * 0.5
         nyq = self.sample_rate * 0.5
         cf = torch.as_tensor(cf, dtype=torch.float32)
         cf = cf[cf <= (nyq * 0.98)]
-        self.geq_centers = cf  # tensor of center frequencies (Hz)
-        # shelving crossovers as tensor of length 2 (low & high)
+        self.geq_centers = cf
         sh = torch.as_tensor(sh, dtype=torch.float32)
         sh = torch.stack([torch.clamp(sh[0], min=20.0), torch.clamp(sh[1], max=nyq * 0.98)])
         self.geq_shelves = sh
-        # Two shelves + one peak per 1/3‑octave center
-        self.n_geq = int(self.geq_centers.numel() + 3)  # two shelves + one peak per 1/3‑octave center
+        self.n_geq = int(self.geq_centers.numel() + 3)
         self.max_gain_db = 12.0
 
-        # MLP head to predict per‑band dB gains
-        self.geq_head = nn.Linear(hidden_size, self.n_geq)
-
-        # Per‑frame loop design parameters (g, b1, b2) – raw logits, linear head
-        self.coefficients_head = nn.Linear(hidden_size, loop_order + 1)  # [g_logit, b1_logit, b2_logit]
-
-        # Time‑varying gain head (applied to excitation before GEQ)
-        self.gain_head = nn.Linear(hidden_size, 1)
-
-        # Create a buffer for GRU state
-        self.register_buffer("cache_gru", torch.zeros(1, 1, hidden_size))
-
-        # ----------  differentiable KS decoder  ----------
-        self.decoder = DiffKS(
-            batch_size = batch_size,
-            internal_sr = internal_sr,
-            loop_order = loop_order,
-            loop_n_frames = z_encoder.z_time_steps if hasattr(z_encoder, 'z_time_steps') else 250,
-            interp_type = interpolation_type,
-            use_double_precision = False,
-            min_f0_hz = E2_HZ - 10,
+        # AST conditioner
+        self.z_encoder = ASTConditioner(
+            n_mels=128,
+            input_tdim=401,            # 4 s @ 10 ms hop -> ~401 mel frames
+            sample_rate=internal_sr,
+            embed_dim=768,             # ViT-Base width
+            loop_order=loop_order,
+            n_geq=self.n_geq,
+            do_normalize=True,
         )
 
-        # Decoder parameters are frozen, since it obtains its values from the autoencoder
+        cfg = self.z_encoder.backbone.config
+        # Derive the *content* time token count from the conditioner input_tdim (e.g., 401 → 39)
+        self.control_frames = ((int(self.z_encoder.input_tdim) - int(cfg.patch_size)) // int(cfg.time_stride)) + 1
+
+        # Differentiable KS decoder
+        self.decoder = DiffKS(
+            batch_size=batch_size,
+            internal_sr=internal_sr,
+            loop_order=loop_order,
+            loop_n_frames=self.control_frames,
+            interp_type=interpolation_type,
+            use_double_precision=False,
+            min_f0_hz=E2_HZ - 10,
+        )
         for p in self.decoder.parameters():
             p.requires_grad = False
 
+    # --- training helpers -------------------------------------------------
+    def freeze_backbone(self) -> None:
+        """Freeze AST backbone; keep heads trainable. Decoder stays frozen."""
+        if hasattr(self, "z_encoder") and hasattr(self.z_encoder, "freeze_backbone"):
+            self.z_encoder.freeze_backbone()
 
-    def forward(
-            self,
-            pitch,
-            loudness,
-            audio,
-            audio_sr,
-            return_parameters=False
-    ):
-        """
-        Forward pass of the neural Karplus-Strong model.
+    def unfreeze_all(self) -> None:
+        """Unfreeze backbone and heads. Decoder remains frozen by design."""
+        if hasattr(self, "z_encoder") and hasattr(self.z_encoder, "unfreeze_all"):
+            self.z_encoder.unfreeze_all()
 
-        Args:
-            pitch: Tensor of shape [batch_size, frames, 1] - pitch values (f0)
-            loudness: Tensor of shape [batch_size, frames, 1] - Loudness values
-
-        Returns:
-            If `return_parameters` is False:
-                Tensor of shape [batch_size, n_samples] — synthesized audio.
-            If `return_parameters` is True:
-                Tuple (loop_coeffs_c, geq_info) where:
-                    loop_coeffs_c: Tensor [B, T, 3] of raw loop coefficients logits [g, b1, b2].
-                    geq_info: dict with keys "centers_hz", "shelves_hz", and "gains_db".
-        """
-        # ─── build the full‑resolution hidden sequence ───────────────────────
-        z = self.z_encoder(audio, f0_scaled=pitch)  # [B, T, z_dim]
-        x_f = self.mlp_f(pitch)                      # [B, T, H]
-        x_l = self.mlp_l(loudness)                   # [B, T, H]
-        x_z = self.mlp_z(z)                          # [B, T, H]
-
-        gru_in  = torch.cat([x_f, x_l, x_z], -1)     # [B, T, 3H]
-        gru_out = self.gru(gru_in)[0]               # [B, T, H]
-
-        hidden  = torch.cat([gru_out, x_f, x_l], -1) # [B, T, 3H]
-        hidden  = self.out_mlp(hidden)               # [B, T, H]
-
-        # --- Predict GEQ gains from hidden; pool across time to make them static per example
-        h_pool = hidden.mean(dim=1)               # [B, H]
-        geq_logits = self.geq_head(h_pool)        # [B, K] – K = self.n_geq
-        gains_db   = self.max_gain_db * torch.tanh(geq_logits)  # clamp to ±max_gain_db
-
-        # ─── 3. Onset-based excitation (DiffKS) ────────────────────────────────
+    def forward(self,
+                pitch,
+                _loudness,
+                audio,
+                audio_sr,
+                return_parameters=False):
         B, N = audio.shape
-        T = pitch.size(1)  # number of pitch frames
-        # (No inversion) — detect onsets directly on the target audio (moved earlier for segment attention)
+        T_frames = pitch.size(1)
+
+        # 1) Predict frame-wise parameters and global EQ gains
+        g_db_frames, l_b_frames, geq_logits = self.z_encoder.predict_parameters(
+            audio=audio,
+        )
+
+        gains_db = self.max_gain_db * torch.tanh(geq_logits)
+
+        # 2) Onset-based excitation
         onset_list = []
         for b in range(B):
             on_b = detect_onsets_librosa(
@@ -248,16 +262,10 @@ class AE_KarplusModel(nn.Module):
                 on_b = np.array([0], dtype=int)
             onset_list.append(on_b)
 
-        # Helper: map sample index → pitch frame index
         def sample_to_frame_idx(s: int) -> int:
-            # linear mapping with clamp
-            idx = int(round(s * T / max(1, N)))
-            return max(0, min(T - 1, idx))
+            idx = int(round(s * T_frames / max(1, N)))
+            return max(0, min(T_frames - 1, idx))
 
-        # Per-frame head (simple MLP projection)
-        l_b_frames = self.coefficients_head(hidden)  # [B, T, 3]
-
-        # Build bursts per item with per-onset length derived from local pitch,
         exc_rows = []
         for b in range(B):
             exc_b = torch.zeros(1, N, device=audio.device, dtype=audio.dtype)
@@ -267,7 +275,6 @@ class AE_KarplusModel(nn.Module):
                 f0_loc = float(torch.clamp(pitch[b, f_idx, 0], min=E2_HZ).item())
                 L_loc = int(round(float(audio_sr) / max(f0_loc, 1e-6)))
 
-                # Generate a single-burst noise at this onset (unscaled reference)
                 nb = make_onset_noise(
                     onset_samples=np.array([s], dtype=int),
                     num_samples=N,
@@ -280,51 +287,53 @@ class AE_KarplusModel(nn.Module):
 
                 burst_start = s
                 burst_end   = min(burst_start + L_loc, N)
-                seg_noi     = nb[:, burst_start:burst_end]  # [1, L]
+                seg_noi     = nb[:, burst_start:burst_end]
 
                 nb_scaled = nb.clone()
-                nb_scaled[:, burst_start:burst_end] = seg_noi #* gain
+                nb_scaled[:, burst_start:burst_end] = seg_noi
                 exc_b = exc_b + nb_scaled
             exc_rows.append(exc_b)
 
-        excitation = torch.cat(exc_rows, dim=0)       # [B, N]
+        excitation = torch.cat(exc_rows, dim=0)  # [B, N]
+        excitation_pregain = excitation
 
-        # --- Time‑varying gain applied to bursts before GEQ ---
-        # Asymmetric dB mapping: [-inf, +12] dB (no cap on attenuation, +12 dB max boost)
-        # g_db(x) = 12 - (12/ln 2) * softplus(x); g_db(0)=0 dB, g_db→12 dB as x→-inf, g_db→-inf as x→+inf
-        g_logits = self.gain_head(hidden)  # [B, T, 1]
-        g_db = 12.0 - (12.0 / math.log(2.0)) * F.softplus(g_logits)
-
-        gain_frames = torch.pow(10.0, g_db / 20.0)  # dB → linear; (0, 10^(12/20)]
-        # Numerical floor to avoid exact zeros that can kill gradients
+        # 3) Time‑varying gain (framewise) applied before GEQ
+        gain_frames = torch.sigmoid(g_db_frames)
+        gain_frames = torch.pow(10.0, gain_frames / 20.0)
         gain_frames = torch.clamp(gain_frames, min=1e-6)
-
-        gain_up = F.interpolate(gain_frames.transpose(1, 2), size=N, mode="linear", align_corners=False).squeeze(1)
+        gain_up = F.interpolate(gain_frames.transpose(1, 2), size=N, mode="nearest").squeeze(1)
         excitation = excitation * gain_up
+        excitation_postgain = excitation
 
-        # Graphic‑EQ shaping (learnable dB gains) in frequency domain
+        # 4) Graphic‑EQ shaping
         excitation = self._apply_geq_fd(
-            excitation,   # [B, N]
-            gains_db=gains_db,  # [B, K]
+            excitation,
+            gains_db=gains_db,
             sr=audio_sr,
         )
 
         if return_parameters:
-            loop_coeffs_c = self.decoder.design_loop(f0= pitch.squeeze(2), l_b=l_b_frames)  # [B, T, 3] = [g_logit, b1_logit, b2_logit]
+            f0_for_params = F.interpolate(
+                pitch.squeeze(2).unsqueeze(1),
+                size=self.decoder.loop_n_frames,
+                mode='linear',
+                align_corners=False,
+            ).squeeze(1)
+            loop_coeffs_c = self.decoder.design_loop(f0=f0_for_params, l_b=l_b_frames, return_gain=True)
             geq_info = {
                 "centers_hz": self.geq_centers.detach().cpu(),
                 "shelves_hz": self.geq_shelves.detach().cpu(),
                 "gains_db":    gains_db.detach().cpu(),
             }
-            return loop_coeffs_c, geq_info
+            return loop_coeffs_c, geq_info, gain_frames, gain_up, excitation_pregain, excitation_postgain, excitation
 
+        # 5) Synthesize with DiffKS
         out = self.decoder(
             f0_frames=pitch.squeeze(2),
             input=excitation,
             input_sr=audio_sr,
-            loop_coefficients=l_b_frames,  # feed raw logits [g, b1, b2] directly (no upsampling)
+            loop_coefficients=l_b_frames,
         )
-
         return out
 
     def _apply_geq_fd(self, x: torch.Tensor, gains_db: torch.Tensor, sr: int) -> torch.Tensor:
@@ -399,6 +408,36 @@ class AE_KarplusModel(nn.Module):
             makeup   = pre_rms / (post_rms + 1e-12)
             y = y * makeup
 
+            # --- Per-burst DC removal (POST-GEQ): detect active regions on y and subtract local mean ---
+            # Build a robust activity mask from the post-EQ signal. Use a relative threshold
+            # to include the ring-down so we don't introduce clicks at the burst edges.
+            abs_y = y.abs()
+            # Threshold at ~-60 dB of the peak, with a small floor for numerical stability
+            thr = torch.maximum(abs_y.max() * y.new_tensor(1e-3), y.new_tensor(1e-8))
+            mask = abs_y >= thr
+            if bool(mask.any()):
+                m = mask.to(torch.int8)
+                dm = m[1:] - m[:-1]
+                starts = torch.nonzero(dm == 1, as_tuple=False).squeeze(-1) + 1
+                ends   = torch.nonzero(dm == -1, as_tuple=False).squeeze(-1) + 1
+                if bool(m[0]):
+                    starts = torch.cat([torch.tensor([0], device=y.device, dtype=starts.dtype), starts], dim=0) if starts.numel() else torch.tensor([0], device=y.device, dtype=torch.long)
+                if bool(m[-1]):
+                    ends = torch.cat([ends, torch.tensor([N], device=y.device, dtype=ends.dtype)], dim=0) if ends.numel() else torch.tensor([N], device=y.device, dtype=torch.long)
+                if starts.numel() and ends.numel():
+                    count = min(starts.numel(), ends.numel())
+                    starts = starts[:count]
+                    ends   = ends[:count]
+                    for s_idx, e_idx in zip(starts.tolist(), ends.tolist()):
+                        if e_idx > s_idx:
+                            seg = y[s_idx:e_idx]
+                            seg_mean = seg.mean()
+                            y[s_idx:e_idx] = seg - seg_mean
+
             y_list.append(y.to(dtype=x.dtype))
 
+
         return torch.stack(y_list, dim=0)
+    def trainable_parameters(self):
+        """Return only parameters that require gradients (useful if freezing legacy path)."""
+        return [p for p in self.parameters() if p.requires_grad]

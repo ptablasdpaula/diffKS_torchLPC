@@ -25,6 +25,10 @@ def detect_onsets_librosa(x: Union[torch.Tensor, np.ndarray],
                                              hop_length=hop_length,
                                              backtrack=backtrack,
                                              units="frames")
+    # Deduplicate identical frame indices
+    onset_frames = np.asarray(onset_frames, dtype=int)
+    if onset_frames.size:
+        onset_frames = np.unique(onset_frames)
     onset_samples = librosa.frames_to_samples(onset_frames, hop_length=hop_length)
 
     # undo the left pad and keep valid onsets
@@ -40,15 +44,33 @@ def make_onset_noise(onset_samples: np.ndarray,
                      device=None,
                      dtype=None,
                      noise_ms: float = 10.0,
-                     burst_len_samples: int | None = None) -> torch.Tensor:
+                     burst_len_samples: int | None = None,
+                     seed: int | None = 12345,
+                     generator: torch.Generator | None = None) -> torch.Tensor:
     """
     Create [B, N] mostly‑zero signal with uniform noise bursts in [-1, 1].
     If `burst_len_samples` is provided, it overrides `noise_ms` for burst length.
+    Determinism: pass a `seed` or a pre‑constructed `generator` to get repeatable bursts.
     """
     if device is None:
         device = torch.device("cpu")
     if dtype is None:
         dtype = torch.float32
+
+    # Optional deterministic RNG for repeatable bursts
+    if generator is None:
+        # Create a generator tied to the target device for torch.rand (supports cpu/cuda/mps)
+        gen_device = 'cpu'
+        if device is not None and hasattr(device, 'type'):
+            if device.type in ('cpu', 'cuda', 'mps'):
+                gen_device = device.type
+        generator = torch.Generator(device=gen_device)
+        if seed is not None:
+            generator.manual_seed(int(seed))
+    else:
+        # If a generator was provided, ensure it's seeded if requested
+        if seed is not None:
+            generator.manual_seed(int(seed))
 
     if burst_len_samples is not None:
         seg_len = max(1, int(burst_len_samples))
@@ -63,7 +85,7 @@ def make_onset_noise(onset_samples: np.ndarray,
         if start >= num_samples:
             continue
         end = min(start + seg_len, num_samples)
-        # zero‑mean uniform noise in [-0.5, 0.5]
-        noise = torch.rand(batch_size, end - start, device=device, dtype=dtype) - 0.5
+        # zero‑mean uniform noise in [-1, +1]
+        noise = torch.rand(batch_size, end - start, device=device, dtype=dtype, generator=generator) * 2 - 1
         sig[:, start:end] = noise
     return sig

@@ -2,88 +2,21 @@ from tqdm import tqdm
 import numpy as np
 import soundfile as sf
 import torch, torch.optim as optim, wandb
-from third_party.auraloss.auraloss.freq import MultiResolutionSTFTLoss
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from .model import AE_KarplusModel, MfccTimeDistributedRnnEncoder
+from .model import nnKarplusStrong
 import argparse, os
 import multiprocessing as mp
 import psutil
 
 from collections import defaultdict
 
-
-def plot_composite_four(fig_path: str,
-                       target: np.ndarray,
-                       reconstructed: np.ndarray,
-                       loop_coeffs_c: np.ndarray,
-                       eq_gains: np.ndarray,
-                       sr: int) -> None:
-    """
-    Create a 4-panel composite:
-      1) Target waveform
-      2) Reconstructed waveform
-      3) Loop filter coefficients
-      4) EQ Band Gains (per-band dB)
-    Saves to `fig_path`.
-    """
-    import matplotlib.pyplot as plt
-    import numpy as np
-
-    n_rows, n_cols = 2, 2
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(12, 7))
-    axes = axes.ravel()
-
-    # 1) Target waveform
-    ax = axes[0]
-    t = np.arange(len(target)) / sr
-    ax.plot(t, target)
-    ax.set_title("Target")
-    ax.set_xlabel("Time (s)")
-
-    # 2) Reconstructed waveform
-    ax = axes[1]
-    t_rec = np.arange(len(reconstructed)) / sr
-    ax.plot(t_rec, reconstructed)
-    ax.set_title("Reconstructed")
-    ax.set_xlabel("Time (s)")
-
-    # 3) Loop filter coefficients
-    ax = axes[2]
-    if loop_coeffs_c is not None:
-        for k in range(loop_coeffs_c.shape[1]):
-            ax.plot(np.arange(loop_coeffs_c.shape[0]), loop_coeffs_c[:, k], label=f"b{k}")
-        ax.set_title("Loop Coefficients")
-        ax.set_xlabel("Tap Index")
-        ax.set_ylabel("Coefficient")
-        ax.legend(fontsize=8)
-    else:
-        ax.text(0.5, 0.5, "(loop coeffs unavailable)", ha="center", va="center")
-        ax.set_title("Loop Coefficients")
-
-    # 4) EQ Band Gains
-    ax = axes[3]
-    ax.set_title("EQ Band Gains")
-    if eq_gains is not None and len(eq_gains) > 0:
-        band_indices = np.arange(1, len(eq_gains)+1)
-        ax.plot(band_indices, eq_gains, marker='o', linestyle='-')
-        ax.set_xlabel("Band Index")
-        ax.set_ylabel("Gain (dB)")
-        ax.set_ylim([-12, 12])
-        ax.set_xticks(band_indices)
-        ax.grid(True, which="both", alpha=0.2)
-    else:
-        ax.text(0.5, 0.5, "(no EQ gains)", ha="center", va="center")
-        ax.set_xlabel("Band Index")
-        ax.set_ylabel("Gain (dB)")
-
-    fig.tight_layout()
-    fig.savefig(fig_path, dpi=150)
-    plt.close(fig)
-
-
 from paths import NSYNTH_PREPROCESSED_DIR
-from data.preprocess import NsynthDataset
+from data.preprocess import NsynthDataset, a_weighted_loudness
 from utils.misc import get_device, str2bool
+
+from .losses import _frame_env, build_smooth_mrstft
+from .plotters import plot_composite_four, _resample_to_len, plot_excitation_composite_zoomed
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -108,8 +41,6 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=int(env("BATCH_SIZE", 1)))
     p.add_argument("--num_workers", type=int, default=int(env("NUM_WORKERS", 2)))
 
-    # ─── Model size ────────────────────────────────────────────────────────
-    p.add_argument("--hidden_size", type=int, default=int(env("HIDDEN_SIZE", 512)))
 
     # ─── DiffKS filter configuration ───────────────────────────────────────
     p.add_argument("--l_order", type=int, default=int(env("L_ORDER", 2)))
@@ -124,8 +55,16 @@ def parse_args():
 
     # ─── Losses weights ────────────────────────────────────────────────────
     p.add_argument("--stft_weight", type=float, default=float(env("STFT_WEIGHT", 1.0)))
+    p.add_argument("--loud_weight", type=float, default=float(env("LOUD_WEIGHT", 0.0)),
+                   help="Weight for the A-weighted loudness loss (L2/MSE on per-frame log-power).")
+    p.add_argument("--env_weight", type=float, default=float(env("ENV_WEIGHT", 0.0)),
+                   help="Weight for the envelope loss (L1 on framewise |x|).")
 
-    # ─── Testing mode ────────────────────────────────────────────────────
+    # ─── Stages ────────────────────────────────────────────────────────────
+    p.add_argument("--stage0_steps", type=int, default=int(env("STAGE0_STEPS", 5000)),
+                   help="Number of steps with backbone frozen (stage 0). Then unfreeze all (stage 1). 0 disables stage 0.")
+
+    # ─── Testing mode ──────────────────────────────────────────────────────
     p.add_argument("--test", action="store_true",
                    default=str2bool(env("TEST", "false")),
                    help="If set, load the NSynth 'test' split for both training and validation")
@@ -164,16 +103,29 @@ def print_trainable_summary(model, optimizer):
         print(f"  - {k:24s}: {comp_counts[k]:4d} tensors | {comp_paramnums[k]:8d} params")
     print(f"  Total trainable params: {total}")
     # Optimizer groups summary
-    try:
-        import torch.optim as _optim
-        if isinstance(optimizer, _optim.Optimizer):
-            print("[OPTIMIZER] param groups:")
-            for i, g in enumerate(optimizer.param_groups):
-                lr = g.get('lr', None)
-                n = sum(p.numel() for p in g['params'])
-                print(f"  group {i}: lr={lr} | params={n}")
-    except Exception:
-        pass
+    if isinstance(optimizer, optim.Optimizer):
+        print("[OPTIMIZER] param groups:")
+        for i, g in enumerate(optimizer.param_groups):
+            lr = g.get('lr', None)
+            n = sum(p.numel() for p in g['params'])
+            print(f"  group {i}: lr={lr} | params={n}")
+    # Optional: breakdown of z_encoder heads if present
+    if hasattr(model, "z_encoder"):
+        z = model.z_encoder
+        def _count(mod):
+            if mod is None:
+                return 0, 0
+            t = sum(1 for p in mod.parameters() if p.requires_grad)
+            n = sum(p.numel() for p in mod.parameters() if p.requires_grad)
+            return t, n
+        print("[TRAINABLE] z_encoder breakdown:")
+        for label, mod in (
+            ("z_encoder.gain_head", getattr(z, "gain_head", None)),
+            ("z_encoder.loop_head", getattr(z, "loop_head", None)),
+            ("z_encoder.geq_head",  getattr(z, "geq_head",  None)),
+        ):
+            t, n = _count(mod)
+            print(f"  - {label:24s}: {t:4d} tensors | {n:8d} params")
 
 
 def print_grad_snapshot(model, components=None):
@@ -197,13 +149,72 @@ def print_grad_snapshot(model, components=None):
         else:
             print(f"  - {k:24s}: {sum(vals)/len(vals):.6e} (n={len(vals)})")
 
+# --- NEW: Print gradients for z_encoder heads (gain_head, loop_head, geq_head) if present
+def print_ast_head_grads(model):
+    """Print mean |grad| for z_encoder heads (gain_head, loop_head, geq_head) if present."""
+    if not hasattr(model, "z_encoder"):
+        return
+    z = model.z_encoder
+    lines = ["[Z_ENCODER HEAD GRADS]"]
+    for label, mod in (
+        ("z_encoder.gain_head", getattr(z, "gain_head", None)),
+        ("z_encoder.loop_head", getattr(z, "loop_head", None)),
+        ("z_encoder.geq_head",  getattr(z, "geq_head",  None)),
+    ):
+        if mod is None:
+            lines.append(f"  - {label:24s}: (missing)")
+            continue
+        vals = []
+        for p in mod.parameters():
+            if p.requires_grad and p.grad is not None:
+                vals.append(p.grad.detach().abs().mean().item())
+        if len(vals) == 0:
+            lines.append(f"  - {label:24s}: (no grads)")
+        else:
+            lines.append(f"  - {label:24s}: {sum(vals)/len(vals):.6e}")
+    print("\n".join(lines))
+
+# -----------------------------------------------------------------
+# Staged training helpers
+
+
+def set_stage0_backbone_frozen(model) -> None:
+    """Stage 0: freeze AST backbone, train mel-attn + heads."""
+    assert hasattr(model, "freeze_backbone"), (
+        "Model is expected to expose freeze_backbone(); update the model or this call site."
+    )
+    model.freeze_backbone()
+    # Always keep decoder frozen
+    for name, p in model.named_parameters():
+        if name.startswith("decoder."):
+            p.requires_grad = False
+
+def set_stage1_unfreeze_all(model) -> None:
+    """Stage 1: unfreeze all learnable parts except the differentiable decoder."""
+    assert hasattr(model, "unfreeze_all"), (
+        "Model is expected to expose unfreeze_all(); update the model or this call site."
+    )
+    model.unfreeze_all()
+    # Ensure decoder remains frozen
+    for name, p in model.named_parameters():
+        if name.startswith("decoder."):
+            p.requires_grad = False
+
+def rebuild_optimizer(optimizer, model, lr):
+    """Recreate optimizer after changing requires_grad flags."""
+    del optimizer
+    optimizer = build_optimizer(model, lr)
+    print("[STAGE] Rebuilt optimizer for new trainable set")
+    print_trainable_summary(model, optimizer)
+    return optimizer
+# -----------------------------------------------------------------
+
 def main():
     args = parse_args()
     # If --test is enabled, override splits to use the NSynth 'test' subset
     split_train = "test" if args.test else "train"
     split_val   = "test" if args.test else "valid"
     config = {
-        "hidden_size": args.hidden_size,
         "loop_order": args.l_order,
         "sample_rate": 16000,
         "ks_sample_rate": 16000,
@@ -221,8 +232,10 @@ def main():
         "pitch_mode": args.pitch_mode,
         "batches_per_epoch": args.batches_per_epoch,
         "stft_weight": args.stft_weight,
+        "loud_weight": args.loud_weight,
+        "env_weight": args.env_weight,
+        "stage0_steps": args.stage0_steps,
     }
-
 
     print("\n▶ Running with config:")
     for k, v in vars(args).items():
@@ -293,23 +306,29 @@ def main():
     n_plot = min(fixed_audio.size(0), 5)
 
     # ─── Start Model, optimizer & Loss ────────────────────────── #
-    model = AE_KarplusModel(
+    model = nnKarplusStrong(
         batch_size=config["batch_size"],
-        hidden_size=config["hidden_size"],
         loop_order=config["loop_order"],
         internal_sr=config["ks_sample_rate"],
         interpolation_type=config["interpolation_type"],
-        z_encoder=MfccTimeDistributedRnnEncoder(),
     ).to(device)
+
+    # ---- Stage scheduling (stage 0 → stage 1) ----------------------------
+    current_stage = 0 if config["stage0_steps"] > 0 else 1
+    if current_stage == 0:
+        print("[STAGE 0] Freezing AST backbone; training mel-attn + heads only")
+        set_stage0_backbone_frozen(model)
+    else:
+        print("[STAGE 1] Training all (except decoder)")
+        set_stage1_unfreeze_all(model)
+
     optimizer = build_optimizer(model, lr=config["learning_rate"])
+    if wandb.run is not None:
+        wandb.log({"stage": int(current_stage)})
+
     print_trainable_summary(model, optimizer)
-    global_step = 0
     # STFT loss
-    mr_stft = MultiResolutionSTFTLoss(
-        perceptual_weighting=True,
-        scale_invariance=False,
-        sample_rate=config["sample_rate"],
-    )
+    mr_stft = build_smooth_mrstft()
     mr_stft = mr_stft.to(device)
     mr_stft = mr_stft.float()
 
@@ -332,7 +351,16 @@ def main():
 
         print(f"[RESUME] Starting at epoch {start_epoch} (best so far {best_val_loss:.4f})")
 
+    # Derive starting global step if resuming, to keep stage schedule consistent
     bpe = min(len(train_loader), config["batches_per_epoch"])
+    global_step = start_epoch * bpe
+
+    # If we've already passed stage0_steps when resuming, advance to stage 1
+    if current_stage == 0 and global_step >= config["stage0_steps"]:
+        print(f"[STAGE TRANSITION @ startup] global_step={global_step} ≥ stage0_steps={config['stage0_steps']} → unfreezing all")
+        set_stage1_unfreeze_all(model)
+        optimizer = rebuild_optimizer(optimizer, model, lr=config["learning_rate"])
+        current_stage = 1
 
     # ─── Early-stopping bookkeeping ───────────────────────────── #
     epochs_since_improve = 0
@@ -359,18 +387,38 @@ def main():
             if batch_idx >= config["batches_per_epoch"]:
                 break
             audio, pitch, loud = audio.to(device), pitch.to(device), loud.to(device)
-            recon = model(
-                pitch=pitch,
-                loudness=loud,
-                audio=audio,
-                audio_sr=config["sample_rate"],
-            )
+            recon = model(pitch, loud, audio, config["sample_rate"])
             assert recon.shape[1] == audio.shape[1], (
                 f"Decoder returned {recon.shape[1]} samples, "
                 f"but target has {audio.shape[1]}.")
 
             stft_loss = mr_stft(recon.unsqueeze(1), audio.unsqueeze(1)) * args.stft_weight
-            loss = stft_loss
+
+            # A-weighted loudness loss (per-frame, log-power). No alignment, no try/except.
+            # recon/audio are [B,N]; target loudness `loud` is [B,T] or [B,T,1].
+            pred_loud = a_weighted_loudness(recon)        # [B, F_pred]
+            tgt_loud  = loud
+            if tgt_loud.dim() == 3 and tgt_loud.size(-1) == 1:
+                tgt_loud = tgt_loud.squeeze(-1)           # [B, F_tgt]
+
+            # Enforce exact shape match to avoid broadcasting
+            pred_loud = pred_loud.reshape(pred_loud.size(0), -1)
+            tgt_loud  = tgt_loud.reshape(tgt_loud.size(0), -1)
+            if pred_loud.size(1) != tgt_loud.size(1):
+                raise RuntimeError(
+                    f"Loudness frames mismatch: pred {pred_loud.size(1)} vs target {tgt_loud.size(1)}. "
+                    f"Ensure HOP_SIZE and framing match in a_weighted_loudness() and dataset 'loud'.")
+
+            # L2 (MSE) on log-power loudness frames
+            loudness_loss = F.mse_loss(pred_loud, tgt_loud)
+
+            # Envelope loss (phase-agnostic, time-local). Use same frame count as loudness.
+            num_frames = pred_loud.size(1)
+            env_pred = _frame_env(recon, num_frames)  # [B,F]
+            env_tgt = _frame_env(audio, num_frames)  # [B,F]
+            env_loss = F.l1_loss(env_pred, env_tgt)
+
+            loss = stft_loss + args.loud_weight * loudness_loss + args.env_weight * env_loss
             # Abort early if loss is NaN or Inf
             if not torch.isfinite(loss):
                 print(f"[ABORT] Non-finite loss detected at epoch {epoch}, batch {batch_idx}: {loss.item()}")
@@ -386,11 +434,10 @@ def main():
                     model,
                     components=[
                         "z_encoder",
-                        "coefficients_head",
-                        "geq_head",
-                        "gain_head",
                     ],
                 )
+            if batch_idx == 0:
+                print_ast_head_grads(model)
 
             # Accumulate per-component mean absolute gradient (this batch)
             for name, p in model.named_parameters():
@@ -403,7 +450,23 @@ def main():
             optimizer.step()
 
             global_step += 1
+
+            # Stage transition: when reaching stage0_steps, unfreeze all
+            if current_stage == 0 and global_step >= config["stage0_steps"]:
+                print(f"[STAGE TRANSITION] Hit global_step={global_step} → switching to Stage 1 (unfreeze all)")
+                set_stage1_unfreeze_all(model)
+                optimizer = rebuild_optimizer(optimizer, model, lr=config["learning_rate"])
+                current_stage = 1
+                if wandb.run is not None:
+                    wandb.log({"stage": 1, "global_step": int(global_step)})
+
             log_train_batch(loss.item())
+            if wandb.run is not None:
+                wandb.log({
+                    "train/loss_stft": float(stft_loss.item()),
+                    "train/loss_loud": float((args.loud_weight * loudness_loss).item()),
+                    "train/loss_env": float((args.env_weight * env_loss).item()),
+                })
 
             t_loss += loss.item()
             batches_processed += 1
@@ -440,12 +503,7 @@ def main():
             with torch.no_grad():
                 for audio, pitch, loud in val_loader:
                     audio, pitch, loud = audio.to(device), pitch.to(device), loud.to(device)
-                    recon_std = model(
-                        pitch=pitch,
-                        loudness=loud,
-                        audio=audio,
-                        audio_sr=config["sample_rate"],
-                    )
+                    recon_std = model(pitch, loud, audio, config["sample_rate"])
                     assert recon_std.shape[1] == audio.shape[1]
                     loss_std = mr_stft(recon_std.unsqueeze(1), audio.unsqueeze(1))
                     v_losses_std.append(loss_std.item())
@@ -485,47 +543,39 @@ def main():
         # ─── AUDIO LOGS ──────────────────────────────────────────────────
         if epoch % config["eval_interval"] == 0:
             with torch.no_grad():
-
-
                 a, p, l = fixed_audio.to(device), fixed_pitch.to(device), fixed_loud.to(device)
 
-                rec = model(
-                    pitch=p,
-                    loudness=l,
-                    audio=a,
-                    audio_sr=config["sample_rate"],
-                )
+                rec = model(p, l, a, config["sample_rate"])
                 assert rec.shape[1] == a.shape[1]
 
-                # Fetch parameter info only
-                _lc, _geq = model(
-                    pitch=p,
-                    loudness=l,
-                    audio=a,
-                    audio_sr=config["sample_rate"],
-                    return_parameters=True,
+                # Fetch parameter info and internal signals
+                _lc, _geq, gain_frames_b, gain_up_b, excitation_pregain_b, excitation_postgain_b, excitation_b = model(
+                    p, l, a, config["sample_rate"], return_parameters=True
                 )
                 gains_db_batch = _geq["gains_db"]  # [B, K]
                 if gains_db_batch is not None:
-                    try:
-                        gcpu = gains_db_batch.detach().cpu()
-                        same = bool(torch.allclose(gcpu, gcpu[0:1].expand_as(gcpu), atol=1e-6)) if gcpu.size(0) > 1 else True
-                        per_band_std = float(gcpu.std(dim=0).mean().item()) if gcpu.ndim == 2 else float("nan")
-                        print(
-                            f"[GEQ DBG] batch_size={gcpu.size(0)} bands={gcpu.size(1) if gcpu.ndim==2 else 'NA'} "
-                            f"mean(per-band std)={per_band_std:.6f} dB | identical_across_batch={same} | "
-                            f"min={gcpu.min().item():.3f} dB max={gcpu.max().item():.3f} dB"
-                        )
-                    except Exception:
-                        pass
+                    gcpu = gains_db_batch.detach().cpu()
+                    same = bool(torch.allclose(gcpu, gcpu[0:1].expand_as(gcpu), atol=1e-6)) if gcpu.size(0) > 1 else True
+                    per_band_std = float(gcpu.std(dim=0).mean().item()) if gcpu.ndim == 2 else float("nan")
+                    print(
+                        f"[GEQ DBG] batch_size={gcpu.size(0)} bands={gcpu.size(1) if gcpu.ndim==2 else 'NA'} "
+                        f"mean(per-band std)={per_band_std:.6f} dB | identical_across_batch={same} | "
+                        f"min={gcpu.min().item():.3f} dB max={gcpu.max().item():.3f} dB"
+                    )
 
                 # Save & log a few examples
                 media_log = {}
                 for idx in range(n_plot):
                     wave_orig = a[idx].cpu().numpy()
                     wave_rec  = rec[idx].cpu().numpy()
-                    # Concatenate target || recon for quick listening
-                    sample_cat = np.concatenate([wave_orig, wave_rec], axis=0)
+                    wave_exc  = excitation_b[idx].detach().cpu().numpy() if isinstance(excitation_b, torch.Tensor) else np.asarray(excitation_b[idx])
+
+                    # Ensure excitation is same length as audio for clean concatenation
+                    if len(wave_exc) != len(wave_orig):
+                        wave_exc = _resample_to_len(wave_exc, len(wave_orig))
+
+                    # Concatenate target || excitation || recon for quick listening
+                    sample_cat = np.concatenate([wave_orig, wave_exc, wave_rec], axis=0)
                     peak = float(np.max(np.abs(sample_cat))) if sample_cat.size > 0 else 0.0
                     sample_cat = sample_cat / peak * 0.99 if peak > 0 else sample_cat
 
@@ -538,10 +588,8 @@ def main():
                         media_log[f"audio_{idx}"] = wandb.Audio(
                             sample_cat,
                             sample_rate=config["sample_rate"],
-                            caption=f"epoch {epoch} | sample {idx} | target+recon",
+                            caption=f"epoch {epoch} | sample {idx} | target+excitation+recon",
                         )
-
-                # ---- Plotting of inversion debug info removed ----
 
                 # ---- Composite (4‑panel) per example -----------------------------
                 for idx in range(n_plot):
@@ -558,6 +606,31 @@ def main():
                         eq_gains=eq_gains_np,
                         sr=config["sample_rate"],
                     )
+
+                    # --- Excitation composite (3 stacked panels, zoomed on first trigger) ---
+                    pre_np  = excitation_pregain_b[idx].detach().cpu().numpy()
+                    post_np = excitation_postgain_b[idx].detach().cpu().numpy()
+                    exc_np  = excitation_b[idx].detach().cpu().numpy()
+                    gf_np   = gain_frames_b[idx].detach().cpu().numpy()
+                    gu_np   = gain_up_b[idx].detach().cpu().numpy()
+
+                    exc_comp_path = os.path.join(config["save_dir"], f"excitation_composite_zoom_e{epoch}_{idx}.png")
+                    plot_excitation_composite_zoomed(
+                        exc_comp_path,
+                        sr=config["sample_rate"],
+                        excitation_pregain=pre_np,
+                        excitation_postgain=post_np,
+                        excitation=exc_np,
+                        gain_frames=gf_np,
+                        gain_up=gu_np,
+                        pre_ms=10.0,
+                        post_ms=10.0,
+                    )
+
+                    if wandb.run is not None:
+                        media_log[f"excitation_composite_{idx}"] = wandb.Image(
+                            exc_comp_path, caption=f"Excitation composite (zoom) | e{epoch} i{idx}")
+
                     if wandb.run is not None:
                         media_log[f"composite_{idx}"] = wandb.Image(comp_path, caption=f"Composite | e{epoch} i{idx}")
 
