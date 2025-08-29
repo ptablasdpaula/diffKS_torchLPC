@@ -10,6 +10,7 @@ from core import make_onset_noise, detect_onsets_librosa
 from flamo.auxiliary.eq import eq_freqs, geq as geq_sos
 
 import math
+import re
 
 # ========================================================================
 # ASTConditioner: Audio-Spectrogram-Transformer based conditioner
@@ -98,14 +99,57 @@ class ASTConditioner(nn.Module):
         self._set_requires_grad(self.loop_head, True)
         self._set_requires_grad(self.geq_head, True)
 
-    def unfreeze_all(self) -> None:
-        """Unfreeze the entire conditioner (backbone + mel-attn + heads)."""
-        self._set_requires_grad(self.backbone, True)
+
+    def unfreeze_backbone_last(self,
+                               n_layers: int = 2,
+                               also_unfreeze_layernorm: bool = True,
+                               train_pos_embed: bool = False) -> None:
+        """Partially unfreeze the AST backbone.
+        Unfreezes the last `n_layers` Transformer blocks and (optionally) all
+        LayerNorm parameters and/or positional embeddings.
+        This is safer than unfreezing the whole backbone and often stabilizes
+        fine‑tuning.
+        """
+        # 1) Start from a fully frozen backbone
+        self._set_requires_grad(self.backbone, False)
+        # Put backbone in train mode so dropout etc. behave correctly; only the
+        # parameters we re‑enable below will receive grads.
+        self.backbone.train()
+
+        # 2) Determine total number of hidden layers, if available
+        total_layers = int(getattr(self.backbone.config, "num_hidden_layers", -1))
+
+        # 3) Re‑enable gradients for the last N encoder blocks by name pattern
+        # Works for HF models that expose modules like: *.encoder.layer.{i}.*
+        for name, p in self.backbone.named_parameters():
+            unfreeze = False
+
+            m = re.search(r"\.layer\.(\d+)\.", name)
+            if m is not None and total_layers > 0:
+                idx = int(m.group(1))
+                if idx >= max(0, total_layers - n_layers):
+                    unfreeze = True
+
+            # Optionally always let LayerNorms update (helps stability)
+            if also_unfreeze_layernorm:
+                lname = name.lower()
+                if ("layernorm" in lname) or (".ln" in lname) or ("norm" in lname):
+                    unfreeze = True or unfreeze
+
+            # Optionally allow positional embeddings to update
+            if train_pos_embed and ("pos_embed" in name or
+                                    "position_embeddings" in name or
+                                    "position_embedding" in name):
+                unfreeze = True or unfreeze
+
+            if unfreeze:
+                p.requires_grad = True
+
+        # 4) Ensure our heads remain trainable regardless
         self._set_requires_grad(self.mel_attn, True)
         self._set_requires_grad(self.gain_head, True)
         self._set_requires_grad(self.loop_head, True)
         self._set_requires_grad(self.geq_head, True)
-        self.backbone.train()
 
     def _logmel(self, audio: torch.Tensor) -> torch.Tensor:
         """Return normalized log-mel [B, M, Tm]."""
@@ -179,7 +223,8 @@ class nnKarplusStrong(nn.Module):
                    batch_size,
                    loop_order,
                    internal_sr,
-                   interpolation_type):
+                   interpolation_type,
+                   filter_type):
         super().__init__()
         self.internal_sr = internal_sr
         self.loop_order = loop_order
@@ -221,6 +266,7 @@ class nnKarplusStrong(nn.Module):
             interp_type=interpolation_type,
             use_double_precision=False,
             min_f0_hz=E2_HZ - 10,
+            loop_filter_kind=filter_type,
         )
         for p in self.decoder.parameters():
             p.requires_grad = False
@@ -231,17 +277,25 @@ class nnKarplusStrong(nn.Module):
         if hasattr(self, "z_encoder") and hasattr(self.z_encoder, "freeze_backbone"):
             self.z_encoder.freeze_backbone()
 
-    def unfreeze_all(self) -> None:
-        """Unfreeze backbone and heads. Decoder remains frozen by design."""
-        if hasattr(self, "z_encoder") and hasattr(self.z_encoder, "unfreeze_all"):
-            self.z_encoder.unfreeze_all()
+
+    def unfreeze_backbone_last(self,
+                               n_layers: int = 2,
+                               also_unfreeze_layernorm: bool = True,
+                               train_pos_embed: bool = False) -> None:
+        """Partially unfreeze the conditioner backbone (last N blocks)."""
+        if hasattr(self, "z_encoder") and hasattr(self.z_encoder, "unfreeze_backbone_last"):
+            self.z_encoder.unfreeze_backbone_last(
+                n_layers=n_layers,
+                also_unfreeze_layernorm=also_unfreeze_layernorm,
+                train_pos_embed=train_pos_embed,
+            )
 
     def forward(self,
                 pitch,
                 _loudness,
                 audio,
                 audio_sr,
-                return_parameters=False):
+                return_parameters=False,):
         B, N = audio.shape
         T_frames = pitch.size(1)
 
@@ -266,16 +320,18 @@ class nnKarplusStrong(nn.Module):
             idx = int(round(s * T_frames / max(1, N)))
             return max(0, min(T_frames - 1, idx))
 
-        exc_rows = []
+        # Build bursts-only excitation per batch (no impulses)
+        burst_rows = []
         for b in range(B):
-            exc_b = torch.zeros(1, N, device=audio.device, dtype=audio.dtype)
+            burst_b = torch.zeros(1, N, device=audio.device, dtype=audio.dtype)
             for s in onset_list[b]:
                 s = int(s)
                 f_idx = sample_to_frame_idx(s)
                 f0_loc = float(torch.clamp(pitch[b, f_idx, 0], min=E2_HZ).item())
                 L_loc = int(round(float(audio_sr) / max(f0_loc, 1e-6)))
 
-                nb = make_onset_noise(
+                # Noise-burst branch only
+                nb_burst = make_onset_noise(
                     onset_samples=np.array([s], dtype=int),
                     num_samples=N,
                     sample_rate=audio_sr,
@@ -283,29 +339,32 @@ class nnKarplusStrong(nn.Module):
                     device=audio.device,
                     dtype=audio.dtype,
                     burst_len_samples=L_loc,
+                    impulse_instead=False,
                 )  # [1, N]
 
-                burst_start = s
-                burst_end   = min(burst_start + L_loc, N)
-                seg_noi     = nb[:, burst_start:burst_end]
+                burst_b = burst_b + nb_burst
+            burst_rows.append(burst_b)
 
-                nb_scaled = nb.clone()
-                nb_scaled[:, burst_start:burst_end] = seg_noi
-                exc_b = exc_b + nb_scaled
-            exc_rows.append(exc_b)
+        exc_burst = torch.cat(burst_rows, dim=0)  # [B, N]
 
-        excitation = torch.cat(exc_rows, dim=0)  # [B, N]
-        excitation_pregain = excitation
+        # 3) Time‑varying gain (framewise), apply only to the burst branch in stages that learn gain
+        gain_frames = torch.pow(10.0, (-F.softplus(g_db_frames)) / 20.0)  # [B, T_f, 1]
+        gain_up = F.interpolate(
+            gain_frames.transpose(1, 2),  # -> [B, 1, T_f]
+            size=N,
+            mode="linear",
+            align_corners=False
+        ).squeeze(1)  # -> [B, N]
 
-        # 3) Time‑varying gain (framewise) applied before GEQ
-        gain_frames = torch.sigmoid(g_db_frames)
-        gain_frames = torch.pow(10.0, gain_frames / 20.0)
-        gain_frames = torch.clamp(gain_frames, min=1e-6)
-        gain_up = F.interpolate(gain_frames.transpose(1, 2), size=N, mode="nearest").squeeze(1)
-        excitation = excitation * gain_up
-        excitation_postgain = excitation
+        # Apply framewise gain to bursts (always)
+        exc_burst_scaled = exc_burst * gain_up
 
-        # 4) Graphic‑EQ shaping
+        # Bursts-only excitation
+        excitation_pregain = exc_burst
+        excitation_postgain = exc_burst_scaled
+        excitation = excitation_postgain
+
+        # 4) Graphic‑EQ shaping (always on)
         excitation = self._apply_geq_fd(
             excitation,
             gains_db=gains_db,
@@ -313,6 +372,7 @@ class nnKarplusStrong(nn.Module):
         )
 
         if return_parameters:
+            # Optional: external smoothness/regularization can use these parameters.
             f0_for_params = F.interpolate(
                 pitch.squeeze(2).unsqueeze(1),
                 size=self.decoder.loop_n_frames,
@@ -401,12 +461,6 @@ class nnKarplusStrong(nn.Module):
             Y = X * H
             # Time-domain signal after EQ
             y = torch.fft.irfft(Y, n=nfft).real[:N]
-
-            # --- Make-up gain: preserve overall RMS loudness of excitation ---
-            pre_rms  = torch.sqrt(torch.clamp((x[b] ** 2).mean(), min=1e-12))
-            post_rms = torch.sqrt(torch.clamp((y    ** 2).mean(), min=1e-12))
-            makeup   = pre_rms / (post_rms + 1e-12)
-            y = y * makeup
 
             # --- Per-burst DC removal (POST-GEQ): detect active regions on y and subtract local mean ---
             # Build a robust activity mask from the post-EQ signal. Use a relative threshold

@@ -2,7 +2,6 @@ from tqdm import tqdm
 import numpy as np
 import soundfile as sf
 import torch, torch.optim as optim, wandb
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from .model import nnKarplusStrong
 import argparse, os
@@ -12,10 +11,10 @@ import psutil
 from collections import defaultdict
 
 from paths import NSYNTH_PREPROCESSED_DIR
-from data.preprocess import NsynthDataset, a_weighted_loudness
+from data.preprocess import NsynthDataset
 from utils.misc import get_device, str2bool
 
-from .losses import _frame_env, build_smooth_mrstft
+from .losses import build_smooth_mrstft
 from .plotters import plot_composite_four, _resample_to_len, plot_excitation_composite_zoomed
 
 def parse_args():
@@ -38,31 +37,37 @@ def parse_args():
                    help="Minimum relative (fractional) validation-loss improvement to reset patience. 0.001 = 0.1 %")
 
     # ─── Data-loading ──────────────────────────────────────────────────────
-    p.add_argument("--batch_size", type=int, default=int(env("BATCH_SIZE", 1)))
+    p.add_argument("--batch_size", type=int, default=int(env("BATCH_SIZE", 16)))
     p.add_argument("--num_workers", type=int, default=int(env("NUM_WORKERS", 2)))
 
 
+
     # ─── DiffKS filter configuration ───────────────────────────────────────
-    p.add_argument("--l_order", type=int, default=int(env("L_ORDER", 2)))
+    p.add_argument("--l_order", type=int, default=int(env("L_ORDER", 1)))
+    p.add_argument("--filter_type", type=str, default=(env("FILTER_TYPE", "fir")))
 
     # ─── Dataset filters ────────────────────────────────────────────────────
     p.add_argument("--families", type=str, default=env("FAMILIES", "guitar"))
     p.add_argument("--sources", type=str, default=env("SOURCES", "acoustic"))
 
     # ─── DiffKS decoder settings ───────────────────────────────────────────
-    p.add_argument("--interpolation_type", type=str, default=env("INTERPOLATION_TYPE", "linear"))
+    p.add_argument("--interpolation_type", type=str, default=env("INTERPOLATION_TYPE", "lagrange"))
     p.add_argument("--pitch_mode", type=str, default=env("PITCH_MODE", "meta"))
 
     # ─── Losses weights ────────────────────────────────────────────────────
     p.add_argument("--stft_weight", type=float, default=float(env("STFT_WEIGHT", 1.0)))
-    p.add_argument("--loud_weight", type=float, default=float(env("LOUD_WEIGHT", 0.0)),
-                   help="Weight for the A-weighted loudness loss (L2/MSE on per-frame log-power).")
-    p.add_argument("--env_weight", type=float, default=float(env("ENV_WEIGHT", 0.0)),
-                   help="Weight for the envelope loss (L1 on framewise |x|).")
 
-    # ─── Stages ────────────────────────────────────────────────────────────
-    p.add_argument("--stage0_steps", type=int, default=int(env("STAGE0_STEPS", 5000)),
-                   help="Number of steps with backbone frozen (stage 0). Then unfreeze all (stage 1). 0 disables stage 0.")
+    # ─── Backbone fine-tuning flags ───────────────────────────────────────
+    p.add_argument("--train_backbone_steps", type=int, default=int(env("TRAIN_BACKBONE_STEPS", 8000)),
+                   help="Number of steps to keep backbone frozen before unfreezing (independent of DDSP stages). 0 disables backbone freeze.")
+    p.add_argument("--backbone_unfreeze_layers", type=int, default=int(env("BACKBONE_UNFREEZE_LAYERS", 2)),
+                   help="How many of the last AST/ViT layers to unfreeze at Stage 1.")
+    p.add_argument("--backbone_lr", type=float, default=float(env("BACKBONE_LR", 1e-5)),
+                   help="Learning rate for the (partially) unfrozen backbone param group.")
+    p.add_argument("--unfreeze_layernorm", type=str2bool, default=str2bool(env("UNFREEZE_LAYERNORM", "true")),
+                   help="Also unfreeze LayerNorm parameters across the backbone.")
+    p.add_argument("--unfreeze_pos_embed", type=str2bool, default=str2bool(env("UNFREEZE_POS_EMBED", "false")),
+                   help="Also unfreeze positional embeddings in the backbone.")
 
     # ─── Testing mode ──────────────────────────────────────────────────────
     p.add_argument("--test", action="store_true",
@@ -71,19 +76,26 @@ def parse_args():
     return p.parse_args()
 
 # -----------------------------------------------------------------
-def build_optimizer(model, lr):
-    """
-    Build Adam optimizer over all trainable params (decoder params excluded).
-    """
-    params = []
+def build_optimizer(model, lr_main, lr_backbone):
+    """Build Adam with two param groups: main (heads/etc) and backbone. Decoder is frozen."""
+    def _is_backbone(name: str) -> bool:
+        return (".backbone." in name) or name.startswith("backbone.") or name.startswith("z_encoder.backbone")
+
+    main_params, bb_params = [], []
     for name, p in model.named_parameters():
-        # Always freeze the differentiable decoder
         if name.startswith("decoder."):
             p.requires_grad = False
             continue
-        if p.requires_grad:
-            params.append(p)
-    return optim.Adam(params, lr=lr)
+        if not p.requires_grad:
+            continue
+        (bb_params if _is_backbone(name) else main_params).append(p)
+
+    groups = []
+    if main_params:
+        groups.append({"params": main_params, "lr": lr_main})
+    if bb_params:
+        groups.append({"params": bb_params, "lr": lr_backbone})
+    return optim.Adam(groups)
 # -----------------------------------------------------------------
 
 # ---- Debug print helpers -------------------------------------------------
@@ -174,9 +186,7 @@ def print_ast_head_grads(model):
             lines.append(f"  - {label:24s}: {sum(vals)/len(vals):.6e}")
     print("\n".join(lines))
 
-# -----------------------------------------------------------------
-# Staged training helpers
-
+# --- DDSP stage trainability helpers -------------------------------------
 
 def set_stage0_backbone_frozen(model) -> None:
     """Stage 0: freeze AST backbone, train mel-attn + heads."""
@@ -189,25 +199,28 @@ def set_stage0_backbone_frozen(model) -> None:
         if name.startswith("decoder."):
             p.requires_grad = False
 
-def set_stage1_unfreeze_all(model) -> None:
-    """Stage 1: unfreeze all learnable parts except the differentiable decoder."""
-    assert hasattr(model, "unfreeze_all"), (
-        "Model is expected to expose unfreeze_all(); update the model or this call site."
-    )
-    model.unfreeze_all()
-    # Ensure decoder remains frozen
-    for name, p in model.named_parameters():
-        if name.startswith("decoder."):
-            p.requires_grad = False
-
-def rebuild_optimizer(optimizer, model, lr):
+def rebuild_optimizer(optimizer, model, lr_main, lr_backbone):
     """Recreate optimizer after changing requires_grad flags."""
     del optimizer
-    optimizer = build_optimizer(model, lr)
+    optimizer = build_optimizer(model, lr_main, lr_backbone)
     print("[STAGE] Rebuilt optimizer for new trainable set")
     print_trainable_summary(model, optimizer)
     return optimizer
 # -----------------------------------------------------------------
+
+def set_stage1_unfreeze_partial(model, n_layers: int, also_unfreeze_layernorm: bool, train_pos_embed: bool) -> None:
+    """Stage 1: partially unfreeze backbone (last N layers), keep decoder frozen."""
+    assert hasattr(model, "unfreeze_backbone_last"), (
+        "Model must implement unfreeze_backbone_last(); update the model or this call site."
+    )
+    model.unfreeze_backbone_last(
+        n_layers=n_layers,
+        also_unfreeze_layernorm=also_unfreeze_layernorm,
+        train_pos_embed=train_pos_embed,
+    )
+    for name, p in model.named_parameters():
+        if name.startswith("decoder."):
+            p.requires_grad = False
 
 def main():
     args = parse_args()
@@ -216,6 +229,7 @@ def main():
     split_val   = "test" if args.test else "valid"
     config = {
         "loop_order": args.l_order,
+        "filter_type": args.filter_type,
         "sample_rate": 16000,
         "ks_sample_rate": 16000,
         "batch_size": args.batch_size,
@@ -232,9 +246,11 @@ def main():
         "pitch_mode": args.pitch_mode,
         "batches_per_epoch": args.batches_per_epoch,
         "stft_weight": args.stft_weight,
-        "loud_weight": args.loud_weight,
-        "env_weight": args.env_weight,
-        "stage0_steps": args.stage0_steps,
+        "backbone_unfreeze_layers": args.backbone_unfreeze_layers,
+        "backbone_lr": args.backbone_lr,
+        "unfreeze_layernorm": args.unfreeze_layernorm,
+        "unfreeze_pos_embed": args.unfreeze_pos_embed,
+        "train_backbone_steps": args.train_backbone_steps,
     }
 
     print("\n▶ Running with config:")
@@ -260,16 +276,12 @@ def main():
         wandb_id = wandb_run.id  # store for fresh runs
 
     # ----- WandB logging helpers (single global step; let wandb manage) -----
-    def log_train_batch(value: float):
-        if wandb.run is not None:
-            wandb.log({"train loss per batch": value})
-
-    def log_epoch(train_loss: float, val_loss: float):
+    def log_epoch(train_loss: float, val_loss: float, step: int):
         if wandb.run is not None:
             wandb.log({
                 "train loss per epoch": train_loss,
                 "val loss per epoch":   val_loss,
-            })
+            }, step=int(step))
 
     # ─── RAM check ────────────────────────────────────────────── #
     process = psutil.Process(os.getpid())
@@ -311,26 +323,31 @@ def main():
         loop_order=config["loop_order"],
         internal_sr=config["ks_sample_rate"],
         interpolation_type=config["interpolation_type"],
+        filter_type=config["filter_type"],
     ).to(device)
 
-    # ---- Stage scheduling (stage 0 → stage 1) ----------------------------
-    current_stage = 0 if config["stage0_steps"] > 0 else 1
+    # ---- Backbone freeze / partial unfreeze based on train_backbone_steps ----
+    current_stage = 0 if config["train_backbone_steps"] > 0 else 1
     if current_stage == 0:
-        print("[STAGE 0] Freezing AST backbone; training mel-attn + heads only")
+        print("[BACKBONE] Freezing backbone initially; heads/mel-attn trainable")
         set_stage0_backbone_frozen(model)
     else:
-        print("[STAGE 1] Training all (except decoder)")
-        set_stage1_unfreeze_all(model)
+        print(f"[BACKBONE] Partially unfreezing backbone: last {args.backbone_unfreeze_layers} layers "
+              f"(LayerNorm={'on' if args.unfreeze_layernorm else 'off'}, "
+              f"pos_embed={'on' if args.unfreeze_pos_embed else 'off'})")
+        set_stage1_unfreeze_partial(
+            model,
+            n_layers=args.backbone_unfreeze_layers,
+            also_unfreeze_layernorm=args.unfreeze_layernorm,
+            train_pos_embed=args.unfreeze_pos_embed,
+        )
 
-    optimizer = build_optimizer(model, lr=config["learning_rate"])
-    if wandb.run is not None:
-        wandb.log({"stage": int(current_stage)})
+    optimizer = build_optimizer(model, lr_main=config["learning_rate"], lr_backbone=config["backbone_lr"])
+    # Log current stage to wandb (removed as per instruction)
 
     print_trainable_summary(model, optimizer)
-    # STFT loss
-    mr_stft = build_smooth_mrstft()
-    mr_stft = mr_stft.to(device)
-    mr_stft = mr_stft.float()
+    # STFT loss (scale-variant)
+    mr_stft_sv = build_smooth_mrstft(scale_invariance=False).to(device).float()
 
     # ─── Resume from checkpoint if requested ──────────────────────────────
     start_epoch, best_val_loss = 0, float('inf')
@@ -343,7 +360,7 @@ def main():
             if "ks_inverse_signal" in key or "excitation_filter_out" in key:
                 sd.pop(key)
 
-        model.load_state_dict(ckpt["model_state_dict"])
+        model.load_state_dict(sd)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
 
         start_epoch = ckpt["epoch"] + 1
@@ -354,13 +371,6 @@ def main():
     # Derive starting global step if resuming, to keep stage schedule consistent
     bpe = min(len(train_loader), config["batches_per_epoch"])
     global_step = start_epoch * bpe
-
-    # If we've already passed stage0_steps when resuming, advance to stage 1
-    if current_stage == 0 and global_step >= config["stage0_steps"]:
-        print(f"[STAGE TRANSITION @ startup] global_step={global_step} ≥ stage0_steps={config['stage0_steps']} → unfreezing all")
-        set_stage1_unfreeze_all(model)
-        optimizer = rebuild_optimizer(optimizer, model, lr=config["learning_rate"])
-        current_stage = 1
 
     # ─── Early-stopping bookkeeping ───────────────────────────── #
     epochs_since_improve = 0
@@ -382,43 +392,22 @@ def main():
 
         #torch.autograd.set_detect_anomaly(True)
 
-        # ─── Training step ───────────────────────────────────────────────
         for batch_idx, (audio, pitch, loud) in enumerate(tqdm(train_loader, desc=f"[E{epoch:03d} train]")):
             if batch_idx >= config["batches_per_epoch"]:
                 break
             audio, pitch, loud = audio.to(device), pitch.to(device), loud.to(device)
-            recon = model(pitch, loud, audio, config["sample_rate"])
+
+            recon = model(
+                pitch, loud, audio, config["sample_rate"],
+            )
             assert recon.shape[1] == audio.shape[1], (
                 f"Decoder returned {recon.shape[1]} samples, "
-                f"but target has {audio.shape[1]}.")
+                f"but target has {audio.shape[1]}."
+            )
 
-            stft_loss = mr_stft(recon.unsqueeze(1), audio.unsqueeze(1)) * args.stft_weight
+            stft_sv = mr_stft_sv(recon.unsqueeze(1), audio.unsqueeze(1))
+            loss = args.stft_weight * stft_sv
 
-            # A-weighted loudness loss (per-frame, log-power). No alignment, no try/except.
-            # recon/audio are [B,N]; target loudness `loud` is [B,T] or [B,T,1].
-            pred_loud = a_weighted_loudness(recon)        # [B, F_pred]
-            tgt_loud  = loud
-            if tgt_loud.dim() == 3 and tgt_loud.size(-1) == 1:
-                tgt_loud = tgt_loud.squeeze(-1)           # [B, F_tgt]
-
-            # Enforce exact shape match to avoid broadcasting
-            pred_loud = pred_loud.reshape(pred_loud.size(0), -1)
-            tgt_loud  = tgt_loud.reshape(tgt_loud.size(0), -1)
-            if pred_loud.size(1) != tgt_loud.size(1):
-                raise RuntimeError(
-                    f"Loudness frames mismatch: pred {pred_loud.size(1)} vs target {tgt_loud.size(1)}. "
-                    f"Ensure HOP_SIZE and framing match in a_weighted_loudness() and dataset 'loud'.")
-
-            # L2 (MSE) on log-power loudness frames
-            loudness_loss = F.mse_loss(pred_loud, tgt_loud)
-
-            # Envelope loss (phase-agnostic, time-local). Use same frame count as loudness.
-            num_frames = pred_loud.size(1)
-            env_pred = _frame_env(recon, num_frames)  # [B,F]
-            env_tgt = _frame_env(audio, num_frames)  # [B,F]
-            env_loss = F.l1_loss(env_pred, env_tgt)
-
-            loss = stft_loss + args.loud_weight * loudness_loss + args.env_weight * env_loss
             # Abort early if loss is NaN or Inf
             if not torch.isfinite(loss):
                 print(f"[ABORT] Non-finite loss detected at epoch {epoch}, batch {batch_idx}: {loss.item()}")
@@ -451,22 +440,23 @@ def main():
 
             global_step += 1
 
-            # Stage transition: when reaching stage0_steps, unfreeze all
-            if current_stage == 0 and global_step >= config["stage0_steps"]:
-                print(f"[STAGE TRANSITION] Hit global_step={global_step} → switching to Stage 1 (unfreeze all)")
-                set_stage1_unfreeze_all(model)
-                optimizer = rebuild_optimizer(optimizer, model, lr=config["learning_rate"])
+            # Backbone transition: when reaching train_backbone_steps, partially unfreeze backbone
+            if current_stage == 0 and global_step >= config["train_backbone_steps"]:
+                print(f"[BACKBONE] Reached global_step={global_step} → partially unfreezing last {config['backbone_unfreeze_layers']} layers")
+                set_stage1_unfreeze_partial(
+                    model,
+                    n_layers=config["backbone_unfreeze_layers"],
+                    also_unfreeze_layernorm=config["unfreeze_layernorm"],
+                    train_pos_embed=config["unfreeze_pos_embed"],
+                )
+                optimizer = rebuild_optimizer(optimizer, model, lr_main=config["learning_rate"], lr_backbone=config["backbone_lr"])
                 current_stage = 1
-                if wandb.run is not None:
-                    wandb.log({"stage": 1, "global_step": int(global_step)})
 
-            log_train_batch(loss.item())
             if wandb.run is not None:
                 wandb.log({
-                    "train/loss_stft": float(stft_loss.item()),
-                    "train/loss_loud": float((args.loud_weight * loudness_loss).item()),
-                    "train/loss_env": float((args.env_weight * env_loss).item()),
-                })
+                    "train loss per batch": float(loss.item()),
+                    "train/loss_stft": float(stft_sv.item()),
+                }, step=int(global_step))
 
             t_loss += loss.item()
             batches_processed += 1
@@ -484,6 +474,8 @@ def main():
             torch.save(ckpt, abort_ckpt)
             print(f"[ABORT] Saved checkpoint to {abort_ckpt}")
             if wandb.run is not None:
+                wandb.log({"nonfinite_loss_detected": True, "epoch": epoch, "batch": batch_idx}, step=int(global_step))
+                wandb.run.summary["nonfinite_loss"] = True
                 wandb.finish()
             return
 
@@ -503,15 +495,17 @@ def main():
             with torch.no_grad():
                 for audio, pitch, loud in val_loader:
                     audio, pitch, loud = audio.to(device), pitch.to(device), loud.to(device)
-                    recon_std = model(pitch, loud, audio, config["sample_rate"])
+                    recon_std = model(
+                        pitch, loud, audio, config["sample_rate"],
+                    )
                     assert recon_std.shape[1] == audio.shape[1]
-                    loss_std = mr_stft(recon_std.unsqueeze(1), audio.unsqueeze(1))
+                    loss_std = mr_stft_sv(recon_std.unsqueeze(1), audio.unsqueeze(1))
                     v_losses_std.append(loss_std.item())
             v_loss_std = float(np.mean(v_losses_std))
 
         # ─── LOGGING ───────────────────────────────────────────────────────
         if epoch % config["eval_interval"] == 0:
-            log_epoch(t_loss, v_loss_std)
+            log_epoch(t_loss, v_loss_std, step=int(global_step))
         else:
             # no validation this epoch
             pass
@@ -544,13 +538,15 @@ def main():
         if epoch % config["eval_interval"] == 0:
             with torch.no_grad():
                 a, p, l = fixed_audio.to(device), fixed_pitch.to(device), fixed_loud.to(device)
-
-                rec = model(p, l, a, config["sample_rate"])
+                rec = model(
+                    p, l, a, config["sample_rate"],
+                )
                 assert rec.shape[1] == a.shape[1]
 
                 # Fetch parameter info and internal signals
                 _lc, _geq, gain_frames_b, gain_up_b, excitation_pregain_b, excitation_postgain_b, excitation_b = model(
-                    p, l, a, config["sample_rate"], return_parameters=True
+                    p, l, a, config["sample_rate"],
+                    return_parameters=True,
                 )
                 gains_db_batch = _geq["gains_db"]  # [B, K]
                 if gains_db_batch is not None:
@@ -635,7 +631,7 @@ def main():
                         media_log[f"composite_{idx}"] = wandb.Image(comp_path, caption=f"Composite | e{epoch} i{idx}")
 
                 if wandb.run is not None and len(media_log) > 0:
-                    wandb.log(media_log, commit=True)
+                    wandb.log(media_log, commit=True, step=int(global_step))
 
         if epoch % config["eval_interval"] == 0:
             print(f"[E{epoch}] train={t_loss:.4f} val_std={v_loss_std:.4f} best={best_val_loss:.4f} (no-improve {epochs_since_improve}/{config['patience']})")
