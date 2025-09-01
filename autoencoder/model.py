@@ -385,7 +385,7 @@ class nnKarplusStrong(nn.Module):
                 "shelves_hz": self.geq_shelves.detach().cpu(),
                 "gains_db":    gains_db.detach().cpu(),
             }
-            return loop_coeffs_c, geq_info, gain_frames, gain_up, excitation_pregain, excitation_postgain, excitation
+            return loop_coeffs_c, geq_info, gain_frames, gain_up, excitation_pregain, excitation_postgain, excitation, onset_list
 
         # 5) Synthesize with DiffKS
         out = self.decoder(

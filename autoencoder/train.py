@@ -7,6 +7,7 @@ from .model import nnKarplusStrong
 import argparse, os
 import multiprocessing as mp
 import psutil
+import math
 
 from collections import defaultdict
 
@@ -56,6 +57,8 @@ def parse_args():
 
     # ─── Losses weights ────────────────────────────────────────────────────
     p.add_argument("--stft_weight", type=float, default=float(env("STFT_WEIGHT", 1.0)))
+    p.add_argument("--pg_weight", type=float, default=float(env("PG_WEIGHT", 0.1)),
+                   help="Weight for the (p,g) prior loss estimated per onset from two-harmonic decay fits. Set to 0 to disable.")
 
     # ─── Backbone fine-tuning flags ───────────────────────────────────────
     p.add_argument("--train_backbone_steps", type=int, default=int(env("TRAIN_BACKBONE_STEPS", 8000)),
@@ -162,6 +165,7 @@ def print_grad_snapshot(model, components=None):
             print(f"  - {k:24s}: {sum(vals)/len(vals):.6e} (n={len(vals)})")
 
 # --- NEW: Print gradients for z_encoder heads (gain_head, loop_head, geq_head) if present
+# --- Print gradients for z_encoder heads (gain_head, loop_head, geq_head) if present
 def print_ast_head_grads(model):
     """Print mean |grad| for z_encoder heads (gain_head, loop_head, geq_head) if present."""
     if not hasattr(model, "z_encoder"):
@@ -185,6 +189,220 @@ def print_ast_head_grads(model):
         else:
             lines.append(f"  - {label:24s}: {sum(vals)/len(vals):.6e}")
     print("\n".join(lines))
+
+# === Two‑harmonic decay → (p,g) helpers ===========================================
+@torch.no_grad()
+def _stft_mag(x: torch.Tensor, fs: int, n_fft: int = 1024, hop: int = 256) -> torch.Tensor:
+    """Return magnitude STFT with frames-major shape [frames, freq_bins]. x: [T] (1D)."""
+    x = x.detach()
+    win = torch.hann_window(n_fft, device=x.device, dtype=x.dtype)
+    X = torch.stft(x, n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                   window=win, center=True, return_complex=True)
+    mag = X.abs().transpose(0, 1)  # [frames, bins]
+    return mag
+
+@torch.no_grad()
+def _sample_mag_at_freqs(mag: torch.Tensor, fs: int, n_fft: int, f_target_hz: torch.Tensor) -> torch.Tensor:
+    """Linear-interpolate magnitude at target frequencies per frame.
+    mag: [frames, bins], f_target_hz: [frames]
+    """
+    df = fs / float(n_fft)
+    b = f_target_hz / df  # [frames]
+    frames, bins = mag.shape
+    b0 = torch.clamp(b.floor().long(), 0, bins - 2)
+    w  = (b - b0.float()).clamp(0, 1)
+    rows = torch.arange(frames, device=mag.device)
+    m0 = mag[rows, b0]
+    m1 = mag[rows, b0 + 1]
+    return (1.0 - w) * m0 + w * m1  # [frames]
+
+@torch.no_grad()
+def _fit_log_decay(ampl: torch.Tensor, hop: int, fs: int, t_skip_sec: float = 0.040, eps: float = 1e-12) -> float:
+    """OLS slope m (s^-1) of ln amplitude vs time for a single harmonic envelope."""
+    frames = ampl.numel()
+    if frames <= 3:
+        return 0.0
+    t = torch.arange(frames, device=ampl.device, dtype=ampl.dtype) * (hop / float(fs))
+    y = torch.log(ampl + eps)
+    start = int(round(t_skip_sec * fs / hop))
+    start = min(max(start, 0), frames - 2)
+    t = t[start:]; y = y[start:]
+    if t.numel() <= 1:
+        return 0.0
+    t_mean = t.mean()
+    y_mean = y.mean()
+    num = ((t - t_mean) * (y - y_mean)).sum()
+    den = ((t - t_mean) ** 2).sum().clamp_min(1e-12)
+    m = (num / den).item()
+    return m
+
+@torch.no_grad()
+def _estimate_pg_two_harmonics(x_seg: torch.Tensor, fs: int, f0_med: float,
+                               n_fft: int = 1024, hop: int = 256) -> tuple[float, float, dict]:
+    """Estimate (p,g) from fundamental & 3rd harmonic in one onset window.
+    Returns (p_hat, g_hat, diagnostics_dict). Robust, closed-form.
+    """
+    T = x_seg.numel()
+    if T < max(512, 4 * hop):
+        return 0.0, 0.95, {"ok": False, "reason": "window too short"}
+    # Guard f0 range
+    if not (1.0 < f0_med < 0.45 * fs):
+        return 0.0, 0.95, {"ok": False, "reason": "f0 out of range"}
+
+    mag = _stft_mag(x_seg, fs, n_fft=n_fft, hop=hop)  # [frames, bins]
+    frames = mag.shape[0]
+    if frames <= 2:
+        return 0.0, 0.95, {"ok": False, "reason": "too few frames"}
+
+    f1 = torch.full((frames,), float(f0_med), dtype=mag.dtype, device=mag.device)
+    f3 = 3.0 * f1
+
+    # Keep 3rd below Nyquist margin
+    if (f3.max().item() >= 0.45 * fs):
+        return 0.0, 0.95, {"ok": False, "reason": "3rd near Nyquist"}
+
+    A1 = _sample_mag_at_freqs(mag, fs, n_fft, f1)
+    A3 = _sample_mag_at_freqs(mag, fs, n_fft, f3)
+
+    m1 = _fit_log_decay(A1, hop, fs)  # s^-1
+    m3 = _fit_log_decay(A3, hop, fs)
+
+    # Per-period multipliers
+    T_p = 1.0 / max(f0_med, 1e-9)
+    M1 = math.exp(m1 * T_p)
+    M3 = math.exp(m3 * T_p)
+
+    # Solve quadratic for p
+    R2 = (M3 / max(M1, 1e-12)) ** 2
+    omega1 = 2.0 * math.pi * (f0_med / fs)
+    omega3 = 3.0 * omega1
+    c1, c3 = math.cos(omega1), math.cos(omega3)
+
+    a = R2 - 1.0
+    b = 2.0 * (c1 - R2 * c3)
+    c = R2 - 1.0
+    disc = b * b - 4.0 * a * c
+
+    p_candidates = []
+    if abs(a) > 1e-12 and disc >= 0.0:
+        sqrt_disc = math.sqrt(disc)
+        p_candidates = [(-b + sqrt_disc) / (2.0 * a), (-b - sqrt_disc) / (2.0 * a)]
+
+    p = None
+    for p_try in p_candidates:
+        if 1e-6 < p_try < 1.0 - 1e-6:
+            p = p_try
+            break
+    if p is None:
+        p = 0.0  # flat loss fallback
+
+    denom = (1.0 - p)
+    num = math.sqrt(max(1e-18, 1.0 + p * p - 2.0 * p * c1))
+    g = M1 * num / max(1e-9, denom)
+    # Clamp to model domain
+    p = float(min(max(p, 1e-6), 1.0 - 1e-6))
+    g = float(min(max(g, 0.900001), 0.999999))
+
+    return p, g, {"ok": True, "M1": M1, "M3": M3, "f0_med": f0_med}
+
+@torch.no_grad()
+def _samples_to_int_frame(n_samples: int, T_int: int, s_idx: int) -> int:
+    """Map sample index to internal frame index [0, T_int-1] with linear scaling."""
+    if n_samples <= 1:
+        return 0
+    pos = (float(s_idx) / float(max(1, n_samples - 1))) * float(max(1, T_int - 1))
+    j = int(math.floor(pos + 1e-8))
+    return max(0, min(T_int - 1, j))
+
+# --- Onset normalization helper ------------------------------------------
+@torch.no_grad()
+def _normalize_onsets_to_samples(onsets, T: int, T_int: int, fs: int):
+    """
+    Normalize onset list to sample indices in [0, T-1] (int).
+    Accepts onsets as list/array/tensor; supports 3 conventions:
+      - If max_val <= T_int-1: treat as internal frame indices [0, T_int-1]
+      - Else if max_val <= (T/fs)*1.05: treat as seconds
+      - Else: treat as sample indices (clamp to [0, T-1])
+    Returns list of ints (may be empty).
+    """
+    # Defensive: handle non-list or empty
+    if not isinstance(onsets, (list, tuple, np.ndarray, torch.Tensor)) or len(onsets) == 0:
+        return []
+    # Convert to float list
+    if isinstance(onsets, torch.Tensor):
+        onsets = onsets.detach().cpu().tolist()
+    vals = []
+    try:
+        vals = [float(v) for v in onsets]
+    except Exception:
+        return []
+    if len(vals) == 0:
+        return []
+    max_val = max(vals)
+    # Internal frame indices
+    if max_val <= T_int - 1:
+        # Map to sample indices
+        return [int(round(v / max(1, T_int - 1) * (T - 1))) for v in vals]
+    # Seconds
+    elif max_val <= (T / fs) * 1.05:
+        return [int(round(v * fs)) for v in vals]
+    # Sample indices (already in samples)
+    else:
+        return [min(max(0, int(round(v))), T - 1) for v in vals]
+
+
+@torch.no_grad()
+def _build_pg_targets_for_batch(audio_b: torch.Tensor,
+                                pitch_b: torch.Tensor,
+                                onset_lists: list,
+                                fs: int,
+                                T_int: int,
+                                n_fft: int = 1024,
+                                hop: int = 256) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute per-frame piece‑wise constant targets p_hat, g_hat for each batch item.
+    Returns (p_tgt, g_tgt, mask) with shape [B, T_int] on the same device as audio_b.
+    """
+    B, T = audio_b.shape
+    device = audio_b.device
+    dtype = audio_b.dtype
+    p_tgt = torch.zeros((B, T_int), device=device, dtype=dtype)
+    g_tgt = torch.zeros((B, T_int), device=device, dtype=dtype)
+    mask  = torch.zeros((B, T_int), device=device, dtype=dtype)
+
+    for b in range(B):
+        x = audio_b[b]
+        f0 = pitch_b[b]
+        # Accept either python lists or tensors for onsets
+        onsets = onset_lists[b]
+        # Normalize onsets to sample indices
+        onsets_samples = _normalize_onsets_to_samples(onsets, T=T, T_int=T_int, fs=fs)
+        # Ensure boundaries
+        edges = sorted(set([0] + [int(max(0, min(int(T - 1), int(s)))) for s in onsets_samples] + [int(T)]))
+        # Make windows
+        for i in range(len(edges) - 1):
+            s = edges[i]
+            e = edges[i + 1]
+            if e - s < max(256, 2 * hop):
+                continue
+            x_seg = x[s:e]
+            f0_seg = f0[s:e]
+            # Robust median f0 in window (ignore zeros)
+            f0_valid = f0_seg[f0_seg > 1.0]
+            if f0_valid.numel() == 0:
+                continue
+            f0_med = float(torch.median(f0_valid).item())
+            p_hat, g_hat, _diag = _estimate_pg_two_harmonics(x_seg, fs, f0_med, n_fft=n_fft, hop=hop)
+
+            s_int = _samples_to_int_frame(T, T_int, s)
+            e_int = _samples_to_int_frame(T, T_int, e - 1) + 1
+            e_int = max(s_int + 1, min(T_int, e_int))
+
+            p_tgt[b, s_int:e_int] = p_hat
+            g_tgt[b, s_int:e_int] = g_hat
+            mask[b, s_int:e_int]  = 1.0
+
+    return p_tgt, g_tgt, mask
+# ======================================================================
 
 # --- DDSP stage trainability helpers -------------------------------------
 
@@ -251,6 +469,7 @@ def main():
         "unfreeze_layernorm": args.unfreeze_layernorm,
         "unfreeze_pos_embed": args.unfreeze_pos_embed,
         "train_backbone_steps": args.train_backbone_steps,
+        "pg_weight": args.pg_weight,
     }
 
     print("\n▶ Running with config:")
@@ -408,6 +627,43 @@ def main():
             stft_sv = mr_stft_sv(recon.unsqueeze(1), audio.unsqueeze(1))
             loss = args.stft_weight * stft_sv
 
+            # ---- Two-harmonic (p,g) prior loss from onset windows -----------------
+            if config.get("pg_weight", 0.0) > 0.0:
+                # Get loop coeffs (b0, a1, g) and onset lists from the model
+                _lc, _geq, _gf, _gu, _pre, _post, _exc, onset_lists = model(
+                    pitch, loud, audio, config["sample_rate"], return_parameters=True,
+                )
+                # _lc: [B, T_int, K]; with return_gain=True, K=3 and _lc[...,1] is a1, _lc[...,2] is g
+                B, T_int, K = _lc.shape
+                # Build per-frame targets
+                p_tgt, g_tgt, mask = _build_pg_targets_for_batch(
+                    audio_b=audio, pitch_b=pitch.squeeze(2), onset_lists=onset_lists,
+                    fs=config["sample_rate"], T_int=T_int, n_fft=1024, hop=256,
+                )
+                # Derive predicted p,g per frame from loop coeffs
+                if config["filter_type"].lower() == "iir":
+                    p_pred = _lc[..., 1]                      # a1 == p
+                    g_pred = _lc[..., 2]                      # g
+                else:
+                    # FIR: a1 = p * g, b0 = (1-p) * g
+                    a1 = _lc[..., 1]
+                    g_pred = _lc[..., 2]
+                    eps = 1e-8
+                    p_pred = a1 / (g_pred + eps)
+                    p_pred = torch.clamp(p_pred, 1e-6, 1.0 - 1e-6)
+                # Compute masked L2 prior
+                mask = mask.to(p_pred.dtype)
+                denom = mask.sum().clamp_min(1.0)
+                pg_mse = (((p_pred - p_tgt) ** 2 + (g_pred - g_tgt) ** 2) * mask).sum() / denom
+                loss_pg = pg_mse
+                loss = loss + config["pg_weight"] * loss_pg
+                if wandb.run is not None:
+                    wandb.log({
+                        "train/loss_pg": float(loss_pg.detach().cpu().item()),
+                        "train/pg_mask_count": float(denom.detach().cpu().item()),
+                    }, step=int(global_step))
+            # -----------------------------------------------------------------------
+
             # Abort early if loss is NaN or Inf
             if not torch.isfinite(loss):
                 print(f"[ABORT] Non-finite loss detected at epoch {epoch}, batch {batch_idx}: {loss.item()}")
@@ -544,7 +800,7 @@ def main():
                 assert rec.shape[1] == a.shape[1]
 
                 # Fetch parameter info and internal signals
-                _lc, _geq, gain_frames_b, gain_up_b, excitation_pregain_b, excitation_postgain_b, excitation_b = model(
+                _lc, _geq, gain_frames_b, gain_up_b, excitation_pregain_b, excitation_postgain_b, excitation_b, fixed_onsets = model(
                     p, l, a, config["sample_rate"],
                     return_parameters=True,
                 )
@@ -588,11 +844,37 @@ def main():
                         )
 
                 # ---- Composite (4‑panel) per example -----------------------------
+                # --- Compute piece-wise constant (p,g) targets for composite plots ---
+                # Use same logic as in training: build targets from fixed batch
+                # Use fixed_audio, fixed_pitch, and onsets from model call
+                # Build per-frame (p,g) targets for the fixed batch
+                p_tgt, g_tgt, mask = _build_pg_targets_for_batch(
+                    audio_b=a, pitch_b=p.squeeze(2), onset_lists=fixed_onsets,
+                    fs=config["sample_rate"], T_int=_lc.shape[1], n_fft=1024, hop=256,
+                )
+
                 for idx in range(n_plot):
                     target_np = a[idx].cpu().numpy()
                     recon_np  = rec[idx].cpu().numpy()
                     lc_np = _lc[idx].detach().cpu().numpy()  # [T_int, K]
                     eq_gains_np = gains_db_batch[idx].detach().cpu().numpy() if gains_db_batch is not None else None
+
+                    # Build piece-wise constant target loop coeffs for plotting
+                    # p_tgt, g_tgt: [B, T_int]
+                    p_tgt_np = p_tgt[idx].detach().cpu().numpy()
+                    g_tgt_np = g_tgt[idx].detach().cpu().numpy()
+                    if config["filter_type"].lower() == "iir":
+                        a1 = p_tgt_np
+                        g = g_tgt_np
+                        b0 = (1.0 - a1) * g
+                    else:
+                        # FIR: a1 = p * g, b0 = (1-p) * g
+                        a1 = p_tgt_np * g_tgt_np
+                        g = g_tgt_np
+                        b0 = (1.0 - p_tgt_np) * g_tgt_np
+                    # Stack as [T_int, 3]: [b0, a1, g]
+                    lc_targets_np = np.stack([b0, a1, g], axis=-1)
+
                     comp_path = os.path.join(config["save_dir"], f"composite_e{epoch}_{idx}.png")
                     plot_composite_four(
                         comp_path,
@@ -601,6 +883,7 @@ def main():
                         loop_coeffs_c=lc_np,
                         eq_gains=eq_gains_np,
                         sr=config["sample_rate"],
+                        loop_coeffs_target=lc_targets_np,
                     )
 
                     # --- Excitation composite (3 stacked panels, zoomed on first trigger) ---
