@@ -8,6 +8,7 @@ import argparse, os
 import multiprocessing as mp
 import psutil
 import math
+import matplotlib.pyplot as plt
 
 from collections import defaultdict
 
@@ -15,8 +16,10 @@ from paths import NSYNTH_PREPROCESSED_DIR
 from data.preprocess import NsynthDataset
 from utils.misc import get_device, str2bool
 
+
 from .losses import build_smooth_mrstft
-from .plotters import plot_composite_four, _resample_to_len, plot_excitation_composite_zoomed
+from core import detect_onsets_librosa
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -45,7 +48,7 @@ def parse_args():
 
     # ─── DiffKS filter configuration ───────────────────────────────────────
     p.add_argument("--l_order", type=int, default=int(env("L_ORDER", 1)))
-    p.add_argument("--filter_type", type=str, default=(env("FILTER_TYPE", "fir")))
+    p.add_argument("--filter_type", type=str, default=(env("FILTER_TYPE", "iir")))
 
     # ─── Dataset filters ────────────────────────────────────────────────────
     p.add_argument("--families", type=str, default=env("FAMILIES", "guitar"))
@@ -57,20 +60,18 @@ def parse_args():
 
     # ─── Losses weights ────────────────────────────────────────────────────
     p.add_argument("--stft_weight", type=float, default=float(env("STFT_WEIGHT", 1.0)))
-    p.add_argument("--pg_weight", type=float, default=float(env("PG_WEIGHT", 0.1)),
-                   help="Weight for the (p,g) prior loss estimated per onset from two-harmonic decay fits. Set to 0 to disable.")
+    p.add_argument("--sf_weight", type=float, default=float(env("SF_WEIGHT", 0.5)),
+                   help="Weight for spectral-flux onset loss (L1 between novelty curves)")
+    p.add_argument("--sf_min_freq", type=float, default=float(env("SF_MIN_FREQ", 0.0)),
+                   help="Optional high-pass in Hz for spectral-flux; 0 disables")
+    p.add_argument("--pg_weight", type=float, default=float(env("PG_WEIGHT", 0.2)),
+                   help="Weight for onset-to-onset (p,g) supervision loss")
 
-    # ─── Backbone fine-tuning flags ───────────────────────────────────────
-    p.add_argument("--train_backbone_steps", type=int, default=int(env("TRAIN_BACKBONE_STEPS", 8000)),
-                   help="Number of steps to keep backbone frozen before unfreezing (independent of DDSP stages). 0 disables backbone freeze.")
-    p.add_argument("--backbone_unfreeze_layers", type=int, default=int(env("BACKBONE_UNFREEZE_LAYERS", 2)),
-                   help="How many of the last AST/ViT layers to unfreeze at Stage 1.")
-    p.add_argument("--backbone_lr", type=float, default=float(env("BACKBONE_LR", 1e-5)),
-                   help="Learning rate for the (partially) unfrozen backbone param group.")
-    p.add_argument("--unfreeze_layernorm", type=str2bool, default=str2bool(env("UNFREEZE_LAYERNORM", "true")),
-                   help="Also unfreeze LayerNorm parameters across the backbone.")
-    p.add_argument("--unfreeze_pos_embed", type=str2bool, default=str2bool(env("UNFREEZE_POS_EMBED", "false")),
-                   help="Also unfreeze positional embeddings in the backbone.")
+    # ─── DiffKS timesteps and noise bands ─────────────────────────────────
+    p.add_argument("--timesteps", type=int, default=int(env("TIMESTEPS", 250)))
+    p.add_argument("--n_noise_bands", type=int, default=int(env("N_NOISE_BANDS", 64)))
+    p.add_argument("--burst_width", type=int, default=int(env("BURST_WIDTH", 1)),
+                   help="Width of the burst (in frames) for onset-gated excitation")
 
     # ─── Testing mode ──────────────────────────────────────────────────────
     p.add_argument("--test", action="store_true",
@@ -79,26 +80,15 @@ def parse_args():
     return p.parse_args()
 
 # -----------------------------------------------------------------
-def build_optimizer(model, lr_main, lr_backbone):
-    """Build Adam with two param groups: main (heads/etc) and backbone. Decoder is frozen."""
-    def _is_backbone(name: str) -> bool:
-        return (".backbone." in name) or name.startswith("backbone.") or name.startswith("z_encoder.backbone")
-
-    main_params, bb_params = [], []
+def build_optimizer(model, lr_main, *_):
+    params = []
     for name, p in model.named_parameters():
         if name.startswith("decoder."):
             p.requires_grad = False
             continue
-        if not p.requires_grad:
-            continue
-        (bb_params if _is_backbone(name) else main_params).append(p)
-
-    groups = []
-    if main_params:
-        groups.append({"params": main_params, "lr": lr_main})
-    if bb_params:
-        groups.append({"params": bb_params, "lr": lr_backbone})
-    return optim.Adam(groups)
+        if p.requires_grad:
+            params.append(p)
+    return optim.Adam(params, lr=lr_main)
 # -----------------------------------------------------------------
 
 # ---- Debug print helpers -------------------------------------------------
@@ -117,30 +107,7 @@ def print_trainable_summary(model, optimizer):
     for k in sorted(comp_counts.keys()):
         print(f"  - {k:24s}: {comp_counts[k]:4d} tensors | {comp_paramnums[k]:8d} params")
     print(f"  Total trainable params: {total}")
-    # Optimizer groups summary
-    if isinstance(optimizer, optim.Optimizer):
-        print("[OPTIMIZER] param groups:")
-        for i, g in enumerate(optimizer.param_groups):
-            lr = g.get('lr', None)
-            n = sum(p.numel() for p in g['params'])
-            print(f"  group {i}: lr={lr} | params={n}")
-    # Optional: breakdown of z_encoder heads if present
-    if hasattr(model, "z_encoder"):
-        z = model.z_encoder
-        def _count(mod):
-            if mod is None:
-                return 0, 0
-            t = sum(1 for p in mod.parameters() if p.requires_grad)
-            n = sum(p.numel() for p in mod.parameters() if p.requires_grad)
-            return t, n
-        print("[TRAINABLE] z_encoder breakdown:")
-        for label, mod in (
-            ("z_encoder.gain_head", getattr(z, "gain_head", None)),
-            ("z_encoder.loop_head", getattr(z, "loop_head", None)),
-            ("z_encoder.geq_head",  getattr(z, "geq_head",  None)),
-        ):
-            t, n = _count(mod)
-            print(f"  - {label:24s}: {t:4d} tensors | {n:8d} params")
+    # (Optimizer groups and z_encoder breakdown printout removed)
 
 
 def print_grad_snapshot(model, components=None):
@@ -166,31 +133,34 @@ def print_grad_snapshot(model, components=None):
 
 # --- NEW: Print gradients for z_encoder heads (gain_head, loop_head, geq_head) if present
 # --- Print gradients for z_encoder heads (gain_head, loop_head, geq_head) if present
-def print_ast_head_grads(model):
-    """Print mean |grad| for z_encoder heads (gain_head, loop_head, geq_head) if present."""
-    if not hasattr(model, "z_encoder"):
-        return
-    z = model.z_encoder
-    lines = ["[Z_ENCODER HEAD GRADS]"]
-    for label, mod in (
-        ("z_encoder.gain_head", getattr(z, "gain_head", None)),
-        ("z_encoder.loop_head", getattr(z, "loop_head", None)),
-        ("z_encoder.geq_head",  getattr(z, "geq_head",  None)),
-    ):
-        if mod is None:
-            lines.append(f"  - {label:24s}: (missing)")
-            continue
-        vals = []
-        for p in mod.parameters():
-            if p.requires_grad and p.grad is not None:
-                vals.append(p.grad.detach().abs().mean().item())
-        if len(vals) == 0:
-            lines.append(f"  - {label:24s}: (no grads)")
-        else:
-            lines.append(f"  - {label:24s}: {sum(vals)/len(vals):.6e}")
-    print("\n".join(lines))
+def _hz_to_bin(n_fft: int, fs: int, hz: float) -> int:
+    if hz <= 0:
+        return 0
+    return int(min(max(0, round(hz / (fs / float(n_fft)))), n_fft // 2))
 
-# === Two‑harmonic decay → (p,g) helpers ===========================================
+def spectral_flux(x: torch.Tensor, fs: int, n_fft: int = 1024, hop: int = 256,
+                  min_hz: float = 0.0) -> torch.Tensor:
+    """
+    Differentiable spectral-flux novelty curve.
+    x: [B, T] -> [B, frames]
+    SF(n) = sum_w ReLU(|X_w(n)| - |X_w(n-1)|)^2
+    """
+    assert x.dim() == 2, "spectral_flux expects [B, T]"
+    B, T = x.shape
+    win = torch.hann_window(n_fft, device=x.device, dtype=x.dtype)
+    X = torch.stft(x, n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                   window=win, center=True, return_complex=True)  # [B, bins, frames]
+    mag = X.abs()
+    if min_hz > 0.0:
+        b0 = _hz_to_bin(n_fft, fs, min_hz)
+        mag = mag[:, b0:, :]
+    if mag.shape[-1] <= 1:
+        return torch.zeros((B, mag.shape[-1]), device=x.device, dtype=x.dtype)
+    diff = torch.relu(mag[:, :, 1:] - mag[:, :, :-1])
+    sf = (diff ** 2).sum(dim=1)          # [B, frames-1]
+    sf = torch.nn.functional.pad(sf, (1, 0))
+    return sf
+
 @torch.no_grad()
 def _stft_mag(x: torch.Tensor, fs: int, n_fft: int = 1024, hop: int = 256) -> torch.Tensor:
     """Return magnitude STFT with frames-major shape [frames, freq_bins]. x: [T] (1D)."""
@@ -389,8 +359,13 @@ def _build_pg_targets_for_batch(audio_b: torch.Tensor,
             # Robust median f0 in window (ignore zeros)
             f0_valid = f0_seg[f0_seg > 1.0]
             if f0_valid.numel() == 0:
-                continue
-            f0_med = float(torch.median(f0_valid).item())
+                # Fallback to global median f0 for this item
+                f0_global_valid = f0[f0 > 1.0]
+                if f0_global_valid.numel() == 0:
+                    continue
+                f0_med = float(torch.median(f0_global_valid).item())
+            else:
+                f0_med = float(torch.median(f0_valid).item())
             p_hat, g_hat, _diag = _estimate_pg_two_harmonics(x_seg, fs, f0_med, n_fft=n_fft, hop=hop)
 
             s_int = _samples_to_int_frame(T, T_int, s)
@@ -404,41 +379,6 @@ def _build_pg_targets_for_batch(audio_b: torch.Tensor,
     return p_tgt, g_tgt, mask
 # ======================================================================
 
-# --- DDSP stage trainability helpers -------------------------------------
-
-def set_stage0_backbone_frozen(model) -> None:
-    """Stage 0: freeze AST backbone, train mel-attn + heads."""
-    assert hasattr(model, "freeze_backbone"), (
-        "Model is expected to expose freeze_backbone(); update the model or this call site."
-    )
-    model.freeze_backbone()
-    # Always keep decoder frozen
-    for name, p in model.named_parameters():
-        if name.startswith("decoder."):
-            p.requires_grad = False
-
-def rebuild_optimizer(optimizer, model, lr_main, lr_backbone):
-    """Recreate optimizer after changing requires_grad flags."""
-    del optimizer
-    optimizer = build_optimizer(model, lr_main, lr_backbone)
-    print("[STAGE] Rebuilt optimizer for new trainable set")
-    print_trainable_summary(model, optimizer)
-    return optimizer
-# -----------------------------------------------------------------
-
-def set_stage1_unfreeze_partial(model, n_layers: int, also_unfreeze_layernorm: bool, train_pos_embed: bool) -> None:
-    """Stage 1: partially unfreeze backbone (last N layers), keep decoder frozen."""
-    assert hasattr(model, "unfreeze_backbone_last"), (
-        "Model must implement unfreeze_backbone_last(); update the model or this call site."
-    )
-    model.unfreeze_backbone_last(
-        n_layers=n_layers,
-        also_unfreeze_layernorm=also_unfreeze_layernorm,
-        train_pos_embed=train_pos_embed,
-    )
-    for name, p in model.named_parameters():
-        if name.startswith("decoder."):
-            p.requires_grad = False
 
 def main():
     args = parse_args()
@@ -464,12 +404,12 @@ def main():
         "pitch_mode": args.pitch_mode,
         "batches_per_epoch": args.batches_per_epoch,
         "stft_weight": args.stft_weight,
-        "backbone_unfreeze_layers": args.backbone_unfreeze_layers,
-        "backbone_lr": args.backbone_lr,
-        "unfreeze_layernorm": args.unfreeze_layernorm,
-        "unfreeze_pos_embed": args.unfreeze_pos_embed,
-        "train_backbone_steps": args.train_backbone_steps,
+        "sf_weight": args.sf_weight,
+        "sf_min_freq": args.sf_min_freq,
+        "timesteps": args.timesteps,
+        "n_noise_bands": args.n_noise_bands,
         "pg_weight": args.pg_weight,
+        "burst_width": args.burst_width,
     }
 
     print("\n▶ Running with config:")
@@ -495,12 +435,13 @@ def main():
         wandb_id = wandb_run.id  # store for fresh runs
 
     # ----- WandB logging helpers (single global step; let wandb manage) -----
-    def log_epoch(train_loss: float, val_loss: float, step: int):
+    def log_epoch(train_loss: float, val_loss: float, epoch: int):
         if wandb.run is not None:
             wandb.log({
-                "train loss per epoch": train_loss,
-                "val loss per epoch":   val_loss,
-            }, step=int(step))
+                "epoch": int(epoch),
+                "train loss per epoch": float(train_loss),
+                "val loss per epoch":   float(val_loss),
+            })
 
     # ─── RAM check ────────────────────────────────────────────── #
     process = psutil.Process(os.getpid())
@@ -543,25 +484,11 @@ def main():
         internal_sr=config["ks_sample_rate"],
         interpolation_type=config["interpolation_type"],
         filter_type=config["filter_type"],
+        timesteps=config["timesteps"],
+        n_noise_bands=config["n_noise_bands"],
     ).to(device)
 
-    # ---- Backbone freeze / partial unfreeze based on train_backbone_steps ----
-    current_stage = 0 if config["train_backbone_steps"] > 0 else 1
-    if current_stage == 0:
-        print("[BACKBONE] Freezing backbone initially; heads/mel-attn trainable")
-        set_stage0_backbone_frozen(model)
-    else:
-        print(f"[BACKBONE] Partially unfreezing backbone: last {args.backbone_unfreeze_layers} layers "
-              f"(LayerNorm={'on' if args.unfreeze_layernorm else 'off'}, "
-              f"pos_embed={'on' if args.unfreeze_pos_embed else 'off'})")
-        set_stage1_unfreeze_partial(
-            model,
-            n_layers=args.backbone_unfreeze_layers,
-            also_unfreeze_layernorm=args.unfreeze_layernorm,
-            train_pos_embed=args.unfreeze_pos_embed,
-        )
-
-    optimizer = build_optimizer(model, lr_main=config["learning_rate"], lr_backbone=config["backbone_lr"])
+    optimizer = build_optimizer(model, lr_main=config["learning_rate"])
     # Log current stage to wandb (removed as per instruction)
 
     print_trainable_summary(model, optimizer)
@@ -625,44 +552,33 @@ def main():
             )
 
             stft_sv = mr_stft_sv(recon.unsqueeze(1), audio.unsqueeze(1))
-            loss = args.stft_weight * stft_sv
+            # Spectral-flux MAE (Shier et al.)
+            sf_recon = spectral_flux(recon, fs=config["sample_rate"], n_fft=1024, hop=256,
+                                     min_hz=config["sf_min_freq"]).float()
+            sf_target = spectral_flux(audio, fs=config["sample_rate"], n_fft=1024, hop=256,
+                                      min_hz=config["sf_min_freq"]).float()
+            loss_sf = torch.nn.functional.l1_loss(sf_recon, sf_target)
 
-            # ---- Two-harmonic (p,g) prior loss from onset windows -----------------
-            if config.get("pg_weight", 0.0) > 0.0:
-                # Get loop coeffs (b0, a1, g) and onset lists from the model
-                _lc, _geq, _gf, _gu, _pre, _post, _exc, onset_lists = model(
-                    pitch, loud, audio, config["sample_rate"], return_parameters=True,
-                )
-                # _lc: [B, T_int, K]; with return_gain=True, K=3 and _lc[...,1] is a1, _lc[...,2] is g
-                B, T_int, K = _lc.shape
-                # Build per-frame targets
-                p_tgt, g_tgt, mask = _build_pg_targets_for_batch(
-                    audio_b=audio, pitch_b=pitch.squeeze(2), onset_lists=onset_lists,
-                    fs=config["sample_rate"], T_int=T_int, n_fft=1024, hop=256,
-                )
-                # Derive predicted p,g per frame from loop coeffs
-                if config["filter_type"].lower() == "iir":
-                    p_pred = _lc[..., 1]                      # a1 == p
-                    g_pred = _lc[..., 2]                      # g
-                else:
-                    # FIR: a1 = p * g, b0 = (1-p) * g
-                    a1 = _lc[..., 1]
-                    g_pred = _lc[..., 2]
-                    eps = 1e-8
-                    p_pred = a1 / (g_pred + eps)
-                    p_pred = torch.clamp(p_pred, 1e-6, 1.0 - 1e-6)
-                # Compute masked L2 prior
-                mask = mask.to(p_pred.dtype)
-                denom = mask.sum().clamp_min(1.0)
-                pg_mse = (((p_pred - p_tgt) ** 2 + (g_pred - g_tgt) ** 2) * mask).sum() / denom
-                loss_pg = pg_mse
-                loss = loss + config["pg_weight"] * loss_pg
-                if wandb.run is not None:
-                    wandb.log({
-                        "train/loss_pg": float(loss_pg.detach().cpu().item()),
-                        "train/pg_mask_count": float(denom.detach().cpu().item()),
-                    }, step=int(global_step))
-            # -----------------------------------------------------------------------
+            # (p,g) supervision from onset-to-onset decays
+            onset_lists = [detect_onsets_librosa(audio[b], sr=config["sample_rate"]) for b in range(audio.size(0))]
+            p_tgt, g_tgt, m_tgt = _build_pg_targets_for_batch(audio, pitch.squeeze(-1), onset_lists,
+                                                              fs=config["sample_rate"], T_int=config["timesteps"],
+                                                              n_fft=1024, hop=256)
+            # Get model parameters for (p,g)
+            params = model(
+                pitch, loud, audio, config["sample_rate"], return_parameters=True
+            )
+            loop_logits = params["loop_logits"]
+            #excitation  = params["excitation"]
+            loop_pg = model.decoder.design_loop(loop_logits, return_gain=True)  # [B, T, 3]
+            p_pred = loop_pg[..., 1]
+            g_pred = loop_pg[..., 2]
+            # Masked L2 over frames
+            denom = m_tgt.sum().clamp_min(1.0)
+            loss_pg = (((p_pred - p_tgt) ** 2 + (g_pred - g_tgt) ** 2) * m_tgt).sum() / denom
+
+            loss = args.stft_weight * stft_sv + config["sf_weight"] * loss_sf + config["pg_weight"] * loss_pg
+
 
             # Abort early if loss is NaN or Inf
             if not torch.isfinite(loss):
@@ -674,15 +590,7 @@ def main():
                 break
             optimizer.zero_grad()
             loss.backward()
-            if batch_idx == 0:
-                print_grad_snapshot(
-                    model,
-                    components=[
-                        "z_encoder",
-                    ],
-                )
-            if batch_idx == 0:
-                print_ast_head_grads(model)
+            # (Removed print_grad_snapshot and print_ast_head_grads)
 
             # Accumulate per-component mean absolute gradient (this batch)
             for name, p in model.named_parameters():
@@ -696,23 +604,16 @@ def main():
 
             global_step += 1
 
-            # Backbone transition: when reaching train_backbone_steps, partially unfreeze backbone
-            if current_stage == 0 and global_step >= config["train_backbone_steps"]:
-                print(f"[BACKBONE] Reached global_step={global_step} → partially unfreezing last {config['backbone_unfreeze_layers']} layers")
-                set_stage1_unfreeze_partial(
-                    model,
-                    n_layers=config["backbone_unfreeze_layers"],
-                    also_unfreeze_layernorm=config["unfreeze_layernorm"],
-                    train_pos_embed=config["unfreeze_pos_embed"],
-                )
-                optimizer = rebuild_optimizer(optimizer, model, lr_main=config["learning_rate"], lr_backbone=config["backbone_lr"])
-                current_stage = 1
+            # (Removed backbone transition logic)
 
             if wandb.run is not None:
                 wandb.log({
                     "train loss per batch": float(loss.item()),
                     "train/loss_stft": float(stft_sv.item()),
-                }, step=int(global_step))
+                    "train/loss_sf": float(loss_sf.item()),
+                    "train/loss_pg": float(loss_pg.item()),
+                    "epoch": int(epoch),
+                })
 
             t_loss += loss.item()
             batches_processed += 1
@@ -730,7 +631,7 @@ def main():
             torch.save(ckpt, abort_ckpt)
             print(f"[ABORT] Saved checkpoint to {abort_ckpt}")
             if wandb.run is not None:
-                wandb.log({"nonfinite_loss_detected": True, "epoch": epoch, "batch": batch_idx}, step=int(global_step))
+                wandb.log({"nonfinite_loss_detected": True, "epoch": int(epoch), "batch": int(batch_idx)})
                 wandb.run.summary["nonfinite_loss"] = True
                 wandb.finish()
             return
@@ -761,7 +662,7 @@ def main():
 
         # ─── LOGGING ───────────────────────────────────────────────────────
         if epoch % config["eval_interval"] == 0:
-            log_epoch(t_loss, v_loss_std, step=int(global_step))
+            log_epoch(t_loss, v_loss_std, epoch)
         else:
             # no validation this epoch
             pass
@@ -799,122 +700,149 @@ def main():
                 )
                 assert rec.shape[1] == a.shape[1]
 
-                # Fetch parameter info and internal signals
-                _lc, _geq, gain_frames_b, gain_up_b, excitation_pregain_b, excitation_postgain_b, excitation_b, fixed_onsets = model(
-                    p, l, a, config["sample_rate"],
-                    return_parameters=True,
-                )
-                gains_db_batch = _geq["gains_db"]  # [B, K]
-                if gains_db_batch is not None:
-                    gcpu = gains_db_batch.detach().cpu()
-                    same = bool(torch.allclose(gcpu, gcpu[0:1].expand_as(gcpu), atol=1e-6)) if gcpu.size(0) > 1 else True
-                    per_band_std = float(gcpu.std(dim=0).mean().item()) if gcpu.ndim == 2 else float("nan")
-                    print(
-                        f"[GEQ DBG] batch_size={gcpu.size(0)} bands={gcpu.size(1) if gcpu.ndim==2 else 'NA'} "
-                        f"mean(per-band std)={per_band_std:.6f} dB | identical_across_batch={same} | "
-                        f"min={gcpu.min().item():.3f} dB max={gcpu.max().item():.3f} dB"
-                    )
-
-                # Save & log a few examples
+                # --- Simple audio logging ---
                 media_log = {}
                 for idx in range(n_plot):
                     wave_orig = a[idx].cpu().numpy()
                     wave_rec  = rec[idx].cpu().numpy()
-                    wave_exc  = excitation_b[idx].detach().cpu().numpy() if isinstance(excitation_b, torch.Tensor) else np.asarray(excitation_b[idx])
-
-                    # Ensure excitation is same length as audio for clean concatenation
-                    if len(wave_exc) != len(wave_orig):
-                        wave_exc = _resample_to_len(wave_exc, len(wave_orig))
-
-                    # Concatenate target || excitation || recon for quick listening
-                    sample_cat = np.concatenate([wave_orig, wave_exc, wave_rec], axis=0)
+                    sample_cat = np.concatenate([wave_orig, wave_rec], axis=0)
                     peak = float(np.max(np.abs(sample_cat))) if sample_cat.size > 0 else 0.0
                     sample_cat = sample_cat / peak * 0.99 if peak > 0 else sample_cat
-
                     wav_name = f"sample_e{epoch}_{idx}.wav"
                     wav_path = os.path.join(config["save_dir"], wav_name)
                     sf.write(wav_path, sample_cat, config["sample_rate"])
                     print(f"[AUDIO] wrote: {wav_path}")
-
                     if wandb.run is not None:
                         media_log[f"audio_{idx}"] = wandb.Audio(
                             sample_cat,
                             sample_rate=config["sample_rate"],
-                            caption=f"epoch {epoch} | sample {idx} | target+excitation+recon",
+                            caption=f"epoch {epoch} | sample {idx} | target+recon",
                         )
+                if wandb.run is not None and len(media_log) > 0:
+                    wandb.log(media_log, commit=True)
 
-                # ---- Composite (4‑panel) per example -----------------------------
-                # --- Compute piece-wise constant (p,g) targets for composite plots ---
-                # Use same logic as in training: build targets from fixed batch
-                # Use fixed_audio, fixed_pitch, and onsets from model call
-                # Build per-frame (p,g) targets for the fixed batch
-                p_tgt, g_tgt, mask = _build_pg_targets_for_batch(
-                    audio_b=a, pitch_b=p.squeeze(2), onset_lists=fixed_onsets,
-                    fs=config["sample_rate"], T_int=_lc.shape[1], n_fft=1024, hop=256,
+                # --- Diagnostics plots (waveforms, logits/coeffs/p&g, triggers, spectral flux) ---
+                # Fetch parameters for the fixed batch
+                params_b = model(
+                    p, l, a, config["sample_rate"], return_parameters=True
+                )
+                loop_logits_b = params_b["loop_logits"]
+                #excitation_b  = params_b["excitation"]
+                loop_pg_b = model.decoder.design_loop(loop_logits_b, return_gain=True)  # [B, T, 3]
+
+                # Build (p,g) targets for the fixed batch using the same onset detector
+                onset_lists_fix = [detect_onsets_librosa(a[b], sr=config["sample_rate"]) for b in range(a.size(0))]
+                p_tgt_b, g_tgt_b, m_tgt_b = _build_pg_targets_for_batch(
+                    a, p.squeeze(-1), onset_lists_fix,
+                    fs=config["sample_rate"], T_int=config["timesteps"], n_fft=1024, hop=256
                 )
 
+                # Convenience
+                fs = config["sample_rate"]
+                N = a.shape[1]
+                T_int = config["timesteps"]
+                t = np.arange(N) / float(fs)
+                t_frames = np.linspace(0.0, N / float(fs), T_int)
+
+                # Limit to n_plot examples
                 for idx in range(n_plot):
-                    target_np = a[idx].cpu().numpy()
-                    recon_np  = rec[idx].cpu().numpy()
-                    lc_np = _lc[idx].detach().cpu().numpy()  # [T_int, K]
-                    eq_gains_np = gains_db_batch[idx].detach().cpu().numpy() if gains_db_batch is not None else None
+                    # ---- (1) Waveforms: target vs reconstruction ----
+                    fig, ax = plt.subplots(figsize=(10, 3))
+                    ax.plot(t, a[idx].cpu().numpy(), label="target", linewidth=0.8)
+                    ax.plot(t, rec[idx].cpu().numpy(), label="recon", linewidth=0.8, alpha=0.8)
+                    ax.set_title(f"Waveforms (epoch {epoch}, sample {idx})")
+                    ax.set_xlabel("Time [s]")
+                    ax.set_ylabel("Amplitude")
+                    ax.legend(loc="upper right")
+                    wave_png = os.path.join(config["save_dir"], f"wave_e{epoch}_{idx}.png")
+                    fig.tight_layout()
+                    fig.savefig(wave_png, dpi=150)
+                    print(f"[IMG] wrote: {wave_png}")
+                    plt.close(fig)
 
-                    # Build piece-wise constant target loop coeffs for plotting
-                    # p_tgt, g_tgt: [B, T_int]
-                    p_tgt_np = p_tgt[idx].detach().cpu().numpy()
-                    g_tgt_np = g_tgt[idx].detach().cpu().numpy()
-                    if config["filter_type"].lower() == "iir":
-                        a1 = p_tgt_np
-                        g = g_tgt_np
-                        b0 = (1.0 - a1) * g
+                    # ---- (2) Loop logits, p/g (pred vs tgt) ----
+                    l_logits = loop_logits_b[idx].detach().cpu().numpy()  # [T, L+1]
+                    pg_vals = loop_pg_b[idx].detach().cpu().numpy()        # [T, 3]
+                    p_pred = pg_vals[:, 1]
+                    g_pred = pg_vals[:, 2]
+                    p_tgt = p_tgt_b[idx].detach().cpu().numpy()
+                    g_tgt = g_tgt_b[idx].detach().cpu().numpy()
+
+                    fig, ax = plt.subplots(3, 1, figsize=(10, 7), sharex=True)
+                    # plot all raw logits
+                    for k in range(l_logits.shape[1]):
+                        ax[0].plot(t_frames, l_logits[:, k], label=f"logit[{k}]")
+                    ax[0].set_ylabel("loop logits")
+                    ax[0].legend(ncol=min(4, l_logits.shape[1]), fontsize=8)
+                    # p & g predictions
+                    ax[1].plot(t_frames, p_pred, label="p_pred")
+                    ax[1].plot(t_frames, p_tgt, label="p_tgt", linestyle=":")
+                    ax[1].set_ylabel("p")
+                    ax[1].legend(loc="upper right", ncol=2, fontsize=8)
+                    ax[2].plot(t_frames, g_pred, label="g_pred")
+                    ax[2].plot(t_frames, g_tgt, label="g_tgt", linestyle=":")
+                    ax[2].set_ylabel("g")
+                    ax[2].set_xlabel("Time [s]")
+                    ax[2].legend(loc="upper right", ncol=2, fontsize=8)
+                    coeff_png = os.path.join(config["save_dir"], f"coeffs_pg_e{epoch}_{idx}.png")
+                    fig.tight_layout()
+                    fig.savefig(coeff_png, dpi=150)
+                    print(f"[IMG] wrote: {coeff_png}")
+                    plt.close(fig)
+
+                    # ---- (3) Onsets visualization ----
+                    onsets_samples = onset_lists_fix[idx]
+                    fig, ax = plt.subplots(figsize=(10, 3))
+                    ax.plot(t, a[idx].cpu().numpy(), label="target", linewidth=0.5, alpha=0.5)
+                    for s in onsets_samples:
+                        ax.axvline(x=s / float(fs), color="r", linestyle="--", linewidth=0.8, alpha=0.7)
+                    ax.set_title(f"Onsets (epoch {epoch}, sample {idx})")
+                    ax.set_xlabel("Time [s]")
+                    ax.set_ylabel("amplitude / onsets")
+                    ax.legend(loc="upper right")
+                    trig_png = os.path.join(config["save_dir"], f"triggers_e{epoch}_{idx}.png")
+                    fig.tight_layout()
+                    fig.savefig(trig_png, dpi=150)
+                    print(f"[IMG] wrote: {trig_png}")
+                    plt.close(fig)
+
+                    # ---- (4) Spectral flux: target vs recon (+ threshold used for onsets) ----
+                    x_t = a[idx:idx+1]
+                    x_r = rec[idx:idx+1]
+                    sf_t = spectral_flux(x_t, fs=fs, n_fft=1024, hop=256, min_hz=config["sf_min_freq"])[0].detach().cpu().numpy()
+                    sf_r = spectral_flux(x_r, fs=fs, n_fft=1024, hop=256, min_hz=config["sf_min_freq"])[0].detach().cpu().numpy()
+                    # smooth & threshold like detector
+                    if sf_t.shape[0] >= 5:
+                        sf_ts = torch.nn.functional.avg_pool1d(torch.from_numpy(sf_t).view(1,1,-1), kernel_size=5, stride=1, padding=2).view(-1).numpy()
                     else:
-                        # FIR: a1 = p * g, b0 = (1-p) * g
-                        a1 = p_tgt_np * g_tgt_np
-                        g = g_tgt_np
-                        b0 = (1.0 - p_tgt_np) * g_tgt_np
-                    # Stack as [T_int, 3]: [b0, a1, g]
-                    lc_targets_np = np.stack([b0, a1, g], axis=-1)
+                        sf_ts = sf_t
+                    med = np.median(sf_ts)
+                    mad = np.median(np.abs(sf_ts - med)) + 1e-8
+                    thr = med + 1.0 * mad
+                    f = np.arange(sf_t.shape[0]) * (256.0 / float(fs))  # frame times in seconds
+                    fig, ax = plt.subplots(figsize=(10, 3))
+                    ax.plot(f, sf_t, label="SF target")
+                    ax.plot(f, sf_r, label="SF recon")
+                    ax.plot(f, np.full_like(f, thr), label="threshold", linestyle="--")
+                    ax.set_title(f"Spectral Flux (epoch {epoch}, sample {idx})")
+                    ax.set_xlabel("Time [s]")
+                    ax.set_ylabel("Flux")
+                    ax.legend(loc="upper right")
+                    flux_png = os.path.join(config["save_dir"], f"flux_e{epoch}_{idx}.png")
+                    fig.tight_layout()
+                    fig.savefig(flux_png, dpi=150)
+                    print(f"[IMG] wrote: {flux_png}")
+                    plt.close(fig)
 
-                    comp_path = os.path.join(config["save_dir"], f"composite_e{epoch}_{idx}.png")
-                    plot_composite_four(
-                        comp_path,
-                        target=target_np,
-                        reconstructed=recon_np,
-                        loop_coeffs_c=lc_np,
-                        eq_gains=eq_gains_np,
-                        sr=config["sample_rate"],
-                        loop_coeffs_target=lc_targets_np,
-                    )
-
-                    # --- Excitation composite (3 stacked panels, zoomed on first trigger) ---
-                    pre_np  = excitation_pregain_b[idx].detach().cpu().numpy()
-                    post_np = excitation_postgain_b[idx].detach().cpu().numpy()
-                    exc_np  = excitation_b[idx].detach().cpu().numpy()
-                    gf_np   = gain_frames_b[idx].detach().cpu().numpy()
-                    gu_np   = gain_up_b[idx].detach().cpu().numpy()
-
-                    exc_comp_path = os.path.join(config["save_dir"], f"excitation_composite_zoom_e{epoch}_{idx}.png")
-                    plot_excitation_composite_zoomed(
-                        exc_comp_path,
-                        sr=config["sample_rate"],
-                        excitation_pregain=pre_np,
-                        excitation_postgain=post_np,
-                        excitation=exc_np,
-                        gain_frames=gf_np,
-                        gain_up=gu_np,
-                        pre_ms=10.0,
-                        post_ms=10.0,
-                    )
-
+                    # Log images to W&B
                     if wandb.run is not None:
-                        media_log[f"excitation_composite_{idx}"] = wandb.Image(
-                            exc_comp_path, caption=f"Excitation composite (zoom) | e{epoch} i{idx}")
-
-                    if wandb.run is not None:
-                        media_log[f"composite_{idx}"] = wandb.Image(comp_path, caption=f"Composite | e{epoch} i{idx}")
-
-                if wandb.run is not None and len(media_log) > 0:
-                    wandb.log(media_log, commit=True, step=int(global_step))
+                        wandb.log({
+                            "epoch": int(epoch),
+                            f"img/wave_{idx}": wandb.Image(wave_png),
+                            f"img/coeffs_pg_{idx}": wandb.Image(coeff_png),
+                            f"img/triggers_{idx}": wandb.Image(trig_png),
+                            f"img/flux_{idx}": wandb.Image(flux_png),
+                        })
 
         if epoch % config["eval_interval"] == 0:
             print(f"[E{epoch}] train={t_loss:.4f} val_std={v_loss_std:.4f} best={best_val_loss:.4f} (no-improve {epochs_since_improve}/{config['patience']})")
@@ -924,6 +852,6 @@ def main():
     wandb.finish()
 
 
-if __name__ == '__main__':
+if __name__ == '__main__' or __name__.endswith("autoencoder.train"):
     mp.freeze_support()
     main()
