@@ -29,25 +29,27 @@ def parse_args():
     p.add_argument("--name", type=str, default=env("NAME", "exp"),
                    help="Unique experiment name (used for checkpoints & wandb run)")
     p.add_argument("--continue_from_checkpoint", action="store_true",
-                   default=str2bool(env("CONTINUE_FROM_CHECKPOINT", "false")),
+                   default=str2bool(env("CONTINUE_FROM_CHECKPOINT") or "false"),
                    help="Resume training from latest checkpoint for this --name")
 
     # ─── Optimisation hyper-parameters ─────────────────────────────────────
-    p.add_argument("--learning_rate", type=float, default=float(env("LEARNING_RATE", 1e-4)))
-    p.add_argument("--batches_per_epoch", type=int, default=int(env("BATCHES_PER_EPOCH", 10000)))
-    p.add_argument("--max_epochs", type=int, default=int(env("MAX_EPOCHS", 10000)))
-    p.add_argument("--patience", type=int, default=int(env("PATIENCE", 2000)))
-    p.add_argument("--min_delta", type=float, default=float(env("MIN_DELTA", 0.001)),
+    p.add_argument("--learning_rate", type=float, default=float(env("LEARNING_RATE") or 1e-4))
+    p.add_argument("--batches_per_epoch", type=int, default=int(env("BATCHES_PER_EPOCH") or 10000))
+    p.add_argument("--max_epochs", type=int, default=int(env("MAX_EPOCHS") or 10000))
+    p.add_argument("--patience", type=int, default=int(env("PATIENCE") or 2000))
+    p.add_argument("--min_delta", type=float, default=float(env("MIN_DELTA") or 0.001),
                    help="Minimum relative (fractional) validation-loss improvement to reset patience. 0.001 = 0.1 %")
 
+    # ─── tFiLM block size ─────────────────────────────────────────────────
+    p.add_argument("--tfilm_block_size", type=int, default=int(env("TFILM_BLOCK_SIZE") or 256),
+                   help="Block size for tFiLM (default: 256, can override via TFILM_BLOCK_SIZE env var)")
+
     # ─── Data-loading ──────────────────────────────────────────────────────
-    p.add_argument("--batch_size", type=int, default=int(env("BATCH_SIZE", 16)))
-    p.add_argument("--num_workers", type=int, default=int(env("NUM_WORKERS", 2)))
-
-
+    p.add_argument("--batch_size", type=int, default=int(env("BATCH_SIZE") or 16))
+    p.add_argument("--num_workers", type=int, default=int(env("NUM_WORKERS") or 2))
 
     # ─── DiffKS filter configuration ───────────────────────────────────────
-    p.add_argument("--l_order", type=int, default=int(env("L_ORDER", 1)))
+    p.add_argument("--l_order", type=int, default=int(env("L_ORDER") or 1))
     p.add_argument("--filter_type", type=str, default=(env("FILTER_TYPE", "iir")))
 
     # ─── Dataset filters ────────────────────────────────────────────────────
@@ -59,23 +61,23 @@ def parse_args():
     p.add_argument("--pitch_mode", type=str, default=env("PITCH_MODE", "meta"))
 
     # ─── Losses weights ────────────────────────────────────────────────────
-    p.add_argument("--stft_weight", type=float, default=float(env("STFT_WEIGHT", 1.0)))
-    p.add_argument("--sf_weight", type=float, default=float(env("SF_WEIGHT", 0.5)),
+    p.add_argument("--stft_weight", type=float, default=float(env("STFT_WEIGHT") or 0.0))
+    p.add_argument("--sf_weight", type=float, default=float(env("SF_WEIGHT") or 0.0),
                    help="Weight for spectral-flux onset loss (L1 between novelty curves)")
-    p.add_argument("--sf_min_freq", type=float, default=float(env("SF_MIN_FREQ", 0.0)),
+    p.add_argument("--sf_min_freq", type=float, default=float(env("SF_MIN_FREQ") or 0.0),
                    help="Optional high-pass in Hz for spectral-flux; 0 disables")
-    p.add_argument("--pg_weight", type=float, default=float(env("PG_WEIGHT", 0.2)),
+    p.add_argument("--pg_weight", type=float, default=float(env("PG_WEIGHT") or 0.2),
                    help="Weight for onset-to-onset (p,g) supervision loss")
 
     # ─── DiffKS timesteps and noise bands ─────────────────────────────────
-    p.add_argument("--timesteps", type=int, default=int(env("TIMESTEPS", 250)))
-    p.add_argument("--n_noise_bands", type=int, default=int(env("N_NOISE_BANDS", 64)))
-    p.add_argument("--burst_width", type=int, default=int(env("BURST_WIDTH", 1)),
+    p.add_argument("--timesteps", type=int, default=int(env("TIMESTEPS") or 250))
+    p.add_argument("--n_noise_bands", type=int, default=int(env("N_NOISE_BANDS") or 64))
+    p.add_argument("--burst_width", type=int, default=int(env("BURST_WIDTH") or 1),
                    help="Width of the burst (in frames) for onset-gated excitation")
 
     # ─── Testing mode ──────────────────────────────────────────────────────
     p.add_argument("--test", action="store_true",
-                   default=str2bool(env("TEST", "false")),
+                   default=str2bool(env("TEST") or "false"),
                    help="If set, load the NSynth 'test' split for both training and validation")
     return p.parse_args()
 
@@ -410,6 +412,7 @@ def main():
         "n_noise_bands": args.n_noise_bands,
         "pg_weight": args.pg_weight,
         "burst_width": args.burst_width,
+        "tfilm_block_size": args.tfilm_block_size,
     }
 
     print("\n▶ Running with config:")
@@ -486,6 +489,7 @@ def main():
         filter_type=config["filter_type"],
         timesteps=config["timesteps"],
         n_noise_bands=config["n_noise_bands"],
+        tfilm_block_size=config["tfilm_block_size"],
     ).to(device)
 
     optimizer = build_optimizer(model, lr_main=config["learning_rate"])

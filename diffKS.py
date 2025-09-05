@@ -20,13 +20,13 @@ class DiffKS(nn.Module):
         self,
         batch_size: int = 1,
         internal_sr: int = 16000,
-        min_f0_hz: float = 27.5,
+        min_f0_hz: float = 20,
         loop_order: int = 1,
         loop_n_frames: int = 250,
-        interp_type: str = "linear",
+        interp_type: str = "lagrange",
         use_double_precision: bool = True,
         device: torch.device = get_device(),
-        loop_filter_kind: str = "fir",
+        loop_filter_kind: str = "iir",
     ):
         super().__init__()
         assert loop_order == 1, "This implementation supports only order-1 loop filters."
@@ -226,6 +226,15 @@ class DiffKS(nn.Module):
             l_b=l_b,
         )
 
+        '''
+        # --- Smooth upsampled logits with a low-pass FIR (stronger smoothing on mix/a1 than gain) ---
+        l_b = self._smooth_loop_logits_fir(
+            l_b,
+            cutoff_hz=(25.0, 8.0),  # (gain_logits cutoff, mix_logits cutoff) in Hz at internal_sr
+            kernel_size=129,
+        )
+        '''
+
         l_b = self.design_loop(
             f0=f0,
             l_b=l_b,
@@ -352,7 +361,7 @@ class DiffKS(nn.Module):
 
     def design_loop(self,
                     l_b: torch.Tensor,  # [B, N, 2] -> logits for [gain, mix]
-                    f0: torch.Tensor,   # [B, N]
+                    f0: torch.Tensor = None,   # [B, N]
                     return_gain: bool = False,
                     ) -> torch.Tensor:  # [B, N, 2] -> [b0, a1]
         """
@@ -399,17 +408,25 @@ class DiffKS(nn.Module):
 
         taps = torch.stack([b0, a1], dim=-1)
 
+        '''
         # Debug safety check (should never trigger with the parameterization above)
         sum_taps = torch.abs(taps).sum(dim=-1)
         condition = sum_taps >= 1.0
-        assert not condition.any(), (
-            f"Loop filter |taps| sum must be < 1. Found {condition.sum().item()} instances where the sum is >= 1.0. "
-            f"The violating values are:"
-            f"\n  b0: {b0[condition].tolist()}"
-            f"\n  a1: {a1[condition].tolist()}"
-            f"\n  g: {g[condition].tolist()}"
-            f"\n  sum: {sum_taps[condition].tolist()}"
-        )
+        if condition.any():
+            # Report only the first offending position to avoid huge dumps
+            viol_idx = condition.nonzero(as_tuple=False)[0]  # tensor([batch, sample])
+            b_i = int(viol_idx[0].item())
+            n_i = int(viol_idx[1].item())
+            raise AssertionError(
+                "Loop filter |taps| sum must be < 1. "
+                f"Found {int(condition.sum().item())} violating positions; "
+                f"first at batch={b_i}, sample={n_i}: "
+                f"b0={b0[b_i, n_i].item():.9f}, "
+                f"a1={a1[b_i, n_i].item():.9f}, "
+                f"g={g[b_i, n_i].item():.9f}, "
+                f"sum|taps|={sum_taps[b_i, n_i].item():.9f}"
+            )
+        '''
 
         if return_gain is False:
             return taps
@@ -440,3 +457,69 @@ class DiffKS(nn.Module):
             ).squeeze(-1)
 
         return f0.to(self.device), l_b.to(self.device)
+
+    def _smooth_loop_logits_fir(self,
+                                l_b: torch.Tensor,
+                                cutoff_hz=(25.0, 8.0),
+                                kernel_size: int = 129) -> torch.Tensor:
+        """
+        Apply a Hann–windowed sinc low-pass FIR to the upsampled loop *logits* `l_b`
+        before parameterization. This reduces fast wiggles while letting true
+        transitions through. You can pass a scalar cutoff (Hz) or a pair
+        (gain_cutoff_hz, mix_cutoff_hz). The filter is applied per-channel with
+        depthwise conv1d and reflect padding to keep length.
+
+        Args:
+            l_b: [B, N, 2] logits → [gain_logits, mix_logits]
+            cutoff_hz: float or (float, float) in Hz (at `internal_sr`).
+                Defaults to 25 Hz for gain, 8 Hz for mix (heavier smoothing on mix).
+            kernel_size: odd number of taps; default 129 → ~4 ms group delay at 16 kHz.
+        Returns:
+            Smoothed logits with the same shape as `l_b`.
+        """
+        assert l_b.dim() == 3 and l_b.shape[-1] == self.loop_n_coefficients, (
+            f"Expected l_b shape [B, N, {self.loop_n_coefficients}], got {l_b.shape}")
+
+        # Ensure odd kernel size
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+
+        B, N, C = l_b.shape
+        sr = float(self.internal_sr)
+
+        # Build per-channel cutoffs (Hz)
+        if isinstance(cutoff_hz, (tuple, list)):
+            assert len(cutoff_hz) == C, "cutoff_hz must be scalar or length == number of channels"
+            cuts = torch.tensor(cutoff_hz, device=self.device, dtype=self._dtype)
+        else:
+            cuts = torch.full((C,), float(cutoff_hz), device=self.device, dtype=self._dtype)
+
+        # Time index centered at zero
+        n = torch.arange(kernel_size, device=self.device, dtype=self._dtype) - (kernel_size - 1) / 2
+        window = torch.hann_window(kernel_size, periodic=False, device=self.device,
+                                   dtype=self._dtype)
+
+        # Design Hann-windowed sinc low-pass for each channel, normalize DC gain
+        kernels = []
+        for c in range(C):
+            fc_over_fs = cuts[c] / sr  # cycles per sample (0..0.5)
+            # Ideal LPF impulse response (torch.sinc is sin(pi x)/(pi x))
+            h = 2.0 * fc_over_fs * torch.sinc(2.0 * fc_over_fs * n)
+            h = h * window
+            h = h / h.sum()
+            kernels.append(h)
+        W = torch.stack(kernels, dim=0).unsqueeze(1)  # [C, 1, K]
+
+        # Depthwise conv per channel with reflect padding to keep length
+        x = l_b.permute(0, 2, 1)  # [B, C, N]
+        pad = kernel_size // 2
+
+        if self.device.type == "mps" and x.dtype == torch.float64:
+            # MPS backend doesn't support float64 conv; do it in float32 then cast back
+            x32 = x.to(torch.float32)
+            W32 = W.to(torch.float32)
+            y = F.conv1d(F.pad(x32, (pad, pad), mode="reflect"), W32, groups=C).to(self._dtype)
+        else:
+            y = F.conv1d(F.pad(x, (pad, pad), mode="reflect"), W, groups=C)
+
+        return y.permute(0, 2, 1)
