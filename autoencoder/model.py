@@ -1,19 +1,145 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchaudio.transforms as T
 import numpy as np
 from diffKS import DiffKS
 from core import make_onset_noise, detect_onsets_librosa
 import math
-from torchlpc import sample_wise_lpc
-from flamo.auxiliary.eq import eq_freqs, geq as geq_sos
 
 # Additional imports for Jordi-style attention pooling
 from einops import rearrange, repeat
 
+import torch.fft as fft
+
 MIN_HZ = 20
 MAX_HZ = 8000
+
+# ==============================
+# FIR noise filterbank utilities
+# ==============================
+# Bounded dB-range mapping: [min_db, max_db].
+def scale_function(x, min_db: float = -40.0, max_db: float = 16.0):
+    """
+    Map logits x -> linear gain g with a bounded dB range.
+    Range: [min_db, max_db] dB (defaults to -80 dB .. +16 dB).
+    Use a negative bias at call-site (e.g., x-5) to start near the quiet floor.
+    """
+    # σ(x)∈(0,1) → scale_db ∈ [min_db, max_db]
+    scale_db = min_db + (max_db - min_db) * torch.sigmoid(x)
+    # Convert dB to linear
+    g = torch.pow(torch.tensor(10.0, device=x.device, dtype=x.dtype), scale_db / 20.0)
+    return g
+
+
+# Helper: build log-frequency triangular filterbank for band-to-linear mapping
+def _make_log_tri_filterbank(n_bins_lin: int, fs: int, n_bands: int, fmin: float, fmax: float, device, dtype):
+    """
+    Returns [n_bins_lin, n_bands] weight matrix for mapping n_bands log-f bands to linear-f spectrum.
+    Each row is a linear-f bin; each col is a band; rows sum to 1 where covered.
+    """
+    # Clamp fmax to < fs/2
+    nyq = fs / 2.0
+    if fmax >= nyq:
+        fmax = nyq - 1e-4
+    # Linear-f bin frequencies (including DC and Nyquist)
+    freqs = torch.linspace(0, nyq, n_bins_lin, device=device, dtype=dtype)  # [n_bins_lin]
+    # Log-space centers
+    exponents = torch.linspace(
+        math.log10(fmin), math.log10(fmax), n_bands,
+        device=device, dtype=dtype
+    )
+    centers = torch.pow(10.0, exponents)    # Edges: geometric mean between centers
+
+    edges = torch.zeros(n_bands + 1, device=device, dtype=dtype)
+    edges[1:-1] = torch.sqrt(centers[:-1] * centers[1:])
+    edges[0] = fmin
+    edges[-1] = fmax
+    # Compute log10 for all freqs/centers/edges
+    log_freqs = torch.log10(freqs.clamp(min=1e-8))
+    log_centers = torch.log10(centers)
+    log_edges = torch.log10(edges)
+    # Build triangular weights
+    fb = torch.zeros(n_bins_lin, n_bands, device=device, dtype=dtype)
+    for k in range(n_bands):
+        # For each band: left, center, right in log-f
+        left = log_edges[k]
+        c = log_centers[k]
+        right = log_edges[k+1]
+        # Compute rising and falling slopes
+        # Mask for bins within band
+        in_band = (log_freqs >= left) & (log_freqs <= right)
+        # Rising slope
+        rise = ((log_freqs - left) / (c - left)).clamp(0, 1)
+        # Falling slope
+        fall = ((right - log_freqs) / (right - c)).clamp(0, 1)
+        w = torch.minimum(rise, fall)
+        w = w * in_band
+        fb[:, k] = w
+    # Normalize so each linear bin sums to 1 across bands (where covered)
+    norm = fb.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    fb = fb / norm
+    fb[torch.isnan(fb)] = 0.0
+    return fb  # [n_bins_lin, n_bands]
+
+def amp_to_impulse_response(
+    amp: torch.Tensor,
+    target_size: int,
+    fs: int,
+    norm: str = "l2",
+    fmin: float = MIN_HZ,
+    fmax: float = MAX_HZ,
+) -> torch.Tensor:
+    """Map per-frame magnitude response (possibly in log-f bands) -> time-domain FIR (length = target_size).
+    amp: [B, T, K] real, non-negative magnitudes. If K == target_size//2+1, treated as linear spectrum.
+    Otherwise, upsample via log-f triangular filterbank to M = target_size//2+1.
+    Returns: [B, T, target_size] real FIR kernels. Optionally normalized per-frame.
+    """
+    B, T, K = amp.shape
+    M = target_size // 2 + 1
+    device = amp.device
+    dtype = amp.dtype
+    # If K == M, treat as linear spectrum
+    if K == M:
+        amp_lin = amp
+    else:
+        # K is #log-f bands, upsample to linear spectrum [B, T, M]
+        fb = _make_log_tri_filterbank(M, fs, K, fmin, fmax, device, dtype)  # [M, K]
+        amp_lin = torch.matmul(amp, fb.t())  # [B, T, K] x [K, M] = [B, T, M]
+    # Build complex spectrum with zero imaginary part
+    amp_c = torch.view_as_complex(torch.stack([amp_lin, torch.zeros_like(amp_lin)], dim=-1))  # [B, T, M]
+    ir = fft.irfft(amp_c, n=target_size)  # [B, T, target_size]
+    filter_size = ir.shape[-1]
+    # Center the IR, window it, pad/crop to target size, then un-center
+    ir = torch.roll(ir, shifts=filter_size // 2, dims=-1)
+    win = torch.hann_window(filter_size, dtype=ir.dtype, device=ir.device)
+    ir = ir * win
+    if filter_size < target_size:
+        ir = F.pad(ir, (0, int(target_size) - int(filter_size)))
+    elif filter_size > target_size:
+        ir = ir[..., :target_size]
+    ir = torch.roll(ir, shifts=-filter_size // 2, dims=-1)
+    # --- Per-frame normalization (recommended: unit energy) ---
+    if norm == "l2":
+        d = ir.pow(2).sum(dim=-1, keepdim=True).sqrt().clamp_min(1e-8)
+        ir = ir / d
+    elif norm == "l1":
+        d = ir.abs().sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        ir = ir / d
+    elif norm is None:
+        pass
+    else:
+        raise ValueError("norm must be 'l2', 'l1', or None")
+    return ir
+
+def fft_convolve(signal: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
+    """Frame-wise FFT convolution along the last dimension.
+    signal: [B, T, L], kernel: [B, T, L] -> [B, T, L]
+    """
+    L = signal.shape[-1]
+    x = F.pad(signal, (0, L))
+    h = F.pad(kernel, (L, 0))
+    y = fft.irfft(fft.rfft(x) * fft.rfft(h))
+    return y[..., y.shape[-1] // 2:]
 
 # =============================================================
 # Small TCN building blocks
@@ -51,95 +177,6 @@ class DilatedResBlock(nn.Module):
         y = self.conv2(self.act(self.norm2(y)))
         return x + y
 
-# =============================================================
-# SoundStream-style waveform encoder (no FiLM, no quantization)
-# Based on Shier et al.'s DrumBlender encoder blocks
-# =============================================================
-class Pad(nn.Module):
-    def __init__(self, kernel_size: int, dilation: int, causal: bool = False):
-        super().__init__()
-        self.pad = int(dilation) * (int(kernel_size) - 1)
-        self.causal = bool(causal)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.causal:
-            return F.pad(x, (self.pad, 0))
-        left = self.pad // 2
-        right = self.pad - left
-        return F.pad(x, (left, right))
-
-class _SSResidualUnit(nn.Module):
-    def __init__(self, width: int, dilation: int, kernel_size: int = 7, causal: bool = False):
-        super().__init__()
-        self.net = nn.Sequential(
-            Pad(kernel_size, dilation, causal=causal),
-            nn.Conv1d(width, width, kernel_size, dilation=dilation, padding=0),
-            nn.ELU(),
-            nn.Conv1d(width, width, 1),
-        )
-        self.final_act = nn.ELU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.net(x)
-        return x + self.final_act(y)
-
-class _SSEncoderBlock(nn.Module):
-    def __init__(self, width: int, stride: int, kernel_size: int = 7, causal: bool = False):
-        super().__init__()
-        # Three residual units with dilations 1,3,9 operating at width//2 channels
-        self.units = nn.ModuleList([
-            _SSResidualUnit(width // 2, 1, kernel_size, causal=causal),
-            _SSResidualUnit(width // 2, 3, kernel_size, causal=causal),
-            _SSResidualUnit(width // 2, 9, kernel_size, causal=causal),
-        ])
-        # Strided conv to double channels and downsample time by `stride`
-        self.out = nn.Sequential(
-            Pad(2 * stride, 1, causal=causal),
-            nn.Conv1d(width // 2, width, 2 * stride, stride=stride, padding=0),
-            nn.ELU(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for u in self.units:
-            x = u(x)
-        return self.out(x)
-
-class SoundStreamEncoder(nn.Module):
-    """Convolutional waveform encoder (no RVQ).
-    Strides default to (2,2,4,4) → overall downsample x64.
-    """
-    def __init__(
-        self,
-        input_channels: int = 1,
-        hidden_channels: int = 32,
-        output_channels: int = 64,
-        kernel_size: int = 7,
-        strides: tuple[int, ...] = (2, 2, 4, 4),
-        causal: bool = False,
-    ):
-        super().__init__()
-        self.input = nn.Sequential(
-            Pad(kernel_size, 1, causal=causal),
-            nn.Conv1d(input_channels, hidden_channels, kernel_size, padding=0),
-            nn.ELU(),
-        )
-        enc_blocks = []
-        h = hidden_channels
-        for s in strides:
-            h = h * 2
-            enc_blocks.append(_SSEncoderBlock(h, s, kernel_size=kernel_size, causal=causal))
-        self.blocks = nn.ModuleList(enc_blocks)
-        self.output = nn.Sequential(
-            Pad(3, 1, causal=causal),
-            nn.Conv1d(h, output_channels, 3, padding=0),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, C=1, N] → features: [B, output_channels, N/∏strides]
-        y = self.input(x)
-        for blk in self.blocks:
-            y = blk(y)
-        return self.output(y)
 
 
 # =============================================================
@@ -172,249 +209,16 @@ class AttentionPooling(nn.Module):
         return attn
 
 
-# =============================================================
-# FiLM and TemporalFiLM1x1
-# =============================================================
 
-class FiLM(nn.Module):
-    """Feature-wise Linear Modulation (Jordi-style).
-    Takes a clip-level embedding and returns gamma/beta for an activation x.
-    If used with batch-norm, it normalizes x (affine=False) before applying FiLM.
-    """
-    def __init__(self, film_embedding_size: int, input_channels: int, use_batch_norm: bool = True):
-        super().__init__()
-        self.use_batch_norm = use_batch_norm
-        if self.use_batch_norm:
-            self.norm = nn.BatchNorm1d(input_channels, affine=False)
-        self.net = nn.Linear(film_embedding_size, input_channels * 2)
-
-    def forward(self, x: torch.Tensor, film_embedding: torch.Tensor):
-        film = self.net(film_embedding)
-        gamma, beta = film.chunk(2, dim=-1)
-        if self.use_batch_norm:
-            x = self.norm(x)
-        return gamma[..., None] * x + beta[..., None]
-
-
-# Jordi Shier's DrumBlender-style Temporal Feature-wise Linear Modulation (TFiLM)
-class TFiLM(nn.Module):
-    """Temporal Feature-wise Linear Modulation layer. Derives affine parameters from a
-    decimated version of the input signal, and applies them to the input. Allows the
-    model to learn longer-range temporal dependencies.
-    """
-
-    def __init__(self, channels: int, block_size: int):
-        super().__init__()
-        self.block_size = block_size
-
-        self.pool = nn.MaxPool1d(block_size)
-        self.block_size = block_size
-
-        self.lstm = nn.LSTM(
-            input_size=channels,
-            hidden_size=channels,
-            num_layers=1,
-        )
-        self.proj = nn.Linear(channels, channels * 2)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        *_, length = x.shape
-        n_blocks = length // self.block_size
-        assert n_blocks > 0, "Input length must be greater than block size."
-        assert (
-            length == n_blocks * self.block_size
-        ), "Input length must be divisible by block size."
-
-        x_decimated = self.pool(x)
-        x_decimated = rearrange(x_decimated, "b c t -> t b c")
-
-        affine, _ = self.lstm(x_decimated)
-        affine = self.proj(affine)
-        affine = rearrange(affine, "t b c -> b c t 1")
-        gamma, beta = affine.chunk(2, dim=1)
-
-        x = rearrange(x, "b c (n k) -> b c n k", k=self.block_size)
-        x = gamma * x + beta
-        x = rearrange(x, "b c n k -> b c (n k)")
-
-        return x
 
 
 
 
 # =============================================================
-# Jordi-style GatedActivation, TCN, and SoundStreamAttentionEncoder
-# =============================================================
-
-class GatedActivation(nn.Module):
-    """Gated activation function for 1D convolutional networks. Expects input of shape
-    (batch_size, channels * 2, time).
-    """
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x.chunk(2, dim=-2)
-        assert x1.shape[-2] == x2.shape[-2], "Input channels must be divisible by 2."
-        return torch.tanh(x1) * torch.sigmoid(x2)
-
-
-class _DilatedResidualBlock(nn.Module):
-    """Temporal convolutional network internal block (Jordi Shier, DrumBlender style).
-    Includes optional FiLM and optional TFiLM hooks (we keep FiLM only here).
-    """
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        dilation: int,
-        causal: bool = True,
-        norm: str | None = None,
-        activation: str = "GELU",
-        film_conditioning: bool = False,
-        film_embedding_size: int | None = None,
-        film_batch_norm: bool = True,
-        use_temporal_film: bool = True,
-        temporal_film_block_size: int | None = 256,
-    ):
-        super().__init__()
-
-        if film_conditioning and (film_embedding_size is None or film_embedding_size < 1):
-            raise ValueError("FiLM conditioning requires a valid embedding size (int >= 1).")
-
-        net = []
-        pre_activation_channels = out_channels * 2 if activation == "gated" else out_channels
-
-        if norm is not None:
-            if norm not in ("batch", "instance"):
-                raise ValueError("Invalid norm type (must be batch or instance)")
-            _Norm = nn.BatchNorm1d if norm == "batch" else nn.InstanceNorm1d
-            net.append(_Norm(in_channels))
-
-        net.extend([
-            Pad(kernel_size, dilation, causal=causal),
-            nn.Conv1d(
-                in_channels,
-                pre_activation_channels,
-                kernel_size,
-                dilation=dilation,
-                padding=0,
-            ),
-        ])
-        self.net = nn.Sequential(*net)
-
-        self.film = FiLM(film_embedding_size, pre_activation_channels, film_batch_norm) if film_conditioning else None
-        self.activation = GatedActivation() if activation == "gated" else getattr(nn, activation)()
-        self.residual = nn.Conv1d(in_channels, out_channels, 1)
-        self.tfilm = None
-        if use_temporal_film:
-            if temporal_film_block_size is None or temporal_film_block_size < 1:
-                raise ValueError("TFiLM requires a valid block size (int >= 1).")
-            self.tfilm = TFiLM(out_channels, temporal_film_block_size)
-
-    def forward(self, x: torch.Tensor, film_embedding: torch.Tensor | None = None):
-        activations = self.net(x)
-        if self.film is not None:
-            activations = self.film(activations, film_embedding)
-        y = self.activation(activations)
-        if self.tfilm is not None:
-            y = self.tfilm(y)
-        return y + self.residual(x)
-
-
-class TCN(nn.Module):
-    """Jordi-style Temporal Convolutional Network with (optional) FiLM conditioning.
-    Operates at audio rate on 1D sequences.
-    """
-    def __init__(
-        self,
-        in_channels: int,
-        hidden_channels: int,
-        out_channels: int,
-        dilation_base: int = 2,
-        num_layers: int = 8,
-        kernel_size: int = 3,
-        causal: bool = True,
-        norm: str | None = None,
-        activation: str = "GELU",
-        film_conditioning: bool = False,
-        film_embedding_size: int | None = None,
-        film_batch_norm: bool = True,
-        use_temporal_film: bool = True,
-        temporal_film_block_size: int | None = 256,
-    ):
-        super().__init__()
-        self.in_projection = nn.Conv1d(in_channels, hidden_channels, 1)
-        self.out_projection = nn.Conv1d(hidden_channels, out_channels, 1)
-
-        net = []
-        for n in range(num_layers):
-            dilation = dilation_base ** n
-            net.append(
-                _DilatedResidualBlock(
-                    hidden_channels,
-                    hidden_channels,
-                    kernel_size,
-                    dilation,
-                    causal=causal,
-                    norm=norm,
-                    activation=activation,
-                    film_conditioning=film_conditioning,
-                    film_embedding_size=film_embedding_size,
-                    film_batch_norm=film_batch_norm,
-                    use_temporal_film=use_temporal_film,
-                    temporal_film_block_size=temporal_film_block_size,
-                )
-            )
-        self.net = nn.ModuleList(net)
-
-        # Xavier init for stability
-        nn.init.xavier_uniform_(self.in_projection.weight)
-        nn.init.zeros_(self.in_projection.bias)
-        nn.init.xavier_uniform_(self.out_projection.weight)
-        nn.init.zeros_(self.out_projection.bias)
-
-    def forward(self, x: torch.Tensor, film_embedding: torch.Tensor | None = None):
-        x = self.in_projection(x)
-        for layer in self.net:
-            x = layer(x, film_embedding)
-        x = self.out_projection(x)
-        return x
-
-
-class SoundStreamAttentionEncoder(nn.Module):
-    """SoundStream encoder with attention pooling to produce a clip-level embedding
-    (as in DrumBlender)."""
-    def __init__(
-        self,
-        input_channels: int,
-        hidden_channels: int,
-        output_channels: int,
-        kernel_size: int = 7,
-        strides: tuple[int, ...] = (2, 2, 4, 4),
-        causal: bool = False,
-    ):
-        super().__init__()
-        self.encoder = SoundStreamEncoder(
-            input_channels=input_channels,
-            hidden_channels=hidden_channels,
-            output_channels=output_channels,
-            kernel_size=kernel_size,
-            strides=strides,
-            causal=causal,
-        )
-        self.pool = AttentionPooling(output_channels)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, C, N] -> emb: [B, E]
-        feats = self.encoder(x)          # [B, E, T]
-        emb  = self.pool(feats)          # [B, E]
-        return emb
-
-# =============================================================
-# Low-rate controller TCN (runs at frame-rate over pitch/loudness)
-# Emits DiffKS loop logits per frame and clip-global GEQ gains
+# Low-rate TCN feature extractor for segment-level prediction
 # =============================================================
 class LowRateTCN(nn.Module):
-    def __init__(self, in_ch=2, ch=64, n_blocks=6, kernel=3, loop_out=3, n_geq=32):
+    def __init__(self, in_ch=2, ch=64, n_blocks=6, kernel=3, loop_out=3, n_bands=64):
         super().__init__()
         self.inp = Conv1dSame(in_ch, ch, kernel, dilation=1)
         blocks = []
@@ -422,33 +226,25 @@ class LowRateTCN(nn.Module):
             blocks.append(DilatedResBlock(ch, kernel_size=kernel, dilation=2 ** i))
         self.tcn = nn.Sequential(*blocks)
         self.post = Conv1dSame(ch, ch, 1)
-        self.loop_head = nn.Conv1d(ch, loop_out, 1)
-        # Safe initialization: start with zero logits → mid‑range g/p in current mapping
-        nn.init.zeros_(self.loop_head.weight)
-        if self.loop_head.bias is not None:
-            nn.init.zeros_(self.loop_head.bias)
-        self.attn_pool = AttentionPooling(in_features=ch, keep_seq_dim=False)
-        self.geq_proj = nn.Linear(ch, n_geq)
-        # Neutral GEQ at start (0 dB for all bands)
-        nn.init.zeros_(self.geq_proj.weight)
-        if self.geq_proj.bias is not None:
-            nn.init.zeros_(self.geq_proj.bias)
+        # Heads are applied on segment-pooled features (AttentionPooling outside)
+        self.loop_proj = nn.Linear(ch, loop_out)
+        assert self.loop_proj.bias is not None and self.loop_proj.bias.numel() >= loop_out, "loop_proj must have a bias of size >= loop_out"
+        self.band_proj = nn.Linear(ch, n_bands)
+
+        nn.init.constant_(self.loop_proj.bias[0],  2.0)   # g logit → sigmoid ≈ 0.88
 
     def forward(self, pitch_seq, loud_seq):
         """
-        pitch_seq, loud_seq: [B, T, 1]
+        Inputs:
+          pitch_seq, loud_seq: [B, T, 1]
         Returns:
-          loop_logits: [B, T, loop_out]
-          geq_logits:  [B, n_geq]
+          h: hidden features [B, C, T]
         """
         x = torch.cat([pitch_seq, loud_seq], dim=-1).transpose(1, 2)  # [B, 2, T]
         h = self.inp(x)
         h = self.tcn(h)
-        h = self.post(h)                     # [B, C, T]
-        loop = self.loop_head(h).transpose(1, 2)  # [B, T, loop_out]
-        h_pool = self.attn_pool(h)  # [B, C]
-        geq = self.geq_proj(h_pool)
-        return loop, geq
+        h = self.post(h)  # [B, C, T]
+        return h
 
 # =============================================================
 # nnKarplusStrong with split controllers:
@@ -463,13 +259,10 @@ class nnKarplusStrong(nn.Module):
                  interpolation_type,
                  filter_type,
                  timesteps: int = 250,
-                 n_noise_bands: int = 64,
-                 hidden_size: int = 256,
+                 n_noise_bands: int = 16,
                  hi_hop_samples: int = 64,
                  lpc_order: int = 6,
-                 lo_tcn_ch: int = 64,
-                 hi_tcn_ch: int = 32,
-                 tfilm_block_size: int = 256):
+                 lo_tcn_ch: int = 64,):
         super().__init__()
         self.internal_sr = internal_sr
         self.loop_order = loop_order
@@ -477,7 +270,7 @@ class nnKarplusStrong(nn.Module):
         self.n_noise_bands = n_noise_bands
         self.lpc_order = lpc_order
         self.hi_hop = int(hi_hop_samples)
-        self.tfilm_block_size = int(tfilm_block_size)
+
 
         # --- Conditioning normalization (dataset-aware) ---
         # Pitch comes in Hz; clamp between E2 and E6, then log2 → [0,1]
@@ -492,50 +285,16 @@ class nnKarplusStrong(nn.Module):
         self.loud_db_min = -80.0
         self.loud_db_max = 0.0
 
-        # --- GEQ layout (one‑third‑octave bands), applied POST-KS ---
-        self.sample_rate = internal_sr
-        cf, sh = eq_freqs(interval=3)
-        nyq = self.sample_rate * 0.5
-        cf = torch.as_tensor(cf, dtype=torch.float32)
-        cf = cf[cf <= (nyq * 0.98)]
-        self.geq_centers = cf
-        sh = torch.as_tensor(sh, dtype=torch.float32)
-        sh = torch.stack([torch.clamp(sh[0], min=20.0), torch.clamp(sh[1], max=nyq * 0.98)])
-        self.geq_shelves = sh
-        self.n_geq = int(self.geq_centers.numel() + 3)
-        self.max_gain_db = 12.0
+        # --- n_noise_bands attribute ---
+        self.n_noise_bands = int(n_noise_bands)
 
-        # Controller: SoundStream + AttentionPooling -> clip embedding for FiLM
-        film_size = hi_tcn_ch  # FiLM embedding size
-        self.ss_controller = SoundStreamAttentionEncoder(
-            input_channels=1,            # controller sees target audio only (Jordi-style)
-            hidden_channels=32,
-            output_channels=film_size,
-            kernel_size=7,
-            strides=(2, 2, 4, 4),
-            causal=False,
-        )
-
-        # Burst shaper: audio-rate TCN on the burst stream, FiLM-conditioned by the controller embedding
-        self.burst_tcn = TCN(
-            in_channels=1,
-            hidden_channels=hi_tcn_ch,
-            out_channels=1,
-            dilation_base=2,
-            num_layers=8,
-            kernel_size=3,
-            causal=True,
-            norm=None,
-            activation="GELU",
-            film_conditioning=True,
-            film_embedding_size=film_size,
-            film_batch_norm=True,
-            use_temporal_film=True,
-            temporal_film_block_size=self.tfilm_block_size,
-        )
-
+        # --- Low-rate TCN for feature extraction and heads ---
         self.low_tcn = LowRateTCN(in_ch=2, ch=lo_tcn_ch, n_blocks=6, kernel=3,
-                                   loop_out=loop_order + 1, n_geq=self.n_geq)
+                                   loop_out=loop_order + 1, n_bands=n_noise_bands)
+
+        # Attention pooling used *between onsets* (segment-level pooling)
+        self.onset_pool = AttentionPooling(in_features=lo_tcn_ch, keep_seq_dim=False)
+
 
         # Differentiable KS decoder
         self.decoder = DiffKS(
@@ -581,80 +340,6 @@ class nnKarplusStrong(nn.Module):
     # -----------------------------
     # Helpers
     # -----------------------------
-    def _rc_to_lpc(self, rc: torch.Tensor) -> torch.Tensor:
-        """Vectorised Levinson step-up: RC (PARCOR) → LPC 'a' coefficients.
-        rc: [B, T, P]  → a: [B, T, P]
-        """
-        Bf, Tf, P = rc.shape
-        a = torch.zeros(Bf, Tf, P, device=rc.device, dtype=rc.dtype)
-        for m in range(P):
-            km = rc[..., m]
-            if m == 0:
-                a[..., 0] = km
-            else:
-                prev = a[..., :m].clone()
-                rev = torch.flip(prev, dims=[-1])
-                a[..., :m] = prev + km.unsqueeze(-1) * rev
-                a[..., m] = km
-        return a
-
-    def _apply_geq_fd(self, x: torch.Tensor, gains_db: torch.Tensor, sr: int) -> torch.Tensor:
-        """Apply FLAMO GEQ as a cascade of SOS in the frequency domain.
-        x: [B, N] time‑domain mono
-        gains_db: [B, K] where K = 2 + len(self.geq_centers)
-        Returns: [B, N]
-        """
-        B, N = x.shape
-        nfft = 1
-        while nfft < N:
-            nfft <<= 1
-        w = 2.0 * math.pi * torch.arange(0, nfft // 2 + 1, device=x.device, dtype=x.dtype) / float(nfft)
-        z1 = torch.exp(-1j * w)
-        z2 = torch.exp(-2j * w)
-
-        cf = self.geq_centers.to(device=x.device, dtype=x.dtype)
-        sh = self.geq_shelves.to(device=x.device, dtype=x.dtype)
-        R = torch.tensor(2.7, device=x.device, dtype=x.dtype)
-
-        y_list = []
-        K_needed = int(cf.numel() + 3)
-
-        for b in range(B):
-            gdb = gains_db[b]
-            if gdb.numel() != K_needed:
-                if gdb.numel() > K_needed:
-                    gdb = gdb[:K_needed]
-                else:
-                    pad = torch.zeros(K_needed - gdb.numel(), device=gdb.device, dtype=gdb.dtype)
-                    gdb = torch.cat([gdb, pad], dim=0)
-
-            b_sos, a_sos = geq_sos(
-                center_freq=cf,
-                shelving_freq=sh,
-                R=R,
-                gain_db=gdb,
-                fs=float(sr),
-                device=x.device,
-            )
-
-            b0, b1, b2 = b_sos[0], b_sos[1], b_sos[2]
-            a0, a1, a2 = a_sos[0], a_sos[1], a_sos[2]
-            a0_safe = a0 + 1e-12
-            b0, b1, b2 = b0 / a0_safe, b1 / a0_safe, b2 / a0_safe
-            a1, a2 = a1 / a0_safe, a2 / a0_safe
-
-            num = b0.view(-1, 1) + b1.view(-1, 1) * z1 + b2.view(-1, 1) * z2
-            den = 1.0 + a1.view(-1, 1) * z1 + a2.view(-1, 1) * z2
-            H_sections = num / (den + 1e-30)
-            H = torch.prod(H_sections, dim=0)
-
-            X = torch.fft.rfft(x[b], n=nfft)
-            H = H.to(dtype=X.dtype)
-            Y = X * H
-            y_time = torch.fft.irfft(Y, n=nfft).real[:N]
-            y_list.append(y_time.to(dtype=x.dtype))
-
-        return torch.stack(y_list, dim=0)
 
     def trainable_parameters(self):
         return [p for p in self.parameters() if p.requires_grad]
@@ -667,18 +352,20 @@ class nnKarplusStrong(nn.Module):
         B, N = audio.shape
         T_frames = pitch.size(1)
 
-        # --- Low-rate controller on pitch/loudness (frame-rate), with DDX7-style normalization ---
+        # --- Low-rate conditioning (DDX7-style scaling) ---
         pitch_scaled, loud_scaled = self._scale_conditioning(pitch, _loudness)
-        loop_logits, geq_logits = self.low_tcn(pitch_scaled, loud_scaled)  # [B,T,loop+1], [B,K]
-        gains_db = self.max_gain_db * torch.tanh(geq_logits)
 
-        # --- Onset-triggered noise burst excitation (reference logic) ---
-        # Map sample index -> frame index helper
+        # --- Low-rate TCN features at frame-rate ---
+        # h: [B, C, T]
+        h = self.low_tcn(pitch_scaled, loud_scaled)
+        C = h.shape[1]
+
+        # Helper: sample index -> frame index
         def _sample_to_frame_idx(s: int, N: int, T: int) -> int:
             idx = int(round(s * T / max(1, N)))
             return max(0, min(T - 1, idx))
 
-        # Detect onsets per batch (librosa-based helper), with fallback
+        # --- Detect onsets (sample indices per batch) ---
         onset_list = []
         for b in range(B):
             on_b = detect_onsets_librosa(audio[b], sr=int(audio_sr))
@@ -686,7 +373,7 @@ class nnKarplusStrong(nn.Module):
                 on_b = np.array([0], dtype=int)
             onset_list.append(on_b)
 
-        # Build bursts-only excitation per batch (noise bursts per onset, length = one period)
+        # --- Build bursts-only excitation per batch (noise bursts per onset, length = one period) ---
         burst_rows = []
         for b in range(B):
             burst_b = torch.zeros(1, N, device=audio.device, dtype=audio.dtype)
@@ -703,29 +390,76 @@ class nnKarplusStrong(nn.Module):
                     device=audio.device,
                     dtype=audio.dtype,
                     burst_len_samples=L_loc,
-                    impulse_instead=False,
+                    impulse_instead=True,
                 )  # [1, N]
+                # --- Scale burst amplitude linearly from frame loudness (0–1) ---
+                L_val = loud_scaled[b, f_idx, 0].clamp(0.0, 1.0)
+                amp = L_val.clamp_min(1e-5)
+                nb_burst = nb_burst * amp
+
                 burst_b = burst_b + nb_burst
             burst_rows.append(burst_b)
         burst_stream = torch.cat(burst_rows, dim=0)  # [B, N]
 
-        # Controller embedding from target audio (clip-level)
-        film_emb = self.ss_controller(audio.unsqueeze(1))  # [B, E]
+        # --- Onset-segment attention pooling over low-rate features ---
+        # We create frame boundaries using detected onsets mapped to frame indices.
+        loop_out = self.loop_order + 1
+        K = int(self.n_noise_bands)
+        # Prepare outputs [B, T, *]
+        loop_logits = torch.zeros(B, T_frames, loop_out, device=audio.device, dtype=audio.dtype)
+        band_gains_frames = torch.zeros(B, T_frames, K, device=audio.device, dtype=audio.dtype)
 
-        # Audio-rate FiLM-conditioned TCN directly shapes the burst stream
-        # Ensure length divisible by TFiLM block size by right-padding zeros
-        bs = getattr(self, "tfilm_block_size", 256)
-        burst_in = burst_stream.unsqueeze(1)  # [B,1,N]
-        if bs is not None and bs > 1:
-            pad = (bs - (N % bs)) % bs
-        else:
-            pad = 0
-        if pad:
-            burst_in = F.pad(burst_in, (0, pad))
-        shaped = self.burst_tcn(burst_in, film_emb)  # [B,1,N+pad]
-        excitation = shaped.squeeze(1)[..., :N]      # trim back to original length
+        for b in range(B):
+            # frame boundaries (include 0 and T)
+            frame_bounds = [0]
+            for s in onset_list[b].tolist():
+                fi = _sample_to_frame_idx(int(s), N, T_frames)
+                if fi not in frame_bounds:
+                    frame_bounds.append(fi)
+            frame_bounds = sorted(set([i for i in frame_bounds if 0 <= i < T_frames]))
+            if frame_bounds[0] != 0:
+                frame_bounds = [0] + frame_bounds
+            if frame_bounds[-1] != T_frames:
+                frame_bounds.append(T_frames)
 
-        # --- Synthesize with DiffKS (low-rate loop logits) ---
+            hb = h[b:b+1]  # [1, C, T]
+            for si in range(len(frame_bounds) - 1):
+                s = frame_bounds[si]
+                e = frame_bounds[si + 1]
+                if e <= s:
+                    continue
+                seg = hb[:, :, s:e]  # [1, C, L]
+                pooled = self.onset_pool(seg)  # [1, C]
+                # Heads on pooled features → piece-wise constant outputs
+                ll = self.low_tcn.loop_proj(pooled)  # [1, loop_out]
+                band_logits = self.low_tcn.band_proj(pooled)  # [1, K]
+
+                # IRCAM-like quiet init + allow up to +16 dB boost
+                # Use the same scale_function and a -5 shift for a very quiet start.
+                mags = scale_function(band_logits - 5.0)  # [1, K]
+
+                loop_logits[b, s:e, :]       = ll.expand(e - s, -1)
+                band_gains_frames[b, s:e, :] = mags.expand(e - s, -1)
+
+        # --- FIR noise shaping ala IRCAM DDSP (frame-wise time-varying FIR) ---
+        # Choose block size so that T_frames * block_size >= N
+        block_size = int(math.ceil(N / max(1, T_frames)))
+        pad_len = T_frames * block_size - N
+
+        # Build per-frame noise that follows the onset bursts: use the original
+        # burst_stream as a mask so we only excite frames that contain burst samples.
+        burst_padded = F.pad(burst_stream, (0, pad_len))                      # [B, T*block]
+        burst_blocks = burst_padded.view(B, T_frames, block_size)             # [B, T, block]
+
+        # Magnitude bins per frame -> per-frame FIR impulse responses
+        mags = band_gains_frames                                              # [B, T, K]
+        impulse = amp_to_impulse_response(mags, block_size, fs=int(audio_sr), norm=None)  # no per-frame normalization → magnitude mapping controls loudness
+
+        # Frame-wise convolution and fold back to a 1D excitation
+        shaped_blocks = fft_convolve(burst_blocks, impulse)                   # [B, T, block]
+        excitation = shaped_blocks.reshape(B, T_frames * block_size)[..., :N] # [B, N]
+
+        # --- DiffKS decode with loop coefficients at frame-rate ---
         out = self.decoder(
             f0_frames=pitch.squeeze(2),
             input=excitation,
@@ -733,21 +467,13 @@ class nnKarplusStrong(nn.Module):
             loop_coefficients=loop_logits,
         )  # [B, N]
 
-        # --- Clip-global GEQ (body) applied POST-KS ---
-        out_eq = self._apply_geq_fd(out, gains_db=gains_db, sr=int(audio_sr))
-
         if return_parameters:
             return {
-                "loop_logits": loop_logits,
+                "loop_logits": loop_logits.detach(),
+                "band_gains_frames": band_gains_frames.detach(),
                 "burst_stream": burst_stream.detach(),
-                "film_embedding": film_emb.detach(),
-                "decoder_out_pre_geq": out.detach(),
-                "decoder_out_post_geq": out_eq.detach(),
-                "geq_info": {
-                    "centers_hz": self.geq_centers.detach().cpu(),
-                    "shelves_hz": self.geq_shelves.detach().cpu(),
-                    "gains_db": gains_db.detach().cpu(),
-                },
+                "resonator_excitation": excitation.detach(),
+                "fir_impulse": impulse.detach(),
             }
 
-        return out_eq
+        return out

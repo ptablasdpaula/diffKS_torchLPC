@@ -226,15 +226,6 @@ class DiffKS(nn.Module):
             l_b=l_b,
         )
 
-        '''
-        # --- Smooth upsampled logits with a low-pass FIR (stronger smoothing on mix/a1 than gain) ---
-        l_b = self._smooth_loop_logits_fir(
-            l_b,
-            cutoff_hz=(25.0, 8.0),  # (gain_logits cutoff, mix_logits cutoff) in Hz at internal_sr
-            kernel_size=129,
-        )
-        '''
-
         l_b = self.design_loop(
             f0=f0,
             l_b=l_b,
@@ -385,17 +376,22 @@ class DiffKS(nn.Module):
                 s = s.pow(power)
             return (1.0 - eps) * s / (1.0 + s)  # in (0, 1 - eps)
 
-        # --- Explicit g in (0.9, 1) but never 1 ---
-        eps_g  = 1e-6
-        base   = 0.9
-        span   = 0.1 - eps_g                 # so upper bound is 1 - eps_g
-        g_unit = softcap01(gain_logits, eps=eps_g, tau=0.25, power=2.0)  # (0, 1 - eps_g)
-        g      = base + span * (g_unit / (1.0 - eps_g))                  # (0.9, 1 - eps_g)
+        # --- Logarithmic approach-to-1 mapping for g ---
+        # Map z (logits) so that:
+        #   z <= 0 -> g = 0.9
+        #   z = 1  -> g = 0.99
+        #   z = 2  -> g = 0.999
+        #   ...
+        eps = 1e-6
 
-        # --- p in a strict open interval (eps_p, 1 - eps_p) ---
-        eps_p  = 1e-6
-        p_unit = softcap01(mix_logits, eps=eps_p, tau=0.25, power=1.5)   # (0, 1 - eps_p)
-        p      = eps_p + (1.0 - 2.0 * eps_p) * (p_unit / (1.0 - eps_p))  # (eps_p, 1 - eps_p)
+        # Implemented as: g = 1 - max(10^{-(ReLU(z)+1)}, eps_g)
+        s = F.relu(gain_logits)
+        tail = torch.pow(torch.tensor(10.0, device=s.device, dtype=s.dtype), -(s + 1.0))
+        tail = torch.clamp(tail, min=eps)
+        g = 1.0 - tail
+
+        # --- p in a strict open interval (eps_p, 0.5 - eps_p) ---
+        p = torch.sigmoid(mix_logits) * (1 - eps)
 
         if self.loop_filter_kind == "iir":
             a1 = p
@@ -444,8 +440,7 @@ class DiffKS(nn.Module):
         l_b = F.interpolate(
             l_b.permute(0, 2, 1),
             size=num_samples,
-            mode="linear",
-            align_corners=False
+            mode="nearest",
         ).permute(0, 2, 1)
 
         if f0.size(1) == 1:
@@ -457,69 +452,3 @@ class DiffKS(nn.Module):
             ).squeeze(-1)
 
         return f0.to(self.device), l_b.to(self.device)
-
-    def _smooth_loop_logits_fir(self,
-                                l_b: torch.Tensor,
-                                cutoff_hz=(25.0, 8.0),
-                                kernel_size: int = 129) -> torch.Tensor:
-        """
-        Apply a Hann–windowed sinc low-pass FIR to the upsampled loop *logits* `l_b`
-        before parameterization. This reduces fast wiggles while letting true
-        transitions through. You can pass a scalar cutoff (Hz) or a pair
-        (gain_cutoff_hz, mix_cutoff_hz). The filter is applied per-channel with
-        depthwise conv1d and reflect padding to keep length.
-
-        Args:
-            l_b: [B, N, 2] logits → [gain_logits, mix_logits]
-            cutoff_hz: float or (float, float) in Hz (at `internal_sr`).
-                Defaults to 25 Hz for gain, 8 Hz for mix (heavier smoothing on mix).
-            kernel_size: odd number of taps; default 129 → ~4 ms group delay at 16 kHz.
-        Returns:
-            Smoothed logits with the same shape as `l_b`.
-        """
-        assert l_b.dim() == 3 and l_b.shape[-1] == self.loop_n_coefficients, (
-            f"Expected l_b shape [B, N, {self.loop_n_coefficients}], got {l_b.shape}")
-
-        # Ensure odd kernel size
-        if kernel_size % 2 == 0:
-            kernel_size += 1
-
-        B, N, C = l_b.shape
-        sr = float(self.internal_sr)
-
-        # Build per-channel cutoffs (Hz)
-        if isinstance(cutoff_hz, (tuple, list)):
-            assert len(cutoff_hz) == C, "cutoff_hz must be scalar or length == number of channels"
-            cuts = torch.tensor(cutoff_hz, device=self.device, dtype=self._dtype)
-        else:
-            cuts = torch.full((C,), float(cutoff_hz), device=self.device, dtype=self._dtype)
-
-        # Time index centered at zero
-        n = torch.arange(kernel_size, device=self.device, dtype=self._dtype) - (kernel_size - 1) / 2
-        window = torch.hann_window(kernel_size, periodic=False, device=self.device,
-                                   dtype=self._dtype)
-
-        # Design Hann-windowed sinc low-pass for each channel, normalize DC gain
-        kernels = []
-        for c in range(C):
-            fc_over_fs = cuts[c] / sr  # cycles per sample (0..0.5)
-            # Ideal LPF impulse response (torch.sinc is sin(pi x)/(pi x))
-            h = 2.0 * fc_over_fs * torch.sinc(2.0 * fc_over_fs * n)
-            h = h * window
-            h = h / h.sum()
-            kernels.append(h)
-        W = torch.stack(kernels, dim=0).unsqueeze(1)  # [C, 1, K]
-
-        # Depthwise conv per channel with reflect padding to keep length
-        x = l_b.permute(0, 2, 1)  # [B, C, N]
-        pad = kernel_size // 2
-
-        if self.device.type == "mps" and x.dtype == torch.float64:
-            # MPS backend doesn't support float64 conv; do it in float32 then cast back
-            x32 = x.to(torch.float32)
-            W32 = W.to(torch.float32)
-            y = F.conv1d(F.pad(x32, (pad, pad), mode="reflect"), W32, groups=C).to(self._dtype)
-        else:
-            y = F.conv1d(F.pad(x, (pad, pad), mode="reflect"), W, groups=C)
-
-        return y.permute(0, 2, 1)

@@ -17,13 +17,17 @@ from data.preprocess import NsynthDataset
 from utils.misc import get_device, str2bool
 
 
-from .losses import build_smooth_mrstft
+from .losses import build_smooth_mrstft, build_jtfst, build_a_loudness_loss
 from core import detect_onsets_librosa
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     env = os.environ.get
+
+    # ─── Invariance flag ──────────────────────────────────────────────────
+    p.add_argument("--invariant", type=str2bool, default=str2bool(env("INVARIANT") or "false"),
+                   help="If set, use scale-invariant STFT loss and RMS normalization in validation/logging")
 
     # ─── Run identification ────────────────────────────────────────────────
     p.add_argument("--name", type=str, default=env("NAME", "exp"),
@@ -40,17 +44,13 @@ def parse_args():
     p.add_argument("--min_delta", type=float, default=float(env("MIN_DELTA") or 0.001),
                    help="Minimum relative (fractional) validation-loss improvement to reset patience. 0.001 = 0.1 %")
 
-    # ─── tFiLM block size ─────────────────────────────────────────────────
-    p.add_argument("--tfilm_block_size", type=int, default=int(env("TFILM_BLOCK_SIZE") or 256),
-                   help="Block size for tFiLM (default: 256, can override via TFILM_BLOCK_SIZE env var)")
-
     # ─── Data-loading ──────────────────────────────────────────────────────
     p.add_argument("--batch_size", type=int, default=int(env("BATCH_SIZE") or 16))
     p.add_argument("--num_workers", type=int, default=int(env("NUM_WORKERS") or 2))
 
     # ─── DiffKS filter configuration ───────────────────────────────────────
     p.add_argument("--l_order", type=int, default=int(env("L_ORDER") or 1))
-    p.add_argument("--filter_type", type=str, default=(env("FILTER_TYPE", "iir")))
+    p.add_argument("--filter_type", type=str, default=(env("FILTER_TYPE", "fir")))
 
     # ─── Dataset filters ────────────────────────────────────────────────────
     p.add_argument("--families", type=str, default=env("FAMILIES", "guitar"))
@@ -61,24 +61,31 @@ def parse_args():
     p.add_argument("--pitch_mode", type=str, default=env("PITCH_MODE", "meta"))
 
     # ─── Losses weights ────────────────────────────────────────────────────
-    p.add_argument("--stft_weight", type=float, default=float(env("STFT_WEIGHT") or 0.0))
+    p.add_argument("--stft_weight", type=float, default=float(env("STFT_WEIGHT") or 1.0))
     p.add_argument("--sf_weight", type=float, default=float(env("SF_WEIGHT") or 0.0),
                    help="Weight for spectral-flux onset loss (L1 between novelty curves)")
     p.add_argument("--sf_min_freq", type=float, default=float(env("SF_MIN_FREQ") or 0.0),
                    help="Optional high-pass in Hz for spectral-flux; 0 disables")
-    p.add_argument("--pg_weight", type=float, default=float(env("PG_WEIGHT") or 0.2),
+    p.add_argument("--pg_weight", type=float, default=float(env("PG_WEIGHT") or 0.0),
                    help="Weight for onset-to-onset (p,g) supervision loss")
 
     # ─── DiffKS timesteps and noise bands ─────────────────────────────────
-    p.add_argument("--timesteps", type=int, default=int(env("TIMESTEPS") or 250))
     p.add_argument("--n_noise_bands", type=int, default=int(env("N_NOISE_BANDS") or 64))
-    p.add_argument("--burst_width", type=int, default=int(env("BURST_WIDTH") or 1),
-                   help="Width of the burst (in frames) for onset-gated excitation")
 
     # ─── Testing mode ──────────────────────────────────────────────────────
     p.add_argument("--test", action="store_true",
                    default=str2bool(env("TEST") or "false"),
                    help="If set, load the NSynth 'test' split for both training and validation")
+    # ─── JTFST loss weight ────────────────────────────────────────────────
+    p.add_argument("--jtfst_weight", type=float, default=float(env("JTFST_WEIGHT") or 0.0),
+                   help="Weight for joint time-frequency scattering loss")
+    # ─── A-weighted loudness loss weight ──────────────────────────────────
+    p.add_argument(
+        "--a_loudness_weight",
+        type=float,
+        default=float(env("A_LOUDNESS_WEIGHT") or 0.0),
+        help="Weight for A-weighted loudness difference loss"
+    )
     return p.parse_args()
 
 # -----------------------------------------------------------------
@@ -408,11 +415,8 @@ def main():
         "stft_weight": args.stft_weight,
         "sf_weight": args.sf_weight,
         "sf_min_freq": args.sf_min_freq,
-        "timesteps": args.timesteps,
         "n_noise_bands": args.n_noise_bands,
         "pg_weight": args.pg_weight,
-        "burst_width": args.burst_width,
-        "tfilm_block_size": args.tfilm_block_size,
     }
 
     print("\n▶ Running with config:")
@@ -487,17 +491,25 @@ def main():
         internal_sr=config["ks_sample_rate"],
         interpolation_type=config["interpolation_type"],
         filter_type=config["filter_type"],
-        timesteps=config["timesteps"],
         n_noise_bands=config["n_noise_bands"],
-        tfilm_block_size=config["tfilm_block_size"],
     ).to(device)
 
     optimizer = build_optimizer(model, lr_main=config["learning_rate"])
     # Log current stage to wandb (removed as per instruction)
 
     print_trainable_summary(model, optimizer)
-    # STFT loss (scale-variant)
-    mr_stft_sv = build_smooth_mrstft(scale_invariance=False).to(device).float()
+    # STFT loss (scale-invariant if --invariant is set)
+    mr_stft_sv = build_smooth_mrstft(scale_invariance=args.invariant).to(device).float()
+
+    # JTFST loss (optional)
+    jtfst_loss = None
+    if args.jtfst_weight > 0:
+        jtfst_loss = build_jtfst(shape=64000).to(device).float()
+
+    # A-weighted loudness loss (optional)
+    a_loudness_loss = None
+    if args.a_loudness_weight > 0:
+        a_loudness_loss = build_a_loudness_loss(p=1, reduction="mean").to(device).float()
 
     # ─── Resume from checkpoint if requested ──────────────────────────────
     start_epoch, best_val_loss = 0, float('inf')
@@ -561,12 +573,17 @@ def main():
                                      min_hz=config["sf_min_freq"]).float()
             sf_target = spectral_flux(audio, fs=config["sample_rate"], n_fft=1024, hop=256,
                                       min_hz=config["sf_min_freq"]).float()
+
+            # log-scale to stabilize (log1p handles zeros safely)
+            sf_recon = torch.log1p(sf_recon)
+            sf_target = torch.log1p(sf_target)
+
             loss_sf = torch.nn.functional.l1_loss(sf_recon, sf_target)
 
             # (p,g) supervision from onset-to-onset decays
             onset_lists = [detect_onsets_librosa(audio[b], sr=config["sample_rate"]) for b in range(audio.size(0))]
             p_tgt, g_tgt, m_tgt = _build_pg_targets_for_batch(audio, pitch.squeeze(-1), onset_lists,
-                                                              fs=config["sample_rate"], T_int=config["timesteps"],
+                                                              fs=config["sample_rate"], T_int=250,
                                                               n_fft=1024, hop=256)
             # Get model parameters for (p,g)
             params = model(
@@ -579,9 +596,28 @@ def main():
             g_pred = loop_pg[..., 2]
             # Masked L2 over frames
             denom = m_tgt.sum().clamp_min(1.0)
-            loss_pg = (((p_pred - p_tgt) ** 2 + (g_pred - g_tgt) ** 2) * m_tgt).sum() / denom
+            loss_pg = ((p_pred - p_tgt).abs() + (g_pred - g_tgt).abs()) * m_tgt
+            loss_pg = loss_pg.sum() / denom
 
-            loss = args.stft_weight * stft_sv + config["sf_weight"] * loss_sf + config["pg_weight"] * loss_pg
+            # JTFST loss (if enabled)
+            if jtfst_loss is not None:
+                loss_jtfst = jtfst_loss(recon.unsqueeze(1), audio.unsqueeze(1))
+            else:
+                loss_jtfst = torch.tensor(0.0, device=audio.device, dtype=stft_sv.dtype)
+
+            # A-weighted loudness loss (if enabled)
+            if a_loudness_loss is not None:
+                loss_a_loudness = a_loudness_loss(recon.unsqueeze(1), audio.unsqueeze(1))
+            else:
+                loss_a_loudness = torch.zeros(1, device=audio.device, dtype=stft_sv.dtype)
+
+            loss = (
+                args.stft_weight * stft_sv
+                + config["sf_weight"] * loss_sf
+                + config["pg_weight"] * loss_pg
+                + args.jtfst_weight * loss_jtfst
+                + args.a_loudness_weight * loss_a_loudness
+            )
 
 
             # Abort early if loss is NaN or Inf
@@ -616,6 +652,8 @@ def main():
                     "train/loss_stft": float(stft_sv.item()),
                     "train/loss_sf": float(loss_sf.item()),
                     "train/loss_pg": float(loss_pg.item()),
+                    "train/loss_jtfst": float(loss_jtfst.item()) if jtfst_loss is not None else 0.0,
+                    "train/loss_a_loudness": float(loss_a_loudness.item()) if a_loudness_loss is not None else 0.0,
                     "epoch": int(epoch),
                 })
 
@@ -660,6 +698,17 @@ def main():
                         pitch, loud, audio, config["sample_rate"],
                     )
                     assert recon_std.shape[1] == audio.shape[1]
+
+                    '''
+                    # Amplitude normalization only if invariant mode
+                    if args.invariant:
+                        eps = 1e-9
+                        rms_target = audio.pow(2).mean(dim=1, keepdim=True).sqrt() + eps
+                        rms_recon  = recon_std.pow(2).mean(dim=1, keepdim=True).sqrt() + eps
+                        gain = rms_target / rms_recon
+                        recon_std = recon_std * gain  # rescaled recon
+                    '''
+
                     loss_std = mr_stft_sv(recon_std.unsqueeze(1), audio.unsqueeze(1))
                     v_losses_std.append(loss_std.item())
             v_loss_std = float(np.mean(v_losses_std))
@@ -704,6 +753,16 @@ def main():
                 )
                 assert rec.shape[1] == a.shape[1]
 
+                # --- RMS amplitude matching for rec, as in validation loss, only if invariant ---
+                '''
+                if args.invariant:
+                    eps = 1e-9
+                    rms_target = a.pow(2).mean(dim=1, keepdim=True).sqrt() + eps
+                    rms_recon  = rec.pow(2).mean(dim=1, keepdim=True).sqrt() + eps
+                    gain = rms_target / rms_recon
+                    rec = rec * gain
+                '''
+
                 # --- Simple audio logging ---
                 media_log = {}
                 for idx in range(n_plot):
@@ -737,14 +796,14 @@ def main():
                 # Build (p,g) targets for the fixed batch using the same onset detector
                 onset_lists_fix = [detect_onsets_librosa(a[b], sr=config["sample_rate"]) for b in range(a.size(0))]
                 p_tgt_b, g_tgt_b, m_tgt_b = _build_pg_targets_for_batch(
-                    a, p.squeeze(-1), onset_lists_fix,
-                    fs=config["sample_rate"], T_int=config["timesteps"], n_fft=1024, hop=256
+                    a, p.squeeze(-1), onset_lists_fix, T_int=250,
+                    fs=config["sample_rate"], n_fft=1024, hop=256
                 )
 
                 # Convenience
                 fs = config["sample_rate"]
                 N = a.shape[1]
-                T_int = config["timesteps"]
+                T_int = 250
                 t = np.arange(N) / float(fs)
                 t_frames = np.linspace(0.0, N / float(fs), T_int)
 
