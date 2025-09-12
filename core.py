@@ -5,6 +5,7 @@ import librosa
 from torchlpc import sample_wise_lpc
 from torch import nn
 import math
+from torch.nn import functional as F
 
 # --------------------------------------------------------------------------
 # Onset detection helper (librosa, 50 ms left pad, backtrack)
@@ -195,3 +196,18 @@ class IIRResonatorBank(nn.Module):
             out_acc = out_acc + y_k * gains_up[:, :, k]
         # Light energy normalization to avoid scale blow-up when many bands active
         return out_acc / math.sqrt(max(1, K))
+
+def hz_to_samples(f0_hz: torch.Tensor, fs: int) -> torch.Tensor:
+    """Convert fundamental frequency in Hz to samples/period given sample rate fs.
+    Keeps dtype/device of f0_hz.
+    """
+    return torch.as_tensor(float(fs), dtype=f0_hz.dtype, device=f0_hz.device) / f0_hz
+
+def one_minus_log_tail(gain_logits: torch.Tensor, min_tail: float = 1e-6) -> torch.Tensor:
+    """Map unconstrained logits to a value g ∈ (0.9, 1) via a logarithmic tail.
+    Larger logits → tail→0 → g→1; negative logits clamp via ReLU so g doesn't exceed range.
+    """
+    s = F.relu(gain_logits)
+    tail = torch.pow(torch.tensor(10.0, device=s.device, dtype=s.dtype), -(s + 1.0))
+    tail = torch.clamp(tail, min=min_tail)
+    return 1.0 - tail

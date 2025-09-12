@@ -1,44 +1,9 @@
 import torch
 import torch.nn.functional as F
-import torchaudio.functional as TAF
 from torchcubicspline import natural_cubic_spline_coeffs, NaturalCubicSpline
 
 def midi_to_hz(midi : torch.Tensor) -> torch.Tensor:
     return 440 * 2 ** ((midi - 69) / 12)
-
-def kaiser_resample(x, sr_in: int, sr_out: int,
-                    width: int = 32, beta: float = 14.0,
-                    rolloff: float = 0.9475937167399596):
-    """
-    Linear-phase Kaiser-windowed sinc resampler, as used in DDSP (Engel., et al).
-
-    Args
-    ----
-    x        : (..., time) tensor
-    sr_in    : original sample-rate
-    sr_out   : target   sample-rate
-    width    : low-pass filter width (taps per phase)
-    beta     : Kaiser β; 14 ≈ >90 dB stop-band
-    rolloff  : pass-band edge / Nyquist (DDSP uses 0.94759371674)
-    """
-    orig_dev = x.device
-    # if on MPS, do the actual resampling on CPU
-    if orig_dev.type == "mps":
-        x = x.cpu()
-    y = TAF.resample(
-        x, sr_in, sr_out,
-        lowpass_filter_width=width,
-        rolloff=rolloff,
-        resampling_method="sinc_interp_kaiser",
-        beta=beta
-    )
-
-    AUDIO_S = x.shape[1] / sr_in
-    assert y.shape[1] == sr_out * AUDIO_S, f"Expected axis-1 length {sr_out}, got {y.shape[1]}"
-
-    # move back to the original device only if we fell back
-    return y.to(orig_dev) if orig_dev.type == "mps" else y
-
 
 def spline_upsample(
         x: torch.Tensor,  # [B, Frames, D]
@@ -49,7 +14,6 @@ def spline_upsample(
     t_out = torch.linspace(0, 1, steps=num_samples, device=x.device)
     spline_fit = natural_cubic_spline_coeffs(t_in, x)
     return NaturalCubicSpline(spline_fit).evaluate(t_out)
-
 
 class InvertLPC(torch.autograd.Function):
     @staticmethod
