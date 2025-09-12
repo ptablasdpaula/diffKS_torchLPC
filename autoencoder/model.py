@@ -5,6 +5,7 @@ import numpy as np
 from diffKS import DiffKS
 from core import make_onset_noise, detect_onsets_librosa
 import math
+from torchlpc import sample_wise_lpc
 
 # Additional imports for Jordi-style attention pooling
 from einops import rearrange, repeat
@@ -141,6 +142,156 @@ def fft_convolve(signal: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
     y = fft.irfft(fft.rfft(x) * fft.rfft(h))
     return y[..., y.shape[-1] // 2:]
 
+# ==============================
+# Time-domain GEQ utilities (1/3-oct style)
+# ==============================
+
+def scale_function_ircam(x: torch.Tensor) -> torch.Tensor:
+    """IRCAM-DDSP style amplitude scaling.
+    Maps logits -> linear amplitude in ~[~0, 2] (≈ +6 dB max) with a very quiet floor.
+    """
+    return 2.0 * torch.sigmoid(x) ** (math.log(10.0)) + 1e-7
+
+
+def _logspace_centers(n_bands: int, fs: int, fmin: float = MIN_HZ, fmax: float = MAX_HZ, device=None, dtype=None) -> torch.Tensor:
+    """Return n_bands log-spaced center frequencies between fmin and min(fmax, 0.98*Nyquist)."""
+    nyq = fs / 2.0
+    fmax_eff = min(float(fmax), float(nyq * 0.98))
+    if device is None:
+        device = torch.device("cpu")
+    if dtype is None:
+        dtype = torch.float32
+    start = math.log10(float(fmin))
+    end = math.log10(float(fmax_eff))
+    exps = torch.linspace(start, end, steps=int(n_bands), device=device, dtype=dtype)
+    return torch.pow(10.0, exps)
+
+
+def _design_biquad_peaking(f0: torch.Tensor, Q: float, gain_db: torch.Tensor, fs: int) -> torch.Tensor:
+    """Design biquad peaking filters per-band using RBJ Audio EQ Cookbook.
+    Args:
+      f0: [K] center freqs in Hz
+      Q: scalar Q-factor
+      gain_db: [K] boost in dB (>=0)
+      fs: sampling rate
+    Returns: SOS coeffs [K, 6] as (b0, b1, b2, a0, a1, a2) with a0 normalized to 1.
+    """
+    device = f0.device
+    dtype = f0.dtype
+    w0 = 2.0 * math.pi * f0 / float(fs)
+    A = torch.pow(torch.tensor(10.0, device=device, dtype=dtype), gain_db / 40.0)
+    alpha = torch.sin(w0) / (2.0 * Q)
+    cosw0 = torch.cos(w0)
+    b0 = 1.0 + alpha * A
+    b1 = -2.0 * cosw0
+    b2 = 1.0 - alpha * A
+    a0 = 1.0 + alpha / A
+    a1 = -2.0 * cosw0
+    a2 = 1.0 - alpha / A
+    # Normalize by a0
+    b0 = b0 / a0
+    b1 = b1 / a0
+    b2 = b2 / a0
+    a1 = a1 / a0
+    a2 = a2 / a0
+    a0 = torch.ones_like(b0)
+    sos = torch.stack([b0, b1, b2, a0, a1, a2], dim=-1)
+    return sos
+
+
+def _design_geq_sos(n_bands: int, fs: int, fmin: float, fmax: float, gains_db: torch.Tensor) -> torch.Tensor:
+    """Design a cascade of peaking biquads approximating a 1/3-oct GEQ.
+    gains_db: [K] non-negative band boosts in dB.
+    Returns: SOS [K,6].
+    """
+    centers = _logspace_centers(n_bands, fs, fmin=fmin, fmax=fmax, device=gains_db.device, dtype=gains_db.dtype)
+    # 1/3-octave equivalent Q ≈ 1 / (2^(1/6) - 2^(-1/6)) ~ 4.318
+    Q_const = 1.0 / (2.0 ** (1.0 / 6.0) - 2.0 ** (-1.0 / 6.0))
+    return _design_biquad_peaking(centers, Q_const, gains_db, fs)
+
+
+def _apply_sos_cascade(x: torch.Tensor, sos: torch.Tensor) -> torch.Tensor:
+    """Apply a cascade of biquad sections in time domain using TorchLPC for the AR part.
+    x: [B, L]
+    sos: [K, 6] with (b0,b1,b2,a0(=1),a1,a2).
+    Returns: [B, L]
+    NOTE: Stateless per call; each band starts with zero state (piece‑wise per segment).
+    """
+    if sos.numel() == 0:
+        return x
+    y = x
+    B, L = y.shape
+    # Ensure contiguous for conv/LPC
+    y = y.contiguous()
+    for k in range(sos.shape[0]):
+        b0, b1, b2, a0, a1, a2 = sos[k]
+        # Normalize so a0 == 1 (safety in case of numeric drift)
+        if torch.abs(a0 - 1.0) > 1e-12:
+            b0 = b0 / a0
+            b1 = b1 / a0
+            b2 = b2 / a0
+            a1 = a1 / a0
+            a2 = a2 / a0
+        # --- FIR numerator (b0 + b1 z^-1 + b2 z^-2) via causal conv1d ---
+        # conv1d computes correlation, so use flipped kernel and left padding for causality
+        kernel = torch.stack([b0, b1, b2], dim=0).to(dtype=y.dtype, device=y.device)
+        kernel = kernel.flip(0).view(1, 1, 3)
+        v = F.conv1d(F.pad(y.unsqueeze(1), (2, 0)), kernel).squeeze(1)  # [B, L]
+        # --- AR denominator using TorchLPC (all‑pole): y = v - a1*y_{-1} - a2*y_{-2}
+        A = torch.stack([a1, a2], dim=-1).to(dtype=y.dtype, device=y.device)
+        # Time‑invariant across the segment, expand to [B, L, 2]
+        A = A.view(1, 1, 2).expand(B, L, 2).contiguous()
+        y = sample_wise_lpc(v, A)  # [B, L]
+    return y
+
+
+# ==============================
+# Batched biquad cascade (vectorized across batch)
+# ==============================
+def _apply_sos_cascade_batched(x: torch.Tensor, sos: torch.Tensor) -> torch.Tensor:
+    """Vectorized biquad cascade over the whole batch using TorchLPC for AR.
+    Args:
+      x   : [B, L] time-domain input (padded if needed)
+      sos : [B, K, 6] biquad coeffs per-item, per-band as (b0,b1,b2,a0(=1),a1,a2).
+    Returns:
+      y   : [B, L] output after cascading K biquads (sequential across K, vectorized across B).
+    Notes:
+      • Stateless per call; resets states at segment boundaries.
+      • We normalize by a0 defensively in case of small drift.
+    """
+    if sos.numel() == 0:
+        return x
+    B, L = x.shape
+    K = sos.shape[1]
+    y = x.contiguous()
+    for k in range(K):
+        # Coeffs per batch item for band k
+        b0 = sos[:, k, 0]
+        b1 = sos[:, k, 1]
+        b2 = sos[:, k, 2]
+        a0 = sos[:, k, 3]
+        a1 = sos[:, k, 4]
+        a2 = sos[:, k, 5]
+        # Normalize (safety); a0 is expected to be 1 already
+        eps = 1e-12
+        scale = torch.where(torch.abs(a0) > eps, a0, torch.ones_like(a0))
+        b0 = b0 / scale
+        b1 = b1 / scale
+        b2 = b2 / scale
+        a1 = a1 / scale
+        a2 = a2 / scale
+        # --- FIR numerator via grouped conv1d (one filter per batch item) ---
+        # Treat batch as channels so each item uses its own kernel; groups=B
+        y_in = y.view(1, B, L)
+        kernels = torch.stack([b0, b1, b2], dim=1)  # [B, 3]
+        kernels = kernels.flip(1).view(B, 1, 3)     # [B, 1, 3]
+        v = F.conv1d(F.pad(y_in, (2, 0)), kernels, groups=B).squeeze(0)  # [B, L]
+        # --- AR denominator via TorchLPC ---
+        A = torch.stack([a1, a2], dim=-1).to(dtype=v.dtype, device=v.device)  # [B, 2]
+        A = A.view(B, 1, 2).expand(B, L, 2).contiguous()                      # [B, L, 2]
+        y = sample_wise_lpc(v, A)  # [B, L]
+    return y
+
 # =============================================================
 # Small TCN building blocks
 # =============================================================
@@ -230,8 +381,11 @@ class LowRateTCN(nn.Module):
         self.loop_proj = nn.Linear(ch, loop_out)
         assert self.loop_proj.bias is not None and self.loop_proj.bias.numel() >= loop_out, "loop_proj must have a bias of size >= loop_out"
         self.band_proj = nn.Linear(ch, n_bands)
+        self.gain_proj = nn.Linear(ch, 1)
 
         nn.init.constant_(self.loop_proj.bias[0],  2.0)   # g logit → sigmoid ≈ 0.88
+        nn.init.constant_(self.gain_proj.bias, 1.4)
+        nn.init.constant_(self.band_proj.bias, -6.0)
 
     def forward(self, pitch_seq, loud_seq):
         """
@@ -287,6 +441,7 @@ class nnKarplusStrong(nn.Module):
 
         # --- n_noise_bands attribute ---
         self.n_noise_bands = int(n_noise_bands)
+        self.max_geq_db = 6.0  # GEQ is boost-only up to +6 dB
 
         # --- Low-rate TCN for feature extraction and heads ---
         self.low_tcn = LowRateTCN(in_ch=2, ch=lo_tcn_ch, n_blocks=6, kernel=3,
@@ -390,7 +545,7 @@ class nnKarplusStrong(nn.Module):
                     device=audio.device,
                     dtype=audio.dtype,
                     burst_len_samples=L_loc,
-                    impulse_instead=True,
+                    impulse_instead=False,
                 )  # [1, N]
                 # --- Scale burst amplitude linearly from frame loudness (0–1) ---
                 L_val = loud_scaled[b, f_idx, 0].clamp(0.0, 1.0)
@@ -402,62 +557,76 @@ class nnKarplusStrong(nn.Module):
         burst_stream = torch.cat(burst_rows, dim=0)  # [B, N]
 
         # --- Onset-segment attention pooling over low-rate features ---
-        # We create frame boundaries using detected onsets mapped to frame indices.
         loop_out = self.loop_order + 1
         K = int(self.n_noise_bands)
-        # Prepare outputs [B, T, *]
         loop_logits = torch.zeros(B, T_frames, loop_out, device=audio.device, dtype=audio.dtype)
-        band_gains_frames = torch.zeros(B, T_frames, K, device=audio.device, dtype=audio.dtype)
+        geq_db_frames = torch.zeros(B, T_frames, K, device=audio.device, dtype=audio.dtype)
+        gain_frames = torch.zeros(B, T_frames, 1, device=audio.device, dtype=audio.dtype)
 
+        # Build the shaped excitation directly in time domain (piece-wise per onset)
+        excitation = torch.zeros(B, N, device=audio.device, dtype=audio.dtype)
+
+        # Helper to map sample idx -> frame idx
+        def _samp2frame(s_samp: int) -> int:
+            return _sample_to_frame_idx(int(s_samp), N, T_frames)
+
+        # --- Prepare per-batch segment boundaries ---
+        seg_lists = []
+        max_segs = 0
         for b in range(B):
-            # frame boundaries (include 0 and T)
-            frame_bounds = [0]
-            for s in onset_list[b].tolist():
-                fi = _sample_to_frame_idx(int(s), N, T_frames)
-                if fi not in frame_bounds:
-                    frame_bounds.append(fi)
-            frame_bounds = sorted(set([i for i in frame_bounds if 0 <= i < T_frames]))
-            if frame_bounds[0] != 0:
-                frame_bounds = [0] + frame_bounds
-            if frame_bounds[-1] != T_frames:
-                frame_bounds.append(T_frames)
+            onset_samples = onset_list[b]
+            if onset_samples.size == 0:
+                onset_samples = np.array([0], dtype=int)
+            seg_starts = onset_samples.tolist()
+            if 0 not in seg_starts:
+                seg_starts = [0] + seg_starts
+            seg_starts = sorted(set([s for s in seg_starts if 0 <= s < N]))
+            seg_ends = seg_starts[1:] + [N]
+            seg_lists.append((seg_starts, seg_ends))
+            max_segs = max(max_segs, len(seg_starts))
 
-            hb = h[b:b+1]  # [1, C, T]
-            for si in range(len(frame_bounds) - 1):
-                s = frame_bounds[si]
-                e = frame_bounds[si + 1]
-                if e <= s:
+        # --- Vectorized over batch per segment index (only to write loop logits) ---
+        for seg_idx in range(max_segs):
+            for b in range(B):
+                seg_starts, seg_ends = seg_lists[b]
+                if seg_idx >= len(seg_starts):
                     continue
-                seg = hb[:, :, s:e]  # [1, C, L]
-                pooled = self.onset_pool(seg)  # [1, C]
-                # Heads on pooled features → piece-wise constant outputs
-                ll = self.low_tcn.loop_proj(pooled)  # [1, loop_out]
-                band_logits = self.low_tcn.band_proj(pooled)  # [1, K]
+                s_samp = seg_starts[seg_idx]
+                e_samp = seg_ends[seg_idx]
+                fs_idx = _samp2frame(s_samp)
+                fe_idx = _samp2frame(e_samp - 1) + 1
+                fe_idx = max(fs_idx + 1, min(T_frames, fe_idx))
+                seg_h = h[b:b+1, :, fs_idx:fe_idx]  # [1, C, Lf]
+                pooled = self.onset_pool(seg_h)     # [1, C]
+                ll = self.low_tcn.loop_proj(pooled) # [1, loop_out]
+                # Fill loop logits for these frames (GEQ/gain handled globally below)
+                loop_logits[b, fs_idx:fe_idx, :] = ll.expand(fe_idx - fs_idx, -1)
 
-                # IRCAM-like quiet init + allow up to +16 dB boost
-                # Use the same scale_function and a -5 shift for a very quiet start.
-                mags = scale_function(band_logits - 5.0)  # [1, K]
+        # === Global (continuous) GEQ & gain per batch item ===
+        # Pool across the full sequence once per batch for GEQ/gain (continuous filter; no per-onset resets)
+        pooled_all = self.onset_pool(h)  # [B, C]
+        geq_logits_all = self.low_tcn.band_proj(pooled_all)  # [B, K]
+        gain_logit_all = self.low_tcn.gain_proj(pooled_all)  # [B, 1]
 
-                loop_logits[b, s:e, :]       = ll.expand(e - s, -1)
-                band_gains_frames[b, s:e, :] = mags.expand(e - s, -1)
+        # Boost-only GEQ in dB (0..+6 dB), initialized quiet via -5 bias
+        geq_db = self.max_geq_db * torch.sigmoid(geq_logits_all - 5.0)  # [B, K]
+        # IRCAM-like scalar gain (very quiet .. +6 dB), initialized ~-60 dB via gain_proj bias
+        gain_lin = scale_function_ircam(gain_logit_all - 5.0)           # [B, 1]
 
-        # --- FIR noise shaping ala IRCAM DDSP (frame-wise time-varying FIR) ---
-        # Choose block size so that T_frames * block_size >= N
-        block_size = int(math.ceil(N / max(1, T_frames)))
-        pad_len = T_frames * block_size - N
+        # For logging: broadcast per-batch constants across all frames
+        geq_db_frames[:] = geq_db.unsqueeze(1).expand(B, T_frames, K)
+        gain_frames[:]   = gain_lin.unsqueeze(1).expand(B, T_frames, 1)
 
-        # Build per-frame noise that follows the onset bursts: use the original
-        # burst_stream as a mask so we only excite frames that contain burst samples.
-        burst_padded = F.pad(burst_stream, (0, pad_len))                      # [B, T*block]
-        burst_blocks = burst_padded.view(B, T_frames, block_size)             # [B, T, block]
+        # Design SOS per batch item (time-invariant across the clip)
+        sos_list = []
+        for b in range(B):
+            sos_b = _design_geq_sos(K, int(audio_sr), fmin=MIN_HZ, fmax=MAX_HZ, gains_db=geq_db[b])  # [K,6]
+            sos_list.append(sos_b)
+        sos_batch = torch.stack(sos_list, dim=0)  # [B, K, 6]
 
-        # Magnitude bins per frame -> per-frame FIR impulse responses
-        mags = band_gains_frames                                              # [B, T, K]
-        impulse = amp_to_impulse_response(mags, block_size, fs=int(audio_sr), norm=None)  # no per-frame normalization → magnitude mapping controls loudness
-
-        # Frame-wise convolution and fold back to a 1D excitation
-        shaped_blocks = fft_convolve(burst_blocks, impulse)                   # [B, T, block]
-        excitation = shaped_blocks.reshape(B, T_frames * block_size)[..., :N] # [B, N]
+        # Apply one cascade per band over the **entire batch sequence** (continuous filtering)
+        x_full = burst_stream * gain_lin  # [B, N]
+        excitation = _apply_sos_cascade_batched(x_full, sos_batch)  # [B, N]
 
         # --- DiffKS decode with loop coefficients at frame-rate ---
         out = self.decoder(
@@ -470,10 +639,10 @@ class nnKarplusStrong(nn.Module):
         if return_parameters:
             return {
                 "loop_logits": loop_logits.detach(),
-                "band_gains_frames": band_gains_frames.detach(),
+                "geq_db_frames": geq_db_frames.detach(),  # per-frame GEQ boosts (dB)
+                "gain_frames": gain_frames.detach(),      # per-frame scalar gain (linear)
                 "burst_stream": burst_stream.detach(),
                 "resonator_excitation": excitation.detach(),
-                "fir_impulse": impulse.detach(),
             }
 
         return out
