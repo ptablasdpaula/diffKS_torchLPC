@@ -1,52 +1,50 @@
-# diffks_experiment.py
 # --------------------------------------------------------------------------
 # Differentiable Karplus-Strong experiment with extra spectrogram outputs
 # --------------------------------------------------------------------------
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Tuple, Dict, Any, Union
+from typing import Tuple, Dict, Union
 
 import numpy as np
 import torch
 import torchaudio
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import math
+import torch.nn as nn
+from itertools import chain
 
 from third_party.auraloss.auraloss.freq import MultiResolutionSTFTLoss as MultiSTFT
 from diffKS import DiffKS
+from core import make_onset_noise, scale_noise_bursts_to_target_rms, detect_onsets_librosa, StaticShelf
+from utils.misc import get_device
 
 hp = {
-    "learning_rate": 0.1,
-    "max_epochs": 150,
     "use_A_weighing": True,
+    "epochs": 150,
+    "lr": 0.1,
 }
 
 mp = {
-    "exc_order": 5,
-    "exc_length_s": 0.025,
     "loop_order": 2,
+    "loop_n_frames": 250,
     "f0_hz": 311.13,
     "min_f0_hz": 82.41,  # MIDI E2 in Hz
     "burst_width_s": 0.03,
-    "use_double_precision": False,
-    "normalize_burst": True,
+    "use_double_precision": True,
     "interp_type": "linear"
 }
 
 gs = {
     "sample_rate": 16000,
-    "internal_sr": 41000,
+    "internal_sr": 16000,
     "length_audio_s": 4,
     "random_seed": 1234
 }
 
 LENGTH_N = 4 * gs["sample_rate"]
 LENGTH_N_UPSAMPLED = 4 * gs["internal_sr"]
-
-triggers_s = torch.tensor([0.0, 3.0])
-# convert trigger times to INTERNAL‑SR sample indices
-triggers_n = (triggers_s * gs["internal_sr"]).long().unsqueeze(0)  # [B(1), F]
 
 # -----------------------------------------------------------------------------
 # Utility helpers
@@ -75,32 +73,22 @@ def load_guitar(path: str | Path, sr_tgt: int) -> torch.Tensor:
         wav = torchaudio.transforms.Resample(sr_in, sr_tgt)(wav)
     return wav
 
-
-def build_random_model(seed: int) -> DiffKS:
+def build_random_model(seed: int, F: int) -> DiffKS:
     """Create a *DiffKS* with random weights but fixed *seed*."""
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     loop_order = mp["loop_order"]
-    exc_order = mp["exc_order"]
 
     model = DiffKS(
         internal_sr=gs["internal_sr"],
         min_f0_hz=mp["min_f0_hz"],
         loop_order=loop_order,
-        exc_order=exc_order,
-        exc_length_s=mp["exc_length_s"],
-        interp_type=mp["interp_type"],
         use_double_precision=mp["use_double_precision"],
         batch_size=1
     )
 
-    F = triggers_n.size(1)
-
     model.set_loop_coefficients(torch.rand(1, F, loop_order + 1))
-    model.set_loop_gain(torch.rand((1, F, 1), ))
-    model.set_exc_coefficients(torch.rand(1, F, exc_order + 1) * 0.1)
-
     return model
 
 # -----------------------------------------------------------------------------
@@ -109,153 +97,153 @@ def build_random_model(seed: int) -> DiffKS:
 
 def composite_plot(fig_path: str,
                    signals: Dict[str, torch.Tensor],
-                   coeffs: Dict[str, Union[np.ndarray, torch.Tensor]]) -> None:
+                   coeffs: Dict[str, Union[np.ndarray, torch.Tensor]],
+                   plot_low_shelf=None, plot_high_shelf=None) -> None:
     """
     Plot a set of waveforms ('signals') and time‑varying filter coefficients
     ('coeffs') on a single canvas and save to *fig_path*.
 
-    • Each entry in *signals* is a mono tensor – shape [..., samples].
-    • Each entry in *coeffs* is either a 1‑D trajectory (time) or a 2‑D matrix
-      (time, n_coeffs).  All taps are plotted if 2‑D.
+    Composite plot: 3 subplots only —
+      1. Target signal
+      2. Optimised output signal
+      3. Loop coefficients (all, including b0/gain)
     """
-    n_rows = max(len(signals), len(coeffs))
-    fig, axs = plt.subplots(n_rows, 2, figsize=(14, 3 * n_rows))
-    axs = axs.ravel()
+    # Always 3 rows (subplots): Target, Optimised, Loop Coeffs
+    fig, axs = plt.subplots(3, 1, figsize=(12, 8))
 
-    # --------------------------------------------------------------------- #
-    # 1.  Waveforms
-    # --------------------------------------------------------------------- #
-    row = 0
-    for name, wav in signals.items():
-        ax = axs[row * 2]
-        wav_np = wav.squeeze().detach().cpu().numpy()
+    # 1. Target signal
+    ax = axs[0]
+    wav_np = signals["Target"].squeeze().detach().cpu().numpy()
+    wav_samples = len(wav_np)
+    t = np.linspace(0, gs['length_audio_s'], wav_samples)
+    ax.plot(t, wav_np, color='orange')
+    ax.set_xlabel("seconds")
+    ax.set_xlim(0, gs['length_audio_s'])
+    ax.set_title("Target")
+    ax.grid(False)
 
-        # Choose color based on signal name
-        if name in ["Target", "Optimised", "Inverse filtered"]:
-            color = 'orange'
-        else:
-            color = None  # Use default color
+    # 2. Optimised output signal
+    ax = axs[1]
+    wav_np = signals["Optimised"].squeeze().detach().cpu().numpy()
+    wav_samples = len(wav_np)
+    t = np.linspace(0, gs['length_audio_s'], wav_samples)
+    ax.plot(t, wav_np, color='orange')
+    ax.set_xlabel("seconds")
+    ax.set_xlim(0, gs['length_audio_s'])
+    ax.set_title("Optimised")
+    ax.grid(False)
 
-        # Apply time scaling based on signal type
-        if name == "Inverse filtered":
-            # Inverse filtered: 0 to 0.025s
-            wav_samples = len(wav_np)
-            t = np.linspace(0, mp['exc_length_s'], wav_samples)
-            ax.plot(t, wav_np, color=color)
-            ax.set_xlabel("seconds")
-            ax.set_xlim(0, mp['exc_length_s'])
-        elif name in ["Target", "Optimised"]:
-            # Target and Optimised: 0 to 4 seconds
-            wav_samples = len(wav_np)
-            t = np.linspace(0, gs['length_audio_s'], wav_samples)
-            ax.plot(t, wav_np, color=color)
-            ax.set_xlabel("seconds")
-            ax.set_xlim(0, gs['length_audio_s'])
-        else:
-            # Other signals: keep sample index
-            ax.plot(wav_np, color=color)
-            ax.set_xlabel("samples")
-
-        ax.set_title(name)
-        ax.grid(False)
-        row += 1
-
-    # --------------------------------------------------------------------- #
-    # 2.  Coefficient trajectories
-    # --------------------------------------------------------------------- #
-    row = 0
+    # 3. Loop coefficients (all, including b0/gain)
+    ax = axs[2]
+    # Only one entry in coeffs: "Loop coeffs"
     for name, traj in coeffs.items():
-        ax = axs[row * 2 + 1]
         traj_np = traj if isinstance(traj, np.ndarray) else traj
         traj_np = traj_np if isinstance(traj_np, np.ndarray) else traj_np.cpu().numpy()
-
-        # --- map internal‑SR sample index to outer SR (16 k) -------------
-        sr_vis      = gs["sample_rate"]               # 16 kHz
-        sr_internal = gs["internal_sr"]               # 41 kHz
+        sr_vis      = gs["sample_rate"]
+        sr_internal = gs["internal_sr"]
         x_coeff     = np.arange(traj_np.shape[0]) * (sr_vis / sr_internal)
-
-        if traj_np.ndim == 1:  # single trajectory
+        if traj_np.ndim == 1:
             ax.plot(x_coeff, traj_np, label=name)
-        else:  # multiple taps
+        else:
             for k in range(traj_np.shape[1]):
                 ax.plot(x_coeff, traj_np[:, k], label=f"{name}-b{k}")
-        ax.set_title(name)
+        ax.set_title("Loop coefficients (all taps, including b0/gain)")
         ax.set_xlim(0, gs["sample_rate"] * gs["length_audio_s"])
-        ax.set_xlabel("samples (16 kHz)")
+        ax.set_xlabel("samples (16kHz)")
         ax.grid(False)
         ax.legend(loc="upper right")
-        row += 1
 
     plt.tight_layout()
     plt.savefig(fig_path)
-    # Keep plot window open
     plt.show()
 
-# -----------------------------------------------------------------------------
-# Training loop - Simplified version
-# -----------------------------------------------------------------------------
-def optimise_model(model: DiffKS,
-                   input_signal: torch.Tensor,  # what goes *into* the model
-                   target: torch.Tensor,  # waveform we want to match
-                   f0_frames: torch.Tensor,  # delay‑trajectory (ctrl‑rate)
-                   direct: bool,  # True→noise‑burst path
-                   ) -> None:
-    """
-    Optimise *model* so that model(input_signal) ≈ target under STFT loss.
-    """
-    # Set up optimizer using Adam
-    optimiser = torch.optim.Adam(model.parameters(), lr=hp["learning_rate"])
+def _compute_losses(model: DiffKS,
+                    low_shelf: nn.Module,
+                    high_shelf: nn.Module,
+                    raw_noise: torch.Tensor,
+                    target: torch.Tensor,
+                    f0_frames: torch.Tensor,
+                    loss_fn: MultiSTFT) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Forward pass for excitation → KS → STFT loss (single-stage; no reverb/regularisers)."""
+    sample_rate = gs["sample_rate"]
 
-    # Smooth MSS configuration (WF, S5, C2, D2) from “Multi‑Scale Spectral Loss Revisited”
+    # Excitation shaping: Low-shelf → High-shelf
+    excitation = high_shelf(low_shelf(raw_noise))
+
+    # KS synthesis (dry)
+    out = model(
+        f0_frames=f0_frames,
+        input=excitation,
+        input_sr=sample_rate,
+    )
+
+    # Main reconstruction loss only (no smoothness / whitening)
+    loss_stft = loss_fn(out.unsqueeze(1), target.unsqueeze(1))
+
+    loss = loss_stft
+    log = {
+        "stft": float(loss_stft.detach().cpu()),
+    }
+    return loss, log
+
+# ----------------------------------------------------------------------------
+# Single-stage training: optimise DiffKS + shelves together
+# ----------------------------------------------------------------------------
+
+def train_single_stage(model: DiffKS,
+                       raw_noise: torch.Tensor,
+                       target: torch.Tensor,
+                       f0_frames: torch.Tensor,
+                       low_shelf: nn.Module,
+                       high_shelf: nn.Module) -> None:
+    sample_rate = gs["sample_rate"]
+    device = model.device
+    model.train(); low_shelf.train(); high_shelf.train()
+
     loss_fn = MultiSTFT(
         fft_sizes=[257, 509, 1019, 2039, 4093],
         hop_sizes=[128, 254, 509, 1019, 2046],
         win_lengths=[257, 509, 1019, 2039, 4093],
-        window="flattop",          # WF: Flat‑top window with low sidelobes
-        mag_distance="L2",         # D2: squared‑L2 distance
-        log_eps=1.0,               # C2: log‑compression with ε=1 to keep values ≥0
-        w_sc=1.0,                  # default weighting for spectral‑convergence term
-        w_log_mag=1.0,             # log‑magnitude term
-        w_lin_mag=0.0,             # (disabled) linear‑magnitude term
-        perceptual_weighting=hp["use_A_weighing"],
-        scale_invariance=True,
-        sample_rate=gs["sample_rate"],
+        window="flattop",
+        mag_distance="L2",
+        log_eps=1.0,
+        w_sc=1.0,
+        w_log_mag=1.0,
+        w_lin_mag=0.0,
+        perceptual_weighting=hp.get("use_A_weighing", True),
+        scale_invariance=False,
+        sample_rate=sample_rate,
     )
 
+    raw_noise = raw_noise.to(device)
+    target = target.to(device)
+    f0_frames = f0_frames.to(device)
+
+    params = list(chain(model.parameters(), low_shelf.parameters(), high_shelf.parameters()))
+    opt = torch.optim.Adam(params, lr=float(hp.get("lr", 2.5e-2)))
+
+    n_epochs = int(hp.get("epochs", 1500))
+    pbar = tqdm(range(n_epochs), desc=f"Single-stage (@lr={hp.get('lr', 2.5e-2):g})")
+
     loss_curve = []
-    pbar = tqdm(range(hp["max_epochs"]), desc="Training")
+    for _ in pbar:
+        loss, log = _compute_losses(model, low_shelf, high_shelf,
+                                    raw_noise, target, f0_frames, loss_fn)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        loss_curve.append(float(loss.detach().cpu()))
+        pbar.set_postfix(loss=f"{loss_curve[-1]:.4f}", stft=f"{log['stft']:.4f}")
 
-    for epoch in pbar:
-        # Forward pass
-        out = model(f0_frames=f0_frames.to(model.device),
-                    input=input_signal.to(model.device),
-                    input_sr=gs["sample_rate"],
-                    direct=direct,
-                    triggers=triggers_n)
-
-        # Calculate loss
-        loss = loss_fn(out.unsqueeze(1),
-                       target.to(model.device).unsqueeze(1))
-
-        # Backward pass and optimization
-        optimiser.zero_grad()
-        loss.backward(retain_graph=True)
-        optimiser.step()
-
-        # Training progress tracking
-        l = loss.item()
-        loss_curve.append(l)
-        pbar.set_postfix(loss=f"{l:.4f}")
-
-    # Save loss curve
+    # Plot & save a simple loss curve
     plt.figure(figsize=(8, 3))
     plt.plot(loss_curve)
-    plt.title("Training loss")
-    plt.xlabel("epoch");
-    plt.ylabel("STFT loss")
-    plt.grid(True);
-    plt.tight_layout()
-    plt.savefig("analysis/loss_curve.png")
+    plt.title("Training loss (single-stage)")
+    plt.xlabel("iteration")
+    plt.ylabel("total loss")
+    plt.grid(True, alpha=0.3)
+    Path("analysis").mkdir(exist_ok=True)
+    plt.savefig("analysis/loss_curve_single_stage.png")
 
 # -----------------------------------------------------------------------------
 # Entry‑point ------------------------------------------------------------------
@@ -266,121 +254,141 @@ def main() -> None:
 
     # -------------------------------------------------------------------------
     # 3.  Load & prepare guitar -------------------------------------------------
-    guitar = load_guitar("data/test.wav", sample_rate)
+    guitar = load_guitar("data/test.wav", sample_rate).to(device=get_device())
     save_audio("target.wav", guitar, sample_rate)
 
     # -------------------------------------------------------------------------
-    # 4.  New random model ------------------------------------------------------
-    seed = gs["random_seed"]
-    model_opt = build_random_model(seed)
-
+    # 4.  Onsets (librosa with 50 ms left pad) + noise bursts of length = delay
     # -------------------------------------------------------------------------
-    # 5–6.  Forward / optimisation --------------------------------------------
-    input_sig = guitar          # optimise against test.wav only
-    direct_flag = False
-    target_audio = guitar
-    f0_frames_opt = torch.tensor([[mp['f0_hz']]])
+    onset_samples = detect_onsets_librosa(guitar, sr=sample_rate, pad_ms=50.0,
+                                          hop_length=512, backtrack=True)
 
-    optimise_model(model_opt,
-                   input_signal=input_sig,
-                   target=target_audio,
-                   f0_frames=f0_frames_opt,
-                   direct=direct_flag)
+    # Delay length at the *external* SR for excitation construction
+    L_delay = max(1, int(round(sample_rate / mp["f0_hz"])) )
 
-    optim_audio = model_opt(
-        f0_frames=f0_frames_opt.to(model_opt.device),
-        input=input_sig.to(model_opt.device),
-        input_sr=sample_rate,
-        direct=direct_flag,
-        triggers=triggers_n
-    ).cpu()[0, ...]
-
-    save_audio("optimized_model.wav", optim_audio, sample_rate)
-
-    # -------------------------------------------------------------------------
-    # Upsampled coefficients for comparison ------------------------------------
-    _, l_b_opt, _, exc_b_opt = model_opt.get_upsampled_parameters(f0=f0_frames_opt,
-                                                                  num_samples=LENGTH_N_UPSAMPLED,
-                                                                  triggers=triggers_n)
-    l_b_opt = l_b_opt[0].squeeze().detach().cpu().numpy()
-    exc_b_opt = exc_b_opt[0].squeeze().detach().cpu().numpy()
-
-    coeffs_dict = {
-        "Loop coeff (opt.)": l_b_opt,  # shape (time, 2)  → DC + z‑1
-        "Exc coeff (opt.)": exc_b_opt,  # shape (time, 5)
-    }
-
-    signals_dict = {
-        "Target": target_audio,
-        "Optimised": optim_audio,
-    }
-
-    # Calculate the number of samples for exc_length_s
-    exc_len_samples = int(mp['exc_length_s'] * sample_rate)
-
-    # Get the signals
-    inv_sig = model_opt.get_inverse_filtered_signal().cpu()
-    exc_after_opt = model_opt.exc_filter_out.cpu()
-
-    # Only take the first exc_length_s of each signal
-    signals_dict["Inverse filtered"] = inv_sig[:, :exc_len_samples]
-    signals_dict["After excitation"] = exc_after_opt[:, :exc_len_samples]
-
-    # -------------------------------------------------------------------------
-    # Upsampled and constrained coefficients for comparison ---------------------
-    # First get upsampled parameters
-    _, l_b_opt_up, l_g_opt_up, exc_b_opt_up = model_opt.get_upsampled_parameters(
-        f0=f0_frames_opt,
-        num_samples=LENGTH_N_UPSAMPLED,
-        triggers=triggers_n,
+    raw_noise = make_onset_noise(
+        onset_samples=onset_samples,
+        num_samples=LENGTH_N,
+        sample_rate=sample_rate,
+        batch_size=1,
+        device=get_device(),
+        dtype=guitar.dtype,
+        burst_len_samples=L_delay,
     )
-    # Then apply constraints to the upsampled parameters
-    l_b_opt = model_opt.get_constrained_l_coefficients(l_b=l_b_opt_up, l_g=l_g_opt_up)
-    exc_b_opt = model_opt.get_constrained_exc_coefficients(exc_b=exc_b_opt_up)
-    l_b_opt = l_b_opt.squeeze().detach().cpu().numpy()
-    exc_b_opt = exc_b_opt.squeeze().detach().cpu().numpy()
+    # Save pre-matched (dry) bursts for reference
+    save_audio("raw_onset_noise_pre_match.wav", raw_noise[0], sample_rate)
 
-    coeffs_dict = {
-        "Loop coeff (opt.)": l_b_opt,  # Now showing constrained values
-        "Exc coeff (opt.)": exc_b_opt,  # Now showing constrained values
-    }
+    # Match burst RMS to target RMS in the same windows [s, s+L_delay)
+    raw_noise = scale_noise_bursts_to_target_rms(
+        noise=raw_noise,
+        target=guitar,
+        onset_samples=onset_samples,
+        burst_len_samples=L_delay,
+        eps=1e-8,
+        compensate_delay_len=True,  # set True to also apply 1/sqrt(L) scaling
+    )
 
-    signals_dict = {
-        "Target": target_audio,
-        "Optimised": optim_audio,
-    }
+    save_audio("raw_onset_noise.wav", raw_noise[0], sample_rate)
 
-    # Calculate the number of samples for exc_length_s
-    exc_len_samples = int(mp['exc_length_s'] * sample_rate)
+    # Learnable shelves on excitation (body tilt)
+    low_shelf = StaticShelf(
+        which="low",
+        sample_rate=sample_rate,
+        init_fc_hz=120.0,
+        fmin_hz=20.0,
+        fmax_hz=sample_rate / 2 - 200.0,
+        init_Q=0.707,
+        init_gain_db=-3.0,  # gentle low cut
+    ).to(get_device())
 
-    # Get the signals
-    inv_sig = model_opt.get_inverse_filtered_signal().cpu()
-    exc_after_opt = model_opt.exc_filter_out.cpu()
-
-    # Only take the first exc_length_s of each signal
-    signals_dict["Inverse filtered"] = inv_sig[:, 225:exc_len_samples + 225]
-    signals_dict["After excitation"] = exc_after_opt[:, :exc_len_samples]
-
-    composite_plot("analysis/composite.png", signals_dict, coeffs_dict)
+    high_shelf = StaticShelf(
+        which="high",
+        sample_rate=sample_rate,
+        init_fc_hz=3000.0,
+        fmin_hz=30.0,
+        fmax_hz=sample_rate / 2 - 200.0,
+        init_Q=0.707,
+        init_gain_db=-1.5,  # a touch off the air band
+    ).to(get_device())
 
     # -------------------------------------------------------------------------
-    # 6.  Extra diagnostics for the trained model ------------------------------
-    inv_signal = model_opt.get_inverse_filtered_signal().cpu()
-    save_audio("inverse_filtered.wav", inv_sig, sample_rate)
-    exc_after_opt = model_opt.exc_filter_out.cpu()
+    # 5.  Build model with matching number of frames --------------------------
+    seed = gs["random_seed"]
+    F = mp["loop_n_frames"]
+    model_opt = build_random_model(seed, F)
 
-    # Plot only the first exc_length_s seconds
-    exc_len_samples = int(mp['exc_length_s'] * sample_rate)
+    # constant f0 per frame
+    f0_frames_opt = torch.full((1, F), mp["f0_hz"], dtype=guitar.dtype)
 
-    plt.figure(figsize=(12, 4))
-    plt.plot(inv_signal.squeeze().detach().cpu().numpy()[:exc_len_samples],
-             label="Inverse filtered")
-    plt.plot(exc_after_opt.squeeze().detach().cpu().numpy()[:exc_len_samples],
-             label="After excitation", alpha=0.7)
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig("inverse_excitation_opt.png")
+    # 6.  Train (single-stage) ----------------------------------------------
+    target_audio = guitar
+    train_single_stage(model_opt,
+                       raw_noise=raw_noise,
+                       target=target_audio,
+                       f0_frames=f0_frames_opt,
+                       low_shelf=low_shelf,
+                       high_shelf=high_shelf)
+
+    # -------------------------------------------------------------------------
+    # 7.  Render with the trained model and save ------------------------------
+    model_opt.eval()
+    low_shelf.eval()
+    high_shelf.eval()
+    with torch.no_grad():
+        excitation_trained = high_shelf(low_shelf(raw_noise))
+        save_audio("filtered_excitation.wav", excitation_trained[0].cpu(), sample_rate)
+        optim_audio = model_opt(
+            f0_frames=f0_frames_opt.to(model_opt.device),
+            input=excitation_trained.to(model_opt.device),
+            input_sr=sample_rate,
+        ).cpu()[0, ...]
+
+    ls_fc = float(low_shelf.fc_hz().item())
+    ls_Q = float(low_shelf.quality_Q().item())
+    ls_gdb = float(low_shelf.gain_db().item())
+    print(f"[LowShelf]  fc={ls_fc:.2f} Hz, Q={ls_Q:.3f}, gain={ls_gdb:+.2f} dB")
+
+    hs_fc = float(high_shelf.fc_hz().item())
+    hs_Q = float(high_shelf.quality_Q().item())
+    hs_gdb = float(high_shelf.gain_db().item())
+    print(f"[HighShelf] fc={hs_fc:.2f} Hz, Q={hs_Q:.3f}, gain={hs_gdb:+.2f} dB")
+
+    assert not any(map(math.isnan, [ls_fc, ls_Q, ls_gdb])), "Low shelf returned NaN!"
+    assert not any(map(math.isnan, [hs_fc, hs_Q, hs_gdb])), "High shelf returned NaN!"
+
+    plot_low_shelf = (ls_fc, ls_Q, ls_gdb)
+    plot_high_shelf = (hs_fc, hs_Q, hs_gdb)
+
+    # Composite plot including coefficient trajectories (loop & excitation)
+    # Compute the number of internal-sr samples used inside the model
+    N_samples_vis = guitar.shape[-1]
+    N_samples_internal = int(round(N_samples_vis * gs["internal_sr"] / gs["sample_rate"]))
+
+    with torch.no_grad():
+        # Upsample parameters to internal-sr length, then apply constraints
+        _f0_i, l_b_u = model_opt.get_upsampled_parameters(
+            f0=f0_frames_opt.to(model_opt.device),
+            num_samples=N_samples_internal,
+            l_b=model_opt.loop_coefficients,
+        )
+
+        print (f"this is the size of l_b: {model_opt.loop_coefficients.shape}")
+
+        l_b_c_t = model_opt.get_constrained_l_coefficients(f0=_f0_i, l_b=l_b_u)       # [1, T_int, loop_n]
+
+        # For plotting as before
+        l_b_c = l_b_c_t[0].detach().cpu().numpy()
+
+    signals = {
+        "Target": target_audio[0],        # [N]
+        "Optimised": optim_audio,         # [N]
+    }
+    coeffs = {
+        "Loop coeffs": l_b_c,             # [T_int, loop_n_coefficients]
+    }
+
+    composite_plot("analysis/composite.png", signals, coeffs, plot_low_shelf=plot_low_shelf, plot_high_shelf=plot_high_shelf)
+    save_audio("optimized_model_from_onsets.wav", optim_audio, sample_rate)
 
 if __name__ == "__main__":
     main()
