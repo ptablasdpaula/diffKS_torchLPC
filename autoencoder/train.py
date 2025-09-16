@@ -7,8 +7,6 @@ from .model import nnKarplusStrong
 import argparse, os
 import multiprocessing as mp
 import psutil
-import math
-import matplotlib.pyplot as plt
 
 from collections import defaultdict
 
@@ -17,17 +15,17 @@ from data.preprocess import NsynthDataset
 from utils.misc import get_device, str2bool
 
 
-from .losses import build_smooth_mrstft, build_jtfst, build_a_loudness_loss
-from core import detect_onsets_librosa
+from losses import build_smooth_mrstft
+
+import matplotlib
+matplotlib.use("Agg")  # headless backend for servers
+import matplotlib.pyplot as plt
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     env = os.environ.get
 
-    # ─── Invariance flag ──────────────────────────────────────────────────
-    p.add_argument("--invariant", type=str2bool, default=str2bool(env("INVARIANT") or "false"),
-                   help="If set, use scale-invariant STFT loss and RMS normalization in validation/logging")
 
     # ─── Run identification ────────────────────────────────────────────────
     p.add_argument("--name", type=str, default=env("NAME", "exp"),
@@ -50,7 +48,7 @@ def parse_args():
 
     # ─── DiffKS filter configuration ───────────────────────────────────────
     p.add_argument("--l_order", type=int, default=int(env("L_ORDER") or 1))
-    p.add_argument("--filter_type", type=str, default=(env("FILTER_TYPE", "fir")))
+    p.add_argument("--filter_type", type=str, default=(env("FILTER_TYPE", "iir")))
 
     # ─── Dataset filters ────────────────────────────────────────────────────
     p.add_argument("--families", type=str, default=env("FAMILIES", "guitar"))
@@ -62,30 +60,14 @@ def parse_args():
 
     # ─── Losses weights ────────────────────────────────────────────────────
     p.add_argument("--stft_weight", type=float, default=float(env("STFT_WEIGHT") or 1.0))
-    p.add_argument("--sf_weight", type=float, default=float(env("SF_WEIGHT") or 0.0),
-                   help="Weight for spectral-flux onset loss (L1 between novelty curves)")
-    p.add_argument("--sf_min_freq", type=float, default=float(env("SF_MIN_FREQ") or 0.0),
-                   help="Optional high-pass in Hz for spectral-flux; 0 disables")
-    p.add_argument("--pg_weight", type=float, default=float(env("PG_WEIGHT") or 0.0),
-                   help="Weight for onset-to-onset (p,g) supervision loss")
 
     # ─── DiffKS timesteps and noise bands ─────────────────────────────────
-    p.add_argument("--n_noise_bands", type=int, default=int(env("N_NOISE_BANDS") or 64))
+    p.add_argument("--n_noise_bands", type=int, default=int(env("N_NOISE_BANDS") or 16))
 
     # ─── Testing mode ──────────────────────────────────────────────────────
     p.add_argument("--test", action="store_true",
                    default=str2bool(env("TEST") or "false"),
                    help="If set, load the NSynth 'test' split for both training and validation")
-    # ─── JTFST loss weight ────────────────────────────────────────────────
-    p.add_argument("--jtfst_weight", type=float, default=float(env("JTFST_WEIGHT") or 0.0),
-                   help="Weight for joint time-frequency scattering loss")
-    # ─── A-weighted loudness loss weight ──────────────────────────────────
-    p.add_argument(
-        "--a_loudness_weight",
-        type=float,
-        default=float(env("A_LOUDNESS_WEIGHT") or 0.0),
-        help="Weight for A-weighted loudness difference loss"
-    )
     return p.parse_args()
 
 # -----------------------------------------------------------------
@@ -140,253 +122,141 @@ def print_grad_snapshot(model, components=None):
         else:
             print(f"  - {k:24s}: {sum(vals)/len(vals):.6e} (n={len(vals)})")
 
-# --- NEW: Print gradients for z_encoder heads (gain_head, loop_head, geq_head) if present
-# --- Print gradients for z_encoder heads (gain_head, loop_head, geq_head) if present
-def _hz_to_bin(n_fft: int, fs: int, hz: float) -> int:
-    if hz <= 0:
-        return 0
-    return int(min(max(0, round(hz / (fs / float(n_fft)))), n_fft // 2))
 
-def spectral_flux(x: torch.Tensor, fs: int, n_fft: int = 1024, hop: int = 256,
-                  min_hz: float = 0.0) -> torch.Tensor:
+# -----------------------------------------------------------------
+# Composite plotting helpers (dynamic: adapts to returned params)
+# -----------------------------------------------------------------
+
+def _plot_param_panel(ax, name, tensor_np, sample_rate: int, target_len: int):
+    """Plot a returned parameter on a given axis.
+    Rules:
+    - 1D: line vs time (if matches target_len) else vs index.
+    - 2D: if channels <= 8, draw lines; else heatmap (imshow).
+    - 3D: treat as (T, A, B) with x=time, y=A, and color intensity = RMS over B.
+    - >3D: raises ValueError.
     """
-    Differentiable spectral-flux novelty curve.
-    x: [B, T] -> [B, frames]
-    SF(n) = sum_w ReLU(|X_w(n)| - |X_w(n-1)|)^2
-    """
-    assert x.dim() == 2, "spectral_flux expects [B, T]"
-    B, T = x.shape
-    win = torch.hann_window(n_fft, device=x.device, dtype=x.dtype)
-    X = torch.stft(x, n_fft=n_fft, hop_length=hop, win_length=n_fft,
-                   window=win, center=True, return_complex=True)  # [B, bins, frames]
-    mag = X.abs()
-    if min_hz > 0.0:
-        b0 = _hz_to_bin(n_fft, fs, min_hz)
-        mag = mag[:, b0:, :]
-    if mag.shape[-1] <= 1:
-        return torch.zeros((B, mag.shape[-1]), device=x.device, dtype=x.dtype)
-    diff = torch.relu(mag[:, :, 1:] - mag[:, :, :-1])
-    sf = (diff ** 2).sum(dim=1)          # [B, frames-1]
-    sf = torch.nn.functional.pad(sf, (1, 0))
-    return sf
+    import numpy as _np
+    import torch
 
-@torch.no_grad()
-def _stft_mag(x: torch.Tensor, fs: int, n_fft: int = 1024, hop: int = 256) -> torch.Tensor:
-    """Return magnitude STFT with frames-major shape [frames, freq_bins]. x: [T] (1D)."""
-    x = x.detach()
-    win = torch.hann_window(n_fft, device=x.device, dtype=x.dtype)
-    X = torch.stft(x, n_fft=n_fft, hop_length=hop, win_length=n_fft,
-                   window=win, center=True, return_complex=True)
-    mag = X.abs().transpose(0, 1)  # [frames, bins]
-    return mag
-
-@torch.no_grad()
-def _sample_mag_at_freqs(mag: torch.Tensor, fs: int, n_fft: int, f_target_hz: torch.Tensor) -> torch.Tensor:
-    """Linear-interpolate magnitude at target frequencies per frame.
-    mag: [frames, bins], f_target_hz: [frames]
-    """
-    df = fs / float(n_fft)
-    b = f_target_hz / df  # [frames]
-    frames, bins = mag.shape
-    b0 = torch.clamp(b.floor().long(), 0, bins - 2)
-    w  = (b - b0.float()).clamp(0, 1)
-    rows = torch.arange(frames, device=mag.device)
-    m0 = mag[rows, b0]
-    m1 = mag[rows, b0 + 1]
-    return (1.0 - w) * m0 + w * m1  # [frames]
-
-@torch.no_grad()
-def _fit_log_decay(ampl: torch.Tensor, hop: int, fs: int, t_skip_sec: float = 0.040, eps: float = 1e-12) -> float:
-    """OLS slope m (s^-1) of ln amplitude vs time for a single harmonic envelope."""
-    frames = ampl.numel()
-    if frames <= 3:
-        return 0.0
-    t = torch.arange(frames, device=ampl.device, dtype=ampl.dtype) * (hop / float(fs))
-    y = torch.log(ampl + eps)
-    start = int(round(t_skip_sec * fs / hop))
-    start = min(max(start, 0), frames - 2)
-    t = t[start:]; y = y[start:]
-    if t.numel() <= 1:
-        return 0.0
-    t_mean = t.mean()
-    y_mean = y.mean()
-    num = ((t - t_mean) * (y - y_mean)).sum()
-    den = ((t - t_mean) ** 2).sum().clamp_min(1e-12)
-    m = (num / den).item()
-    return m
-
-@torch.no_grad()
-def _estimate_pg_two_harmonics(x_seg: torch.Tensor, fs: int, f0_med: float,
-                               n_fft: int = 1024, hop: int = 256) -> tuple[float, float, dict]:
-    """Estimate (p,g) from fundamental & 3rd harmonic in one onset window.
-    Returns (p_hat, g_hat, diagnostics_dict). Robust, closed-form.
-    """
-    T = x_seg.numel()
-    if T < max(512, 4 * hop):
-        return 0.0, 0.95, {"ok": False, "reason": "window too short"}
-    # Guard f0 range
-    if not (1.0 < f0_med < 0.45 * fs):
-        return 0.0, 0.95, {"ok": False, "reason": "f0 out of range"}
-
-    mag = _stft_mag(x_seg, fs, n_fft=n_fft, hop=hop)  # [frames, bins]
-    frames = mag.shape[0]
-    if frames <= 2:
-        return 0.0, 0.95, {"ok": False, "reason": "too few frames"}
-
-    f1 = torch.full((frames,), float(f0_med), dtype=mag.dtype, device=mag.device)
-    f3 = 3.0 * f1
-
-    # Keep 3rd below Nyquist margin
-    if (f3.max().item() >= 0.45 * fs):
-        return 0.0, 0.95, {"ok": False, "reason": "3rd near Nyquist"}
-
-    A1 = _sample_mag_at_freqs(mag, fs, n_fft, f1)
-    A3 = _sample_mag_at_freqs(mag, fs, n_fft, f3)
-
-    m1 = _fit_log_decay(A1, hop, fs)  # s^-1
-    m3 = _fit_log_decay(A3, hop, fs)
-
-    # Per-period multipliers
-    T_p = 1.0 / max(f0_med, 1e-9)
-    M1 = math.exp(m1 * T_p)
-    M3 = math.exp(m3 * T_p)
-
-    # Solve quadratic for p
-    R2 = (M3 / max(M1, 1e-12)) ** 2
-    omega1 = 2.0 * math.pi * (f0_med / fs)
-    omega3 = 3.0 * omega1
-    c1, c3 = math.cos(omega1), math.cos(omega3)
-
-    a = R2 - 1.0
-    b = 2.0 * (c1 - R2 * c3)
-    c = R2 - 1.0
-    disc = b * b - 4.0 * a * c
-
-    p_candidates = []
-    if abs(a) > 1e-12 and disc >= 0.0:
-        sqrt_disc = math.sqrt(disc)
-        p_candidates = [(-b + sqrt_disc) / (2.0 * a), (-b - sqrt_disc) / (2.0 * a)]
-
-    p = None
-    for p_try in p_candidates:
-        if 1e-6 < p_try < 1.0 - 1e-6:
-            p = p_try
-            break
-    if p is None:
-        p = 0.0  # flat loss fallback
-
-    denom = (1.0 - p)
-    num = math.sqrt(max(1e-18, 1.0 + p * p - 2.0 * p * c1))
-    g = M1 * num / max(1e-9, denom)
-    # Clamp to model domain
-    p = float(min(max(p, 1e-6), 1.0 - 1e-6))
-    g = float(min(max(g, 0.900001), 0.999999))
-
-    return p, g, {"ok": True, "M1": M1, "M3": M3, "f0_med": f0_med}
-
-@torch.no_grad()
-def _samples_to_int_frame(n_samples: int, T_int: int, s_idx: int) -> int:
-    """Map sample index to internal frame index [0, T_int-1] with linear scaling."""
-    if n_samples <= 1:
-        return 0
-    pos = (float(s_idx) / float(max(1, n_samples - 1))) * float(max(1, T_int - 1))
-    j = int(math.floor(pos + 1e-8))
-    return max(0, min(T_int - 1, j))
-
-# --- Onset normalization helper ------------------------------------------
-@torch.no_grad()
-def _normalize_onsets_to_samples(onsets, T: int, T_int: int, fs: int):
-    """
-    Normalize onset list to sample indices in [0, T-1] (int).
-    Accepts onsets as list/array/tensor; supports 3 conventions:
-      - If max_val <= T_int-1: treat as internal frame indices [0, T_int-1]
-      - Else if max_val <= (T/fs)*1.05: treat as seconds
-      - Else: treat as sample indices (clamp to [0, T-1])
-    Returns list of ints (may be empty).
-    """
-    # Defensive: handle non-list or empty
-    if not isinstance(onsets, (list, tuple, np.ndarray, torch.Tensor)) or len(onsets) == 0:
-        return []
-    # Convert to float list
-    if isinstance(onsets, torch.Tensor):
-        onsets = onsets.detach().cpu().tolist()
-    vals = []
-    try:
-        vals = [float(v) for v in onsets]
-    except Exception:
-        return []
-    if len(vals) == 0:
-        return []
-    max_val = max(vals)
-    # Internal frame indices
-    if max_val <= T_int - 1:
-        # Map to sample indices
-        return [int(round(v / max(1, T_int - 1) * (T - 1))) for v in vals]
-    # Seconds
-    elif max_val <= (T / fs) * 1.05:
-        return [int(round(v * fs)) for v in vals]
-    # Sample indices (already in samples)
+    arr = tensor_np
+    # Convert to numpy array without altering rank, avoiding DeprecationWarning
+    if isinstance(arr, torch.Tensor):
+        arr = arr.detach().cpu().numpy()
     else:
-        return [min(max(0, int(round(v))), T - 1) for v in vals]
+        arr = _np.asarray(arr)
+
+    # 1D ---------------------------------------------------------
+    if arr.ndim == 1:
+        t = _np.arange(arr.shape[0], dtype=float)
+        if arr.shape[0] == target_len and sample_rate > 0:
+            t = t / float(sample_rate)
+            ax.set_xlabel("time [s]")
+        else:
+            ax.set_xlabel("index")
+        ax.plot(t, arr)
+        ax.set_title(f"{name} {list(arr.shape)}")
+        return
+
+    # 2D ---------------------------------------------------------
+    if arr.ndim == 2:
+        T, C = arr.shape
+        x = _np.arange(T, dtype=float)
+        if T == target_len and sample_rate > 0:
+            x = x / float(sample_rate)
+            ax.set_xlabel("time [s]")
+        else:
+            ax.set_xlabel("frame")
+        if C <= 8:
+            for c in range(C):
+                ax.plot(x, arr[:, c], linewidth=0.8, alpha=0.9, label=f"ch{c}")
+            if C > 1:
+                ax.legend(loc="best", fontsize=8)
+            ax.set_title(f"{name} {list(arr.shape)}")
+        else:
+            ax.imshow(arr.T, aspect="auto", origin="lower")
+            ax.set_ylabel("channel")
+            ax.set_title(f"{name} heatmap {list(arr.shape)}")
+        return
+
+    # 3D ---------------------------------------------------------
+    if arr.ndim == 3:
+        dims = list(arr.shape)
+        # Choose time axis: prefer dimension equal to target_len, else the largest
+        if target_len in dims:
+            t_idx = dims.index(target_len)
+        else:
+            t_idx = int(_np.argmax(dims))
+        arr = _np.moveaxis(arr, t_idx, 0)  # now (T, A, B)
+        T, A, B = arr.shape
+        # Collapse the third dimension via RMS so intensity represents magnitude across B
+        arr2d = _np.sqrt(_np.mean(arr ** 2, axis=2))  # (T, A)
+        # Time axis
+        x = _np.arange(T, dtype=float)
+        if T == target_len and sample_rate > 0:
+            x = x / float(sample_rate)
+            ax.set_xlabel("time [s]")
+        else:
+            ax.set_xlabel("frame")
+        # Heatmap: x=time, y=A, intensity=RMS over B
+        ax.imshow(arr2d.T, aspect="auto", origin="lower")
+        ax.set_ylabel("channel")
+        ax.set_title(f"{name} heatmap (RMS over axis=2) {dims}")
+        return
+
+    # Unsupported dims ----------------------------------------------------
+    raise ValueError(f"Unsupported tensor ndim={arr.ndim} for plotting param '{name}'")
 
 
-@torch.no_grad()
-def _build_pg_targets_for_batch(audio_b: torch.Tensor,
-                                pitch_b: torch.Tensor,
-                                onset_lists: list,
-                                fs: int,
-                                T_int: int,
-                                n_fft: int = 1024,
-                                hop: int = 256) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute per-frame piece‑wise constant targets p_hat, g_hat for each batch item.
-    Returns (p_tgt, g_tgt, mask) with shape [B, T_int] on the same device as audio_b.
+def _make_and_save_composite(sample_idx: int,
+                             wave_orig_np,
+                             wave_rec_np,
+                             params_dict,
+                             sample_rate: int,
+                             save_path: str):
+    """Make a composite image with waveforms and one panel per param.
+    - params_dict: mapping name -> tensor [B, ...]; we index sample_idx
+    - save_path: where to write the PNG
     """
-    B, T = audio_b.shape
-    device = audio_b.device
-    dtype = audio_b.dtype
-    p_tgt = torch.zeros((B, T_int), device=device, dtype=dtype)
-    g_tgt = torch.zeros((B, T_int), device=device, dtype=dtype)
-    mask  = torch.zeros((B, T_int), device=device, dtype=dtype)
+    import numpy as _np
+    import torch
 
-    for b in range(B):
-        x = audio_b[b]
-        f0 = pitch_b[b]
-        # Accept either python lists or tensors for onsets
-        onsets = onset_lists[b]
-        # Normalize onsets to sample indices
-        onsets_samples = _normalize_onsets_to_samples(onsets, T=T, T_int=T_int, fs=fs)
-        # Ensure boundaries
-        edges = sorted(set([0] + [int(max(0, min(int(T - 1), int(s)))) for s in onsets_samples] + [int(T)]))
-        # Make windows
-        for i in range(len(edges) - 1):
-            s = edges[i]
-            e = edges[i + 1]
-            if e - s < max(256, 2 * hop):
-                continue
-            x_seg = x[s:e]
-            f0_seg = f0[s:e]
-            # Robust median f0 in window (ignore zeros)
-            f0_valid = f0_seg[f0_seg > 1.0]
-            if f0_valid.numel() == 0:
-                # Fallback to global median f0 for this item
-                f0_global_valid = f0[f0 > 1.0]
-                if f0_global_valid.numel() == 0:
-                    continue
-                f0_med = float(torch.median(f0_global_valid).item())
-            else:
-                f0_med = float(torch.median(f0_valid).item())
-            p_hat, g_hat, _diag = _estimate_pg_two_harmonics(x_seg, fs, f0_med, n_fft=n_fft, hop=hop)
+    panels = [("waveforms", None)]  # first panel: original vs recon
 
-            s_int = _samples_to_int_frame(T, T_int, s)
-            e_int = _samples_to_int_frame(T, T_int, e - 1) + 1
-            e_int = max(s_int + 1, min(T_int, e_int))
+    for k, v in params_dict.items():
+        # Prefer indexing the batch dimension when present
+        if hasattr(v, "shape") and len(v.shape) >= 1 and v.shape[0] > sample_idx:
+            arr = v[sample_idx]
+        else:
+            arr = v
+        # Convert to numpy array without altering rank, avoiding DeprecationWarning
+        if isinstance(arr, torch.Tensor):
+            arr = arr.detach().cpu().numpy()
+        else:
+            arr = _np.asarray(arr)
+        panels.append((k, arr))
 
-            p_tgt[b, s_int:e_int] = p_hat
-            g_tgt[b, s_int:e_int] = g_hat
-            mask[b, s_int:e_int]  = 1.0
+    n_panels = len(panels)
+    fig, axes = plt.subplots(n_panels, 1, figsize=(12, 3 * n_panels), constrained_layout=True)
+    if n_panels == 1:
+        axes = [axes]
 
-    return p_tgt, g_tgt, mask
-# ======================================================================
+    # Panel 0: waveforms
+    ax0 = axes[0]
+    N = wave_orig_np.shape[0]
+    t = _np.arange(N, dtype=float) / float(sample_rate)
+    ax0.plot(t, wave_orig_np, label="target", linewidth=0.8)
+    ax0.plot(t, wave_rec_np, label="recon", linewidth=0.8)
+    ax0.set_title("Original vs Reconstructed waveform")
+    ax0.set_xlabel("time [s]")
+    ax0.legend(loc="best", fontsize=8)
+
+    # Remaining panels: dynamic params
+    for ax, (name, arr) in zip(axes[1:], panels[1:]):
+        _plot_param_panel(ax, name, arr, sample_rate, target_len=N)
+
+    fig.savefig(save_path, dpi=120)
+    plt.close(fig)
+    return True
 
 
 def main():
@@ -395,10 +265,7 @@ def main():
     split_train = "test" if args.test else "train"
     split_val   = "test" if args.test else "valid"
     config = {
-        "loop_order": args.l_order,
-        "filter_type": args.filter_type,
         "sample_rate": 16000,
-        "ks_sample_rate": 16000,
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
         "max_epochs": args.max_epochs,
@@ -413,10 +280,7 @@ def main():
         "pitch_mode": args.pitch_mode,
         "batches_per_epoch": args.batches_per_epoch,
         "stft_weight": args.stft_weight,
-        "sf_weight": args.sf_weight,
-        "sf_min_freq": args.sf_min_freq,
-        "n_noise_bands": args.n_noise_bands,
-        "pg_weight": args.pg_weight,
+        "filter_type": args.filter_type,
     }
 
     print("\n▶ Running with config:")
@@ -486,30 +350,18 @@ def main():
 
     # ─── Start Model, optimizer & Loss ────────────────────────── #
     model = nnKarplusStrong(
-        batch_size=config["batch_size"],
-        loop_order=config["loop_order"],
-        internal_sr=config["ks_sample_rate"],
         interpolation_type=config["interpolation_type"],
         filter_type=config["filter_type"],
-        n_noise_bands=config["n_noise_bands"],
+        n_noise_bands=args.n_noise_bands,
+        tcn_ch=64,
     ).to(device)
 
     optimizer = build_optimizer(model, lr_main=config["learning_rate"])
     # Log current stage to wandb (removed as per instruction)
 
     print_trainable_summary(model, optimizer)
-    # STFT loss (scale-invariant if --invariant is set)
-    mr_stft_sv = build_smooth_mrstft(scale_invariance=args.invariant).to(device).float()
-
-    # JTFST loss (optional)
-    jtfst_loss = None
-    if args.jtfst_weight > 0:
-        jtfst_loss = build_jtfst(shape=64000).to(device).float()
-
-    # A-weighted loudness loss (optional)
-    a_loudness_loss = None
-    if args.a_loudness_weight > 0:
-        a_loudness_loss = build_a_loudness_loss(p=1, reduction="mean").to(device).float()
+    # STFT loss (scale-variant only)
+    mr_stft = build_smooth_mrstft(scale_invariance=False).to(device).float()
 
     # ─── Resume from checkpoint if requested ──────────────────────────────
     start_epoch, best_val_loss = 0, float('inf')
@@ -548,12 +400,6 @@ def main():
         batches_processed = 0
         nan_or_inf_detected = False
 
-        # Accumulators for per-component gradient means across the epoch
-        comp_grad_sums = defaultdict(float)
-        comp_grad_counts = defaultdict(int)
-
-        #torch.autograd.set_detect_anomaly(True)
-
         for batch_idx, (audio, pitch, loud) in enumerate(tqdm(train_loader, desc=f"[E{epoch:03d} train]")):
             if batch_idx >= config["batches_per_epoch"]:
                 break
@@ -567,58 +413,10 @@ def main():
                 f"but target has {audio.shape[1]}."
             )
 
-            stft_sv = mr_stft_sv(recon.unsqueeze(1), audio.unsqueeze(1))
-            # Spectral-flux MAE (Shier et al.)
-            sf_recon = spectral_flux(recon, fs=config["sample_rate"], n_fft=1024, hop=256,
-                                     min_hz=config["sf_min_freq"]).float()
-            sf_target = spectral_flux(audio, fs=config["sample_rate"], n_fft=1024, hop=256,
-                                      min_hz=config["sf_min_freq"]).float()
-
-            # log-scale to stabilize (log1p handles zeros safely)
-            sf_recon = torch.log1p(sf_recon)
-            sf_target = torch.log1p(sf_target)
-
-            loss_sf = torch.nn.functional.l1_loss(sf_recon, sf_target)
-
-            # (p,g) supervision from onset-to-onset decays
-            onset_lists = [detect_onsets_librosa(audio[b], sr=config["sample_rate"]) for b in range(audio.size(0))]
-            p_tgt, g_tgt, m_tgt = _build_pg_targets_for_batch(audio, pitch.squeeze(-1), onset_lists,
-                                                              fs=config["sample_rate"], T_int=250,
-                                                              n_fft=1024, hop=256)
-            # Get model parameters for (p,g)
-            params = model(
-                pitch, loud, audio, config["sample_rate"], return_parameters=True
-            )
-            loop_logits = params["loop_logits"]
-            #excitation  = params["excitation"]
-            loop_pg = model.decoder.design_loop(loop_logits, return_gain=True)  # [B, T, 3]
-            p_pred = loop_pg[..., 1]
-            g_pred = loop_pg[..., 2]
-            # Masked L2 over frames
-            denom = m_tgt.sum().clamp_min(1.0)
-            loss_pg = ((p_pred - p_tgt).abs() + (g_pred - g_tgt).abs()) * m_tgt
-            loss_pg = loss_pg.sum() / denom
-
-            # JTFST loss (if enabled)
-            if jtfst_loss is not None:
-                loss_jtfst = jtfst_loss(recon.unsqueeze(1), audio.unsqueeze(1))
-            else:
-                loss_jtfst = torch.tensor(0.0, device=audio.device, dtype=stft_sv.dtype)
-
-            # A-weighted loudness loss (if enabled)
-            if a_loudness_loss is not None:
-                loss_a_loudness = a_loudness_loss(recon.unsqueeze(1), audio.unsqueeze(1))
-            else:
-                loss_a_loudness = torch.zeros(1, device=audio.device, dtype=stft_sv.dtype)
-
+            stft_sv = mr_stft(recon.unsqueeze(1), audio.unsqueeze(1))
             loss = (
                 args.stft_weight * stft_sv
-                + config["sf_weight"] * loss_sf
-                + config["pg_weight"] * loss_pg
-                + args.jtfst_weight * loss_jtfst
-                + args.a_loudness_weight * loss_a_loudness
             )
-
 
             # Abort early if loss is NaN or Inf
             if not torch.isfinite(loss):
@@ -630,37 +428,19 @@ def main():
                 break
             optimizer.zero_grad()
             loss.backward()
-            # (Removed print_grad_snapshot and print_ast_head_grads)
-
-            # Accumulate per-component mean absolute gradient (this batch)
-            for name, p in model.named_parameters():
-                if p.requires_grad and p.grad is not None:
-                    key = _component_of(name)
-                    g = p.grad.detach()
-                    comp_grad_sums[key] += g.abs().mean().item()
-                    comp_grad_counts[key] += 1
-
             optimizer.step()
 
             global_step += 1
-
-            # (Removed backbone transition logic)
 
             if wandb.run is not None:
                 wandb.log({
                     "train loss per batch": float(loss.item()),
                     "train/loss_stft": float(stft_sv.item()),
-                    "train/loss_sf": float(loss_sf.item()),
-                    "train/loss_pg": float(loss_pg.item()),
-                    "train/loss_jtfst": float(loss_jtfst.item()) if jtfst_loss is not None else 0.0,
-                    "train/loss_a_loudness": float(loss_a_loudness.item()) if a_loudness_loss is not None else 0.0,
-                    "epoch": int(epoch),
                 })
 
             t_loss += loss.item()
             batches_processed += 1
 
-        # If a non-finite loss was detected, save a checkpoint and stop training.
         if nan_or_inf_detected:
             ckpt = {
                 "epoch": epoch,
@@ -681,11 +461,20 @@ def main():
         if batches_processed > 0:
             t_loss /= batches_processed
 
-        # --- Per-epoch gradient means (per learnable component) ---
-        if comp_grad_sums:
-            grad_means_epoch = {k: comp_grad_sums[k] / max(1, comp_grad_counts[k]) for k in comp_grad_sums}
-            # Print to stdout only (no wandb logging)
-            print("[GRAD MEAN PER EPOCH]", {k: round(v, 6) for k, v in grad_means_epoch.items()})
+        # --- Per-epoch average |grad| per component (print after training loop, before validation/loss logging) ---
+        # Reuse print_grad_snapshot logic, but do per-epoch mean
+        comp2vals = {}
+        for name, p in model.named_parameters():
+            key = name.split('.')[0] if '.' in name else name
+            if p.requires_grad and (p.grad is not None):
+                comp2vals.setdefault(key, []).append(p.grad.detach().abs().mean().item())
+        print("[GRAD MEAN PER EPOCH] mean|grad| per component:")
+        for k in sorted(comp2vals.keys()):
+            vals = comp2vals[k]
+            if len(vals) == 0:
+                print(f"  - {k:24s}: (no grads)")
+            else:
+                print(f"  - {k:24s}: {sum(vals)/len(vals):.6e} (n={len(vals)})")
 
         # ─── VALID ───────────────────────────────────────────────────────
         if epoch % config["eval_interval"] == 0:
@@ -709,16 +498,13 @@ def main():
                         recon_std = recon_std * gain  # rescaled recon
                     '''
 
-                    loss_std = mr_stft_sv(recon_std.unsqueeze(1), audio.unsqueeze(1))
+                    loss_std = mr_stft(recon_std.unsqueeze(1), audio.unsqueeze(1))
                     v_losses_std.append(loss_std.item())
             v_loss_std = float(np.mean(v_losses_std))
 
         # ─── LOGGING ───────────────────────────────────────────────────────
         if epoch % config["eval_interval"] == 0:
             log_epoch(t_loss, v_loss_std, epoch)
-        else:
-            # no validation this epoch
-            pass
 
         # ─── CHKPTS  ───────────────────────────────────────────────────────
         improved = False
@@ -744,7 +530,7 @@ def main():
         if improved:
             torch.save(ckpt, os.path.join(config["save_dir"], f"best_model_{args.name}.pth"))
 
-        # ─── AUDIO LOGS ──────────────────────────────────────────────────
+        # ─── AUDIO + DIAGNOSTIC COMPOSITES ───────────────────────────────────
         if epoch % config["eval_interval"] == 0:
             with torch.no_grad():
                 a, p, l = fixed_audio.to(device), fixed_pitch.to(device), fixed_loud.to(device)
@@ -753,17 +539,12 @@ def main():
                 )
                 assert rec.shape[1] == a.shape[1]
 
-                # --- RMS amplitude matching for rec, as in validation loss, only if invariant ---
-                '''
-                if args.invariant:
-                    eps = 1e-9
-                    rms_target = a.pow(2).mean(dim=1, keepdim=True).sqrt() + eps
-                    rms_recon  = rec.pow(2).mean(dim=1, keepdim=True).sqrt() + eps
-                    gain = rms_target / rms_recon
-                    rec = rec * gain
-                '''
+                # --- Collect returned parameters for diagnostics (same batch as audio) ---
+                params_ret = model(
+                    p, l, a, config["sample_rate"], return_parameters=True,
+                )
 
-                # --- Simple audio logging ---
+                # --- Audio logging ---
                 media_log = {}
                 for idx in range(n_plot):
                     wave_orig = a[idx].cpu().numpy()
@@ -784,128 +565,26 @@ def main():
                 if wandb.run is not None and len(media_log) > 0:
                     wandb.log(media_log, commit=True)
 
-                # --- Diagnostics plots (waveforms, logits/coeffs/p&g, triggers, spectral flux) ---
-                # Fetch parameters for the fixed batch
-                params_b = model(
-                    p, l, a, config["sample_rate"], return_parameters=True
-                )
-                loop_logits_b = params_b["loop_logits"]
-                #excitation_b  = params_b["excitation"]
-                loop_pg_b = model.decoder.design_loop(loop_logits_b, return_gain=True)  # [B, T, 3]
-
-                # Build (p,g) targets for the fixed batch using the same onset detector
-                onset_lists_fix = [detect_onsets_librosa(a[b], sr=config["sample_rate"]) for b in range(a.size(0))]
-                p_tgt_b, g_tgt_b, m_tgt_b = _build_pg_targets_for_batch(
-                    a, p.squeeze(-1), onset_lists_fix, T_int=250,
-                    fs=config["sample_rate"], n_fft=1024, hop=256
-                )
-
-                # Convenience
-                fs = config["sample_rate"]
-                N = a.shape[1]
-                T_int = 250
-                t = np.arange(N) / float(fs)
-                t_frames = np.linspace(0.0, N / float(fs), T_int)
-
-                # Limit to n_plot examples
+                # --- Composites: waveforms + dynamic params from return_parameters ---
+                img_log = {}
+                params_cpu = {k: (v.detach().cpu() if hasattr(v, "detach") else v) for k, v in params_ret.items()}
                 for idx in range(n_plot):
-                    # ---- (1) Waveforms: target vs reconstruction ----
-                    fig, ax = plt.subplots(figsize=(10, 3))
-                    ax.plot(t, a[idx].cpu().numpy(), label="target", linewidth=0.8)
-                    ax.plot(t, rec[idx].cpu().numpy(), label="recon", linewidth=0.8, alpha=0.8)
-                    ax.set_title(f"Waveforms (epoch {epoch}, sample {idx})")
-                    ax.set_xlabel("Time [s]")
-                    ax.set_ylabel("Amplitude")
-                    ax.legend(loc="upper right")
-                    wave_png = os.path.join(config["save_dir"], f"wave_e{epoch}_{idx}.png")
-                    fig.tight_layout()
-                    fig.savefig(wave_png, dpi=150)
-                    print(f"[IMG] wrote: {wave_png}")
-                    plt.close(fig)
-
-                    # ---- (2) Loop logits, p/g (pred vs tgt) ----
-                    l_logits = loop_logits_b[idx].detach().cpu().numpy()  # [T, L+1]
-                    pg_vals = loop_pg_b[idx].detach().cpu().numpy()        # [T, 3]
-                    p_pred = pg_vals[:, 1]
-                    g_pred = pg_vals[:, 2]
-                    p_tgt = p_tgt_b[idx].detach().cpu().numpy()
-                    g_tgt = g_tgt_b[idx].detach().cpu().numpy()
-
-                    fig, ax = plt.subplots(3, 1, figsize=(10, 7), sharex=True)
-                    # plot all raw logits
-                    for k in range(l_logits.shape[1]):
-                        ax[0].plot(t_frames, l_logits[:, k], label=f"logit[{k}]")
-                    ax[0].set_ylabel("loop logits")
-                    ax[0].legend(ncol=min(4, l_logits.shape[1]), fontsize=8)
-                    # p & g predictions
-                    ax[1].plot(t_frames, p_pred, label="p_pred")
-                    ax[1].plot(t_frames, p_tgt, label="p_tgt", linestyle=":")
-                    ax[1].set_ylabel("p")
-                    ax[1].legend(loc="upper right", ncol=2, fontsize=8)
-                    ax[2].plot(t_frames, g_pred, label="g_pred")
-                    ax[2].plot(t_frames, g_tgt, label="g_tgt", linestyle=":")
-                    ax[2].set_ylabel("g")
-                    ax[2].set_xlabel("Time [s]")
-                    ax[2].legend(loc="upper right", ncol=2, fontsize=8)
-                    coeff_png = os.path.join(config["save_dir"], f"coeffs_pg_e{epoch}_{idx}.png")
-                    fig.tight_layout()
-                    fig.savefig(coeff_png, dpi=150)
-                    print(f"[IMG] wrote: {coeff_png}")
-                    plt.close(fig)
-
-                    # ---- (3) Onsets visualization ----
-                    onsets_samples = onset_lists_fix[idx]
-                    fig, ax = plt.subplots(figsize=(10, 3))
-                    ax.plot(t, a[idx].cpu().numpy(), label="target", linewidth=0.5, alpha=0.5)
-                    for s in onsets_samples:
-                        ax.axvline(x=s / float(fs), color="r", linestyle="--", linewidth=0.8, alpha=0.7)
-                    ax.set_title(f"Onsets (epoch {epoch}, sample {idx})")
-                    ax.set_xlabel("Time [s]")
-                    ax.set_ylabel("amplitude / onsets")
-                    ax.legend(loc="upper right")
-                    trig_png = os.path.join(config["save_dir"], f"triggers_e{epoch}_{idx}.png")
-                    fig.tight_layout()
-                    fig.savefig(trig_png, dpi=150)
-                    print(f"[IMG] wrote: {trig_png}")
-                    plt.close(fig)
-
-                    # ---- (4) Spectral flux: target vs recon (+ threshold used for onsets) ----
-                    x_t = a[idx:idx+1]
-                    x_r = rec[idx:idx+1]
-                    sf_t = spectral_flux(x_t, fs=fs, n_fft=1024, hop=256, min_hz=config["sf_min_freq"])[0].detach().cpu().numpy()
-                    sf_r = spectral_flux(x_r, fs=fs, n_fft=1024, hop=256, min_hz=config["sf_min_freq"])[0].detach().cpu().numpy()
-                    # smooth & threshold like detector
-                    if sf_t.shape[0] >= 5:
-                        sf_ts = torch.nn.functional.avg_pool1d(torch.from_numpy(sf_t).view(1,1,-1), kernel_size=5, stride=1, padding=2).view(-1).numpy()
-                    else:
-                        sf_ts = sf_t
-                    med = np.median(sf_ts)
-                    mad = np.median(np.abs(sf_ts - med)) + 1e-8
-                    thr = med + 1.0 * mad
-                    f = np.arange(sf_t.shape[0]) * (256.0 / float(fs))  # frame times in seconds
-                    fig, ax = plt.subplots(figsize=(10, 3))
-                    ax.plot(f, sf_t, label="SF target")
-                    ax.plot(f, sf_r, label="SF recon")
-                    ax.plot(f, np.full_like(f, thr), label="threshold", linestyle="--")
-                    ax.set_title(f"Spectral Flux (epoch {epoch}, sample {idx})")
-                    ax.set_xlabel("Time [s]")
-                    ax.set_ylabel("Flux")
-                    ax.legend(loc="upper right")
-                    flux_png = os.path.join(config["save_dir"], f"flux_e{epoch}_{idx}.png")
-                    fig.tight_layout()
-                    fig.savefig(flux_png, dpi=150)
-                    print(f"[IMG] wrote: {flux_png}")
-                    plt.close(fig)
-
-                    # Log images to W&B
+                    wave_orig = a[idx].cpu().numpy()
+                    wave_rec  = rec[idx].cpu().numpy()
+                    comp_name = f"composite_e{epoch}_{idx}.png"
+                    comp_path = os.path.join(config["save_dir"], comp_name)
+                    _make_and_save_composite(
+                        sample_idx=idx,
+                        wave_orig_np=wave_orig,
+                        wave_rec_np=wave_rec,
+                        params_dict=params_cpu,
+                        sample_rate=int(config["sample_rate"]),
+                        save_path=comp_path,
+                    )
                     if wandb.run is not None:
-                        wandb.log({
-                            "epoch": int(epoch),
-                            f"img/wave_{idx}": wandb.Image(wave_png),
-                            f"img/coeffs_pg_{idx}": wandb.Image(coeff_png),
-                            f"img/triggers_{idx}": wandb.Image(trig_png),
-                            f"img/flux_{idx}": wandb.Image(flux_png),
-                        })
+                        img_log[f"composite_{idx}"] = wandb.Image(comp_path, caption=f"epoch {epoch} | sample {idx} | composite")
+                if wandb.run is not None and len(img_log) > 0:
+                    wandb.log(img_log, commit=True)
 
         if epoch % config["eval_interval"] == 0:
             print(f"[E{epoch}] train={t_loss:.4f} val_std={v_loss_std:.4f} best={best_val_loss:.4f} (no-improve {epochs_since_improve}/{config['patience']})")

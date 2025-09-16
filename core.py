@@ -2,10 +2,12 @@ from typing import Union
 import numpy as np
 import torch
 import librosa
-from torchlpc import sample_wise_lpc
-from torch import nn
 import math
 from torch.nn import functional as F
+import torch.fft as fft
+
+MIN_HZ = 20
+MAX_HZ = 8000
 
 # --------------------------------------------------------------------------
 # Onset detection helper (librosa, 50 ms left pad, backtrack)
@@ -143,71 +145,56 @@ def make_onset_noise(onset_samples: np.ndarray,
         sig[:, start:end] = noise
     return sig
 
-# =============================================================
-# IIR Resonator Filterbank (parallel all-pole second-order bands)
-# =============================================================
-class IIRResonatorBank(nn.Module):
-    """Parallel bank of second-order all-pole resonators (biquad denominators only).
-    Each band k is defined by a complex pole pair with radius r_k and angle w0_k.
-    Filtering is performed with torchlpc.sample_wise_lpc so that it is fully
-    differentiable and batched on GPU.
-
-    Args:
-        fs (int): sample rate in Hz.
-        n_bands (int): number of resonator bands.
-        min_hz (float): lowest center frequency.
-        max_hz (float): highest center frequency (<= Nyquist).
-        q (float): constant-Q of resonators (BW = f0 / q).
-    """
-    def __init__(self, fs: int, n_bands: int, min_hz: float, max_hz: float, q: float = 8.0):
-        super().__init__()
-        self.fs = float(fs)
-        self.n_bands = int(n_bands)
-        nyq = 0.5 * self.fs
-        f0 = torch.linspace(min_hz, min(max_hz, nyq * 0.98), steps=self.n_bands)
-        # Constant-Q bandwidth -> pole radius r = exp(-pi * BW / fs) with BW = f0 / q
-        bw = f0 / float(q)
-        r = torch.exp(-math.pi * bw / self.fs)
-        w0 = 2.0 * math.pi * f0 / self.fs
-        a1 = -2.0 * r * torch.cos(w0)
-        a2 = r ** 2
-        # Store denominator coefficients as buffers (shape [K])
-        self.register_buffer("a1", a1.to(torch.float32))
-        self.register_buffer("a2", a2.to(torch.float32))
-
-    def forward(self, noise: torch.Tensor, gains_up: torch.Tensor) -> torch.Tensor:
-        """Filter white noise through the bank and apply time-varying gains.
-        Args:
-            noise: [B, N] white noise.
-            gains_up: [B, N, K] linear gains per band at sample-rate.
-        Returns:
-            y: [B, N] synthesized wideband noise shaped by the filterbank.
-        """
-        B, N = noise.shape
-        K = self.a1.numel()
-        assert gains_up.shape == (B, N, K), f"Expected gains_up [B,N,K]={B,N,K}, got {tuple(gains_up.shape)}"
-        out_acc = noise.new_zeros(B, N)
-        for k in range(K):
-            # Build time-constant LPC denominator for this band and expand over time
-            a_k = torch.stack([self.a1[k].expand(B, N), self.a2[k].expand(B, N)], dim=-1)
-            # y_k = filter(noise) with all-pole denominator 1 + a1 z^-1 + a2 z^-2
-            y_k = sample_wise_lpc(noise, a_k)
-            # Apply per-sample gain for this band and accumulate
-            out_acc = out_acc + y_k * gains_up[:, :, k]
-        # Light energy normalization to avoid scale blow-up when many bands active
-        return out_acc / math.sqrt(max(1, K))
-
 def hz_to_samples(f0_hz: torch.Tensor, fs: int) -> torch.Tensor:
     """Convert fundamental frequency in Hz to samples/period given sample rate fs.
     Keeps dtype/device of f0_hz.
     """
     return torch.as_tensor(float(fs), dtype=f0_hz.dtype, device=f0_hz.device) / f0_hz
 
-def one_minus_log_tail(gain_logits: torch.Tensor, min_tail: float = 1e-6) -> torch.Tensor:
-    """Map unconstrained logits to a value g ∈ (0.9, 1) via a logarithmic tail.
-    Larger logits → tail→0 → g→1; negative logits clamp via ReLU so g doesn't exceed range.
+def sigmoid_valid_gain_range(gain_logits: torch.Tensor) -> torch.Tensor:
+    """Map unconstrained logits to a value g ∈ (0.9, 1)"""
+    return torch.sigmoid(gain_logits) * 0.1 + 0.9
+
+def scale_function(x: torch.Tensor) -> torch.Tensor:
+    """IRCAM-style positive scaling used for band amps.
+    Matches: 2 * sigmoid(x)**log(10) + 1e-7.
     """
-    s = F.relu(gain_logits)
-    tail = torch.pow(torch.tensor(10.0, device=s.device, dtype=s.dtype), -(s + 1.0))
-    tail = torch.clamp(tail, min=min_tail)
-    return 1.0 - tail
+    return 2.0 * torch.sigmoid(x) ** (math.log(10)) + 1e-7
+
+def amp_to_impulse_response(amp: torch.Tensor, target_size: int) -> torch.Tensor:
+    """Map non-negative band amplitudes to a real impulse response per frame.
+    Args:
+        amp: [B, T, K] non-negative magnitudes (frequency bands)
+        target_size: output impulse length per frame (e.g., block size)
+    Returns:
+        impulse: [B, T, target_size]
+    """
+    # Make a real spectrum with zero imaginary part: [B, T, K] -> complex [B,T,K]
+    amp_c = torch.view_as_complex(torch.stack([amp, torch.zeros_like(amp)], dim=-1))
+    # IFFT to time domain; length inferred from K
+    ir = fft.irfft(amp_c)
+    Lf = ir.shape[-1]
+    # Center the IR and apply Hann window for smoothness
+    ir = torch.roll(ir, shifts=Lf // 2, dims=-1)
+    win = torch.hann_window(Lf, dtype=ir.dtype, device=ir.device)
+    ir = ir * win
+    # Pad or crop to target_size and roll back
+    if Lf < target_size:
+        ir = F.pad(ir, (0, target_size - Lf))
+    elif Lf > target_size:
+        ir = ir[..., :target_size]
+    ir = torch.roll(ir, shifts=-(Lf // 2), dims=-1)
+    return ir
+
+def fft_convolve(signal: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
+    """FFT overlap-save style convolution per frame (no state across frames).
+    signal: [B, T, L]
+    kernel: [B, T, L]
+    Returns: [B, T, L]
+    """
+    # Pad to same length in a simple circular fashion per frame
+    s = F.pad(signal, (0, signal.shape[-1]))
+    k = F.pad(kernel, (kernel.shape[-1], 0))
+    out = fft.irfft(fft.rfft(s) * fft.rfft(k))
+    out = out[..., out.shape[-1] // 2:]
+    return out
